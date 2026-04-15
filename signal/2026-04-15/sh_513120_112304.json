@@ -1,0 +1,20 @@
+{
+  "symbol": "sh.513120",
+  "name": "港股创新药ETF广发",
+  "signal_type": "SELL",
+  "price": 1.309,
+  "change_pct": 2.185792349726778,
+  "reason": "止盈卖出（盈利0.31%），总收益0.00元 (+0.00%)",
+  "timestamp": "2026-04-15T11:19:45.800411",
+  "position_count": 0,
+  "avg_cost": 0.0,
+  "position_value": 0.0,
+  "target_shares": 0,
+  "next_add_price": null,
+  "next_sell_price": null,
+  "boll_up_diff_pct": -4.045355009666486,
+  "boll_middle_diff_pct": 5.836516424751704,
+  "boll_down_diff_pct": 15.718387859169894,
+  "rsi": 76.17328519855594,
+  "saved_at": "2026-04-15T11:23:04.318234"
+}

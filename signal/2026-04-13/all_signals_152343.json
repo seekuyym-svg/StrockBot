@@ -1,0 +1,33 @@
+{
+  "saved_at": "2026-04-13T15:23:43.595634",
+  "date": "2026-04-13",
+  "count": 2,
+  "signals": [
+    {
+      "symbol": "sh.513120",
+      "name": "港股创新药ETF",
+      "signal_type": "BUY",
+      "price": 1.272,
+      "change_pct": -0.78,
+      "reason": "初始建仓信号",
+      "target_shares": 3934,
+      "position_count": 0,
+      "avg_cost": 0,
+      "position_value": 0,
+      "saved_at": "2026-04-13T15:23:43.471139"
+    },
+    {
+      "symbol": "sh.513050",
+      "name": "中概互联网ETF",
+      "signal_type": "WAIT",
+      "price": 1.185,
+      "change_pct": -1.9,
+      "reason": "观望中",
+      "target_shares": 0,
+      "position_count": 0,
+      "avg_cost": 0,
+      "position_value": 0,
+      "saved_at": "2026-04-13T15:23:43.561769"
+    }
+  ]
+}

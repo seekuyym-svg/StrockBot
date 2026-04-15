@@ -1,0 +1,122 @@
+# ETF链接基金T+0马丁格尔量化交易系统配置文件
+
+# 交易标的配置（仅支持T+0的ETF）
+symbols:
+  - code: "sh.513120"  # 港股创新药ETF
+    name: "港股创新药ETF"
+    enabled: true
+    # 个性化策略参数（可选，不设置则使用全局默认值）
+    add_drop_threshold: 3.5  # 加仓跌幅阈值：下跌3%加仓
+    take_profit_threshold: 4.0  # 止盈涨幅：盈利2%止盈
+    max_add_positions: 4  # 最大加仓次数
+    initial_position_pct: 6  # 初始建仓比例（占总资金百分比）
+    
+  - code: "sh.513050"  # 中概互联网ETF
+    name: "中概互联网ETF"
+    enabled: true
+    # 个性化策略参数（可选，不设置则使用全局默认值）
+    add_drop_threshold: 2.5  # 加仓跌幅阈值：下跌3.5%加仓
+    take_profit_threshold: 3.0  # 止盈涨幅：盈利2.5%止盈
+    max_add_positions: 4  # 最大加仓次数
+    initial_position_pct: 6  # 初始建仓比例（占总资金百分比）
+
+# 初始资金
+initial_capital: 300000  # 30万
+
+# 马丁格尔策略参数（针对T+0优化）
+strategy:
+  # 初始建仓比例 (占总资金百分比)
+  initial_position_pct: 10
+  # 加仓次数 (不含初始建仓)
+  max_add_positions: 4
+  # 加仓倍数 (每次加仓金额是上一次的倍数)
+  add_position_multiplier: 2
+  # 加仓跌幅阈值 (下跌多少百分比加仓)
+  add_drop_threshold: 3  # T+0可以更频繁，降低阈值
+  # 止盈涨幅 (平均成本上涨多少百分比全部卖出)
+  take_profit_threshold: 2  # T+0可以快速止盈，降低阈值
+  # 单只股票最大持仓比例
+  max_position_pct: 80
+
+# 风控参数
+risk_control:
+  # 单日最大亏损比例
+  daily_loss_limit: 5
+  # 单笔最大亏损比例
+  single_loss_limit: 10
+  # 最大总亏损比例
+  total_loss_limit: 20
+
+# 胜率提升过滤器（简化版，适配T+0）
+filters:
+  # 大盘环境过滤
+  market_filter:
+    enabled: true
+    sh_index_min: 2800
+    sh_index_max: 4500
+
+  # 趋势过滤
+  trend_filter:
+    enabled: true
+    ema_periods: [20, 60]
+    require_uptrend: false  # T+0可以双向操作，不强制要求上升趋势
+
+  # 量价配合过滤
+  volume_filter:
+    enabled: false  # T+0交易可以降低成交量要求，暂时禁用
+    volume_ma5_multiplier: 1.0  # 成交量不低于5日均量
+
+  # 时间窗口过滤（T+0全天可交易）
+  time_filter:
+    enabled: false  # T+0不需要避开特定时段
+    avoid_hours: []
+
+# 数据源配置
+data_source:
+  # 东方财富网 - 实时和历史数据源
+  eastmoney:
+    enabled: true
+
+# API服务配置
+api:
+  host: "0.0.0.0"
+  port: 8080
+
+# 定时任务配置
+scheduler:
+  # 信号检查间隔（分钟）- 兼容旧配置，已废弃
+  signal_check_interval: 5
+  # 交易时间检查间隔（分钟）
+  trading_check_interval: 1.1
+  # 非交易时间检查间隔（分钟）
+  non_trading_check_interval: 10
+  # 是否在启动时立即执行首次检查
+  run_immediately_on_start: true
+  # 是否启用定时任务
+  enabled: true
+  # 交易时间配置（24小时制）
+  trading_hours:
+    # 交易日（周一到周五：1=周一, 2=周二, ..., 5=周五, 6=周六, 7=周日）
+    trading_days: [1, 2, 3, 4, 5]
+    # 交易时间段列表（支持多个时间段，如上午和下午）
+    sessions:
+      - start_time: "09:15"  # 上午开盘
+        end_time: "11:30"    # 上午收盘
+      - start_time: "13:00"  # 下午开盘
+        end_time: "15:00"    # 下午收盘
+
+# 通知配置
+notification:
+  # 飞书机器人通知
+  feishu:
+    # 是否启用飞书通知
+    enabled: true
+    # 飞书机器人 Webhook URL
+    webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/42120148-f651-4421-9740-e39c9e4d2f6e"
+    # 通知类型：BUY/SELL/ADD/STOP
+    notify_signals: ["BUY", "SELL", "ADD", "STOP"]
+
+# 数据库配置
+database:
+  type: "sqlite"
+  path: "data/trading.db"

@@ -1,0 +1,20 @@
+{
+  "symbol": "sh.513050",
+  "name": "中概互联网ETF易方达",
+  "signal_type": "BUY",
+  "price": 1.223,
+  "change_pct": 2.343096234309625,
+  "reason": "初始建仓：买入14700份，成本1.223元/份",
+  "timestamp": "2026-04-15T11:18:04.633926",
+  "position_count": 0,
+  "avg_cost": 1.223,
+  "position_value": 17978.100000000002,
+  "target_shares": 14700,
+  "next_add_price": 1.2217770000000001,
+  "next_sell_price": 1.224223,
+  "boll_up_diff_pct": -4.256825527931806,
+  "boll_middle_diff_pct": 1.3409648405560253,
+  "boll_down_diff_pct": 6.9387552090438565,
+  "rsi": 49.01960784313723,
+  "saved_at": "2026-04-15T11:18:19.646683"
+}

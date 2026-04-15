@@ -1,0 +1,13 @@
+{
+  "symbol": "sh.513120",
+  "name": "港股创新药ETF",
+  "signal_type": "BUY",
+  "price": 1.272,
+  "change_pct": -0.78,
+  "reason": "初始建仓信号",
+  "target_shares": 3934,
+  "position_count": 0,
+  "avg_cost": 0,
+  "position_value": 0,
+  "saved_at": "2026-04-13T15:23:43.471139"
+}

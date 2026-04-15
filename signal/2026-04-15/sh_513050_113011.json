@@ -1,0 +1,20 @@
+{
+  "symbol": "sh.513050",
+  "name": "中概互联网ETF易方达",
+  "signal_type": "SELL",
+  "price": 1.223,
+  "change_pct": 2.343096234309625,
+  "reason": "止盈卖出（盈利0.16%），总收益-58.80元 (-0.16%)",
+  "timestamp": "2026-04-15T11:19:45.800411",
+  "position_count": 0,
+  "avg_cost": 0.0,
+  "position_value": 0.0,
+  "target_shares": 0,
+  "next_add_price": null,
+  "next_sell_price": null,
+  "boll_up_diff_pct": -4.2649040459968655,
+  "boll_middle_diff_pct": 1.3368765331152972,
+  "boll_down_diff_pct": 6.93865711222746,
+  "rsi": 49.21875,
+  "saved_at": "2026-04-15T11:30:11.536790"
+}

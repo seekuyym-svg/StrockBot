@@ -1,0 +1,20 @@
+{
+  "symbol": "sh.513120",
+  "name": "港股创新药ETF广发",
+  "signal_type": "BUY",
+  "price": 1.271,
+  "change_pct": -0.07861635220126666,
+  "reason": "初始建仓：买入14100份，成本1.271元/份",
+  "timestamp": "2026-04-14T13:08:43.015896",
+  "position_count": 1,
+  "avg_cost": 1.271,
+  "position_value": 17921.1,
+  "target_shares": 14100,
+  "next_add_price": null,
+  "next_sell_price": null,
+  "boll_down_diff": null,
+  "boll_up_diff": null,
+  "boll_down_diff_pct": null,
+  "boll_up_diff_pct": null,
+  "saved_at": "2026-04-14T13:08:49.552300"
+}
