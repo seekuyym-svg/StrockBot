@@ -477,9 +477,11 @@ class MartingaleEngine:
         """创建卖出信号"""
         price = market_data.current_price
         
-        # 计算收益（正确公式：市值 - 总成本）
+        # 计算收益（正确公式：当前市值 - 总成本）
+        # 注意：必须使用当前卖出价格计算市值，而不是position_value（可能是旧值）
+        current_market_value = position.total_shares * price
         total_cost = position.total_shares * position.avg_cost
-        profit = position.position_value - total_cost
+        profit = current_market_value - total_cost
         profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
         
         # 重置持仓状态
@@ -518,7 +520,7 @@ class MartingaleEngine:
             reason=f"{reason}，总收益{profit:.2f}元 ({profit_pct:+.2f}%)",
             position_count=position.add_count,
             avg_cost=position.avg_cost,
-            position_value=position.position_value,
+            position_value=current_market_value,  # 使用当前市值
             boll_up_diff_pct=boll_up_diff_pct,
             boll_middle_diff_pct=boll_middle_diff_pct,
             boll_down_diff_pct=boll_down_diff_pct,
@@ -529,9 +531,11 @@ class MartingaleEngine:
         """创建止损信号"""
         price = market_data.current_price
         
-        # 计算损失（正确公式：总成本 - 市值）
+        # 计算损失（正确公式：总成本 - 当前市值）
+        # 注意：必须使用当前卖出价格计算市值，而不是position_value（可能是旧值）
+        current_market_value = position.total_shares * price
         total_cost = position.total_shares * position.avg_cost
-        loss = total_cost - position.position_value
+        loss = total_cost - current_market_value
         loss_pct = (loss / total_cost) * 100 if total_cost > 0 else 0
         
         # 重置持仓状态
@@ -570,7 +574,7 @@ class MartingaleEngine:
             reason=f"{reason}，总损失{loss:.2f}元 ({loss_pct:+.2f}%)",
             position_count=position.add_count,
             avg_cost=position.avg_cost,
-            position_value=position.position_value,
+            position_value=current_market_value,  # 使用当前市值
             boll_up_diff_pct=boll_up_diff_pct,
             boll_middle_diff_pct=boll_middle_diff_pct,
             boll_down_diff_pct=boll_down_diff_pct,
