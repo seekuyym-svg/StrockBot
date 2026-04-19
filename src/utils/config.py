@@ -119,6 +119,46 @@ class TradingHoursConfig(BaseModel):
     ]
 
 
+class StockPoolItem(BaseModel):
+    """股票池单项配置"""
+    code: str  # 股票代码（格式：sh.600000 或 sz.000001）
+    name: str  # 股票名称
+    index: str = ""  # 中文序号（一、二、三...）
+
+
+class NewsSourceConfig(BaseModel):
+    """资讯来源配置"""
+    enabled: bool = True  # 是否启用
+    url_template: str = ""  # URL模板
+
+
+class NewsSourcesConfig(BaseModel):
+    """资讯来源总配置"""
+    individual_news: NewsSourceConfig = NewsSourceConfig(
+        enabled=True,
+        url_template="https://so.eastmoney.com/news/s?keyword={symbol}"
+    )
+    financial_reports: NewsSourceConfig = NewsSourceConfig(
+        enabled=True,
+        url_template="https://data.eastmoney.com/notices/stock/{symbol}.html"
+    )
+
+
+class ScheduleConfig(BaseModel):
+    """定时任务调度配置"""
+    hour: int = 21  # 执行小时（24小时制）
+    minute: int = 0  # 执行分钟
+    second: int = 0  # 执行秒数
+
+
+class StockNewsMonitorConfig(BaseModel):
+    """股票资讯监控配置"""
+    enabled: bool = True  # 是否启用资讯监控
+    stock_pool: List[StockPoolItem] = []  # 股票池
+    news_sources: NewsSourcesConfig = NewsSourcesConfig()  # 资讯来源
+    schedule: ScheduleConfig = ScheduleConfig()  # 定时任务配置
+
+
 class FeishuNotificationConfig(BaseModel):
     """飞书通知配置"""
     enabled: bool = False  # 是否启用飞书通知
@@ -152,6 +192,7 @@ class AppConfig(BaseModel):
     api: APIConfig = APIConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     notification: NotificationConfig = NotificationConfig()
+    stock_news_monitor: StockNewsMonitorConfig = StockNewsMonitorConfig()
     database: DatabaseConfig = DatabaseConfig()
 
 

@@ -116,6 +116,42 @@ notification:
     # 通知类型：BUY/SELL/ADD/STOP
     notify_signals: ["BUY", "SELL", "ADD", "STOP"]
 
+# 股票资讯监控配置
+stock_news_monitor:
+  # 是否启用资讯监控
+  enabled: true
+  # 股票池配置（代码格式：sh.600000 或 sz.000001）
+  stock_pool:
+    - code: "sz.000792"
+      name: "盐湖股份"
+      index: "一"
+    - code: "sz.002706"
+      name: "良信股份"
+      index: "二"
+    - code: "sh.600521"
+      name: "华海药业"
+      index: "三"
+    - code: "sz.002126"
+      name: "银轮股份"
+      index: "四"
+   
+  # 资讯来源配置
+  news_sources:
+    # 个股资讯（来自东方财富搜索）
+    individual_news:
+      enabled: true
+      url_template: "https://so.eastmoney.com/news/s?keyword={symbol}"
+    # 财务报告公告
+    financial_reports:
+      enabled: true
+      url_template: "https://data.eastmoney.com/notices/stock/{symbol}.html"
+  # 定时任务配置（Cron表达式格式）
+  schedule:
+    # 每天执行时间（24小时制）
+    hour: 21
+    minute: 0
+    second: 0
+
 # 数据库配置
 database:
   type: "sqlite"

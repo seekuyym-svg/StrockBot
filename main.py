@@ -22,6 +22,7 @@ from src.market.data_provider import get_market_data, get_sh_index
 from src.models.models import SignalType
 from src.utils.signal_storage import save_signal_to_file, save_all_signals_to_file
 from src.utils.scheduler import start_signal_scheduler, stop_signal_scheduler
+from src.utils.news_scheduler import start_news_monitor_scheduler, stop_news_monitor_scheduler
 
 # 配置日志
 logger.remove()
@@ -333,6 +334,25 @@ def main():
             logger.warning("⚠️ 系统将继续运行，但不会自动检查信号\n")
     else:
         logger.info("⏸️ 定时任务已禁用（根据配置）\n")
+    
+    # 启动股票资讯监控调度器
+    logger.info("\n" + "=" * 60)
+    logger.info("启动股票资讯监控任务...")
+    logger.info("=" * 60)
+    
+    news_monitor_config = config.stock_news_monitor
+    if news_monitor_config.enabled and news_monitor_config.stock_pool:
+        try:
+            news_scheduler = start_news_monitor_scheduler()
+            logger.info(f"✅ 股票资讯监控调度器启动成功")
+            logger.info(f"   监控股票: {[f'{s.name}({s.code})' for s in news_monitor_config.stock_pool]}")
+            schedule = news_monitor_config.schedule
+            logger.info(f"   执行时间: 每天 {schedule.hour:02d}:{schedule.minute:02d}:{schedule.second:02d}\n")
+        except Exception as e:
+            logger.error(f"❌ 股票资讯监控调度器启动失败: {e}")
+            logger.warning("⚠️ 系统将继续运行，但不会自动监控股票资讯\n")
+    else:
+        logger.info("⏸️ 股票资讯监控已禁用或股票池为空\n")
 
     # 启动API服务
     logger.info(f"启动API服务: http://{config.api.host}:{config.api.port}")
@@ -350,6 +370,7 @@ def main():
     finally:
         # 停止定时任务
         stop_signal_scheduler()
+        stop_news_monitor_scheduler()
         logger.info("👋 系统已退出")
 
 
