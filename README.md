@@ -697,7 +697,7 @@ python tool_bullbear_a.py
 
 <div align="center">
 
-**⭐ 如果这个项目对您有帮助，请给个Star！**
+**⭐ 如果这个项目对您有帮助，请给个Star，谢谢！**
 
 Made with ❤️ by StockBot Team
 
