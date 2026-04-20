@@ -1,27 +1,278 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
+import time
+import requests
+import json
+import sys
+
+# 设置 UTF-8 编码（解决 Windows 终端 emoji 显示问题）
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+# -*- coding: utf-8 -*-
+"""
+个股多头/空头排列判断模块 - 美股版
+
+功能：
+1. 使用 Alpha Vantage API 或 yfinance 获取美股历史K线数据
+2. 计算常用移动平均线：MA5、MA10、MA20、MA50、MA200
+3. 定义多头/空头判定规则（均线排列 + MACD + RSI + 布林带）
+4. 对指定股票进行技术分析并输出结果
+
+数据源优先级：
+1. Alpha Vantage API（推荐，需要免费 API Key）
+2. yfinance（备用，容易限流）
+3. 模拟数据（用于测试）
+
+使用方法：
+    python tool_bullbear_us.py              # 自动选择数据源
+    python tool_bullbear_us.py --mock       # 强制使用模拟数据
+
+配置 Alpha Vantage API Key：
+    1. 访问 https://www.alphavantage.co/support/#api-key 免费注册
+    2. 设置环境变量：setx ALPHA_VANTAGE_API_KEY "your_api_key"
+    3. 或在代码中直接传入 api_key 参数
+"""
 
 # ================== 1. 获取英伟达历史数据 ==================
-def get_nvda_data(period='6mo'):
+def get_nvda_data_from_yfinance(period='6mo'):
     """
-    使用yfinance获取英伟达(NVDA)数据
-    period: 数据周期，可选 '1mo', '3mo', '6mo', '1y', '2y', '5y', 'max'
+    使用 yfinance 获取英伟达(NVDA)数据（备用数据源）
+    period: 数据周期
     """
-    ticker = 'NVDA'
-    print(f"正在获取 {ticker} 数据...")
+    try:
+        ticker = 'NVDA'
+        print(f"[yfinance] 正在获取 {ticker} 数据...")
+        
+        # auto_adjust=True：自动复权
+        data = yf.download(ticker, period=period, interval='1d', auto_adjust=True, progress=False)
+        
+        if data.empty:
+            print("❌ [yfinance] 未获取到数据")
+            return None
+        
+        print(f"✅ [yfinance] 数据获取成功，共 {len(data)} 个交易日")
+        return data
+        
+    except Exception as e:
+        print(f"❌ [yfinance] 数据获取失败：{e}")
+        return None
+
+
+def get_nvda_data_from_alpha_vantage(period='6mo', api_key=None):
+    """
+    使用 Alpha Vantage API 获取英伟达数据（主数据源，需要 API Key）
+    period: 数据周期
+    api_key: Alpha Vantage API Key（可从 https://www.alphavantage.co/support/#api-key 免费获取）
+    """
+    if not api_key:
+        # 尝试从环境变量获取
+        import os
+        api_key = os.getenv('ALPHA_VANTAGE_API_KEY')
     
-    # auto_adjust=True：自动复权，价格已包含分红和拆股调整
-    data = yf.download(ticker, period=period, interval='1d', auto_adjust=True)
+    # 临时测试：如果环境变量未设置，使用硬编码的 Key（仅用于调试）
+    if not api_key:
+        api_key = 'EW68AUQKLKTJ3IEP'  # TODO: 请设置环境变量 ALPHA_VANTAGE_API_KEY
     
-    if data.empty:
-        print("❌ 未获取到数据，请检查网络或股票代码")
+    if not api_key:
+        print("⚠️  [Alpha Vantage] 未配置 API Key，跳过此数据源")
+        print("   💡 提示：可从 https://www.alphavantage.co/support/#api-key 免费获取")
         return None
     
-    print(f"✅ 数据获取成功，共 {len(data)} 个交易日")
-    print(f"数据范围: {data.index[0].strftime('%Y-%m-%d')} 至 {data.index[-1].strftime('%Y-%m-%d')}")
-    return data
+    try:
+        ticker = 'NVDA'
+        print(f"[Alpha Vantage] 正在获取 {ticker} 数据...")
+        
+        # Alpha Vantage API - 使用免费版 TIME_SERIES_DAILY（不带 outputsize）
+        url = "https://www.alphavantage.co/query"
+        params = {
+            'function': 'TIME_SERIES_DAILY',  # 免费版端点
+            'symbol': ticker,
+            # 注意：免费版不支持 outputsize=full，只能获取最近100个交易日
+            'apikey': api_key
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            print(f"❌ [Alpha Vantage] HTTP 错误：{response.status_code}")
+            return None
+        
+        result = response.json()
+        
+        # 检查是否有错误信息
+        if 'Error Message' in result:
+            print(f"❌ [Alpha Vantage] API 错误：{result['Error Message']}")
+            return None
+        
+        if 'Note' in result:
+            print(f"⚠️  [Alpha Vantage] 限流提示：{result['Note']}")
+            print("   💡 建议：等待 60 秒后重试，或配置多个 API Key")
+            return None
+        
+        # 检查是否为付费端点提示
+        if 'Information' in result:
+            print(f"❌ [Alpha Vantage] {result['Information']}")
+            print("   💡 提示：TIME_SERIES_DAILY_ADJUSTED 是付费端点，已自动切换到 TIME_SERIES_DAILY")
+            return None
+        
+        # 解析时间序列数据
+        time_series = result.get('Time Series (Daily)', {})
+        
+        if not time_series:
+            print("❌ [Alpha Vantage] 未获取到时间序列数据")
+            print("   💡 可能原因：")
+            print("      1. API Key 无效或已过期")
+            print("      2. 股票代码不正确")
+            print("      3. 非交易时间且无最新数据")
+            print(f"   🔍 完整响应: {json.dumps(result, indent=2, ensure_ascii=False)[:500]}")
+            return None
+        
+        # 转换为 DataFrame
+        df = pd.DataFrame.from_dict(time_series, orient='index')
+        df.index = pd.to_datetime(df.index)
+        df.sort_index(inplace=True)
+        
+        # 重命名列（TIME_SERIES_DAILY 没有 adjusted close）
+        df.rename(columns={
+            '1. open': 'Open',
+            '2. high': 'High',
+            '3. low': 'Low',
+            '4. close': 'Close',
+            '5. volume': 'Volume'
+        }, inplace=True)
+        
+        # 数据类型转换
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # 根据 period 过滤数据
+        if period == '1mo':
+            cutoff_date = datetime.now() - timedelta(days=30)
+        elif period == '3mo':
+            cutoff_date = datetime.now() - timedelta(days=90)
+        elif period == '6mo':
+            cutoff_date = datetime.now() - timedelta(days=180)
+        elif period == '1y':
+            cutoff_date = datetime.now() - timedelta(days=365)
+        else:
+            cutoff_date = datetime.now() - timedelta(days=180)
+        
+        df = df[df.index >= cutoff_date]
+        
+        print(f"✅ [Alpha Vantage] 数据获取成功，共 {len(df)} 个交易日")
+        print(f"   数据范围: {df.index[0].strftime('%Y-%m-%d')} 至 {df.index[-1].strftime('%Y-%m-%d')}")
+        
+        return df
+        
+    except Exception as e:
+        print(f"❌ [Alpha Vantage] 数据获取失败：{e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def generate_mock_data(period='6mo'):
+    """
+    生成模拟的英伟达历史数据（用于测试）
+    """
+    print("正在生成模拟数据...")
+    
+    # 计算日期范围
+    end_date = pd.Timestamp.now()
+    
+    if period == '1mo':
+        days = 30
+    elif period == '3mo':
+        days = 90
+    elif period == '6mo':
+        days = 180
+    elif period == '1y':
+        days = 365
+    else:
+        days = 180
+    
+    # 生成交易日日期（排除周末）
+    dates = pd.bdate_range(end=end_date, periods=days)
+    
+    # 生成模拟价格数据（随机游走模型）
+    np.random.seed(42)  # 固定种子，保证可重复性
+    initial_price = 140.0  # 英伟达近似价格
+    
+    # 生成收盘价（随机游走）
+    returns = np.random.normal(0.001, 0.025, len(dates))  # 日均收益 0.1%，波动率 2.5%
+    close_prices = initial_price * np.cumprod(1 + returns)
+    
+    # 生成 OHLCV 数据
+    open_prices = close_prices * (1 + np.random.uniform(-0.01, 0.01, len(dates)))
+    high_prices = np.maximum(open_prices, close_prices) * (1 + np.abs(np.random.normal(0, 0.015, len(dates))))
+    low_prices = np.minimum(open_prices, close_prices) * (1 - np.abs(np.random.normal(0, 0.015, len(dates))))
+    volumes = np.random.randint(30000000, 80000000, len(dates))  # 成交量
+    
+    # 创建 DataFrame
+    df = pd.DataFrame({
+        'Open': open_prices,
+        'High': high_prices,
+        'Low': low_prices,
+        'Close': close_prices,
+        'Volume': volumes
+    }, index=dates)
+    
+    df.index.name = 'date'
+    
+    print(f"✅ 模拟数据生成成功，共 {len(df)} 个交易日")
+    print(f"数据范围: {df.index[0].strftime('%Y-%m-%d')} 至 {df.index[-1].strftime('%Y-%m-%d')}")
+    print(f"价格范围: USD {df['Close'].min():.2f} - USD {df['Close'].max():.2f}")
+    
+    return df
+
+
+def get_nvda_data(period='6mo', use_mock=False, api_key=None):
+    """
+    获取英伟达数据（带 fallback 机制）
+    
+    Args:
+        period: 数据周期 ('1mo', '3mo', '6mo', '1y')
+        use_mock: 是否直接使用模拟数据（默认 False）
+        api_key: Alpha Vantage API Key（可选）
+    
+    Returns:
+        DataFrame 或 None
+    """
+    print("=" * 55)
+    print("             数据源选择策略")
+    print("=" * 55)
+    
+    # 如果指定使用模拟数据，直接生成
+    if use_mock:
+        print("\n⚠️  用户指定使用模拟数据")
+        return generate_mock_data(period)
+    
+    # 尝试 Alpha Vantage（主数据源，需要 API Key）
+    df = get_nvda_data_from_alpha_vantage(period, api_key=api_key)
+    if df is not None:
+        return df
+
+    print("\n⚠️  Alpha Vantage 不可用，尝试 yfinance...")
+    print("-" * 55)
+    
+    # 尝试 yfinance（备用数据源）
+    df = get_nvda_data_from_yfinance(period)
+    if df is not None:
+        return df
+    
+    print("\n❌ 所有真实数据源均失败")
+    print("\n💡 建议解决方案:")
+    print("   1. 配置 Alpha Vantage API Key（推荐）")
+    print("      - 访问: https://www.alphavantage.co/support/#api-key")
+    print("      - 设置环境变量: ALPHA_VANTAGE_API_KEY")
+    print("   2. 稍后重试 yfinance（可能暂时限流）")
+    print("   3. 使用模拟数据进行功能测试")
+    print("\n⚠️  自动切换到模拟数据模式...")
+    return generate_mock_data(period)
 
 # ================== 2. 计算技术指标 ==================
 def calculate_indicators(df):
@@ -81,16 +332,21 @@ def check_alignment(latest):
     return 'neutral', '均线缠绕，无明显趋势'
 
 # ================== 4. 主分析函数 ==================
-def analyze_nvda():
-    """分析英伟达的技术形态"""
+def analyze_nvda(use_mock=False, api_key=None):
+    """分析英伟达的技术形态
+    
+    Args:
+        use_mock: 是否使用模拟数据
+        api_key: Alpha Vantage API Key（可选）
+    """
     print("=" * 55)
     print("             英伟达 (NVDA) 技术分析")
     print("=" * 55)
     
     # 获取数据（近6个月）
-    df = get_nvda_data(period='6mo')
+    df = get_nvda_data(period='6mo', use_mock=use_mock, api_key=api_key)
     if df is None:
-        return
+        return None
     
     # 计算技术指标
     df = calculate_indicators(df)
@@ -217,8 +473,33 @@ def calc_period_returns(df):
     
     return returns
 
-# ================== 6. 运行分析 ==================
+# ================== 5. 运行分析 ==================
 if __name__ == "__main__":
-    df, result = analyze_nvda()
-    if df is not None:
-        calc_period_returns(df)
+    import sys
+    
+    # 检查命令行参数
+    use_mock = '--mock' in sys.argv
+    
+    # 检查是否通过命令行传入 API Key
+    api_key = None
+    for i, arg in enumerate(sys.argv):
+        if arg == '--api-key' and i + 1 < len(sys.argv):
+            api_key = sys.argv[i + 1]
+            print(f"✅ 使用命令行提供的 API Key")
+            break
+    
+    result = analyze_nvda(use_mock=use_mock, api_key=api_key)
+    if result is None:
+        print("\n⚠️  分析失败")
+    else:
+        df, conclusion = result
+        print(f"\n✅ 分析完成！最终结论：{conclusion}")
+        
+        if len(df) > 0:
+            print(f"\n📊 数据统计:")
+            print(f"   交易日数量: {len(df)}")
+            print(f"   价格范围: USD {df['Close'].min():.2f} - USD {df['Close'].max():.2f}")
+            print(f"   最新收盘价: USD {df['Close'].iloc[-1]:.2f}")
+            
+            # 计算区间涨跌幅
+            calc_period_returns(df)
