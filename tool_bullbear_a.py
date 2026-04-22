@@ -7,6 +7,7 @@
 2. 计算常用移动平均线：MA5、MA10、MA20、MA60
 3. 定义多头/空头判定规则（均线排列 + 辅助验证）
 4. 对配置的股票池进行批量分析并输出结果
+5. 持久化评分数据到txt文件，支持历史对比
 """
 
 import pandas as pd
@@ -16,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 from loguru import logger
 import requests
 import re
+import os
+from pathlib import Path
 
 from src.utils.config import get_config
 
@@ -29,6 +32,10 @@ class TrendAnalyzer:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         }
+        # 评分持久化文件路径
+        self.score_file_path = Path(__file__).parent / "data" / "trend_scores.txt"
+        # 确保目录存在
+        self.score_file_path.parent.mkdir(parents=True, exist_ok=True)
     
     def _get_historical_klines_from_tencent(self, market: str, code: str, days: int = 250) -> pd.DataFrame:
         """
@@ -203,6 +210,87 @@ class TrendAnalyzer:
         
         return position, latest_upper, latest_lower
     
+    def save_score_to_file(self, symbol: str, date: str, score: float):
+        """
+        保存评分到txt文件
+        
+        Args:
+            symbol: 股票代码 (格式: sz.002706 或 sh.600519)
+            date: 日期 (格式: YYYY-MM-DD)
+            score: 综合评分
+        """
+        try:
+            # 检查文件是否存在，如果不存在则创建并写入表头
+            file_exists = os.path.exists(self.score_file_path)
+            
+            with open(self.score_file_path, 'a', encoding='utf-8') as f:
+                # 如果文件不存在，先写入表头
+                if not file_exists:
+                    f.write("股票代码,日期,评分\n")
+                
+                # 写入数据行
+                f.write(f"{symbol},{date},{score:.1f}\n")
+            
+            logger.debug(f"✅ 评分已保存: {symbol} | {date} | {score:.1f}")
+            
+        except Exception as e:
+            logger.error(f"❌ 保存评分失败 ({symbol}): {e}")
+    
+    def get_previous_day_score(self, symbol: str, current_date: str) -> Optional[float]:
+        """
+        获取指定股票前一日的评分
+        
+        Args:
+            symbol: 股票代码 (格式: sz.002706 或 sh.600519)
+            current_date: 当前日期 (格式: YYYY-MM-DD)
+            
+        Returns:
+            前一日的评分，如果没有则返回None
+        """
+        try:
+            # 检查文件是否存在
+            if not os.path.exists(self.score_file_path):
+                logger.debug(f"⚠️ 评分文件不存在，无法获取历史评分")
+                return None
+            
+            # 计算前一天的日期
+            current_dt = datetime.strptime(current_date, '%Y-%m-%d')
+            previous_dt = current_dt - timedelta(days=1)
+            previous_date = previous_dt.strftime('%Y-%m-%d')
+            
+            # 读取文件并查找匹配的记录
+            with open(self.score_file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+                # 跳过表头
+                for line in lines[1:]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    parts = line.split(',')
+                    if len(parts) == 3:
+                        file_symbol = parts[0]
+                        file_date = parts[1]
+                        file_score = parts[2]
+                        
+                        # 匹配股票代码和日期
+                        if file_symbol == symbol and file_date == previous_date:
+                            try:
+                                score = float(file_score)
+                                logger.debug(f"✅ 找到前一日评分: {symbol} | {previous_date} | {score:.1f}")
+                                return score
+                            except ValueError:
+                                logger.warning(f"⚠️ 评分格式错误: {file_score}")
+                                continue
+            
+            logger.debug(f"⚠️ 未找到前一日评分: {symbol} | {previous_date}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 读取前一日评分失败 ({symbol}): {e}")
+            return None
+    
     def analyze_stock(self, symbol: str, name: str = '') -> Optional[Dict]:
         """
         综合分析一只股票
@@ -336,7 +424,15 @@ class TrendAnalyzer:
                 'conclusion': conclusion
             }
             
-            # 8. 输出详细结果
+            # 8. 持久化评分
+            analysis_date = result['date']
+            self.save_score_to_file(symbol, analysis_date, score)
+            
+            # 9. 获取前一日评分用于对比
+            previous_score = self.get_previous_day_score(symbol, analysis_date)
+            result['previous_score'] = previous_score
+            
+            # 10. 输出详细结果
             logger.info(f"最新日期: {result['date']}")
             logger.info(f"最新收盘价: {latest_close:.2f}")
             logger.info(f"均线状态: {ma_msg}")
@@ -346,6 +442,15 @@ class TrendAnalyzer:
             logger.info(f"布林带: 上轨={upper:.2f} | 中轨={(upper+lower)/2:.2f} | 下轨={lower:.2f}")
             logger.info(f"成交量: {latest_vol:.0f} (20日均量: {vol_ma20:.0f}, 比例: {vol_ratio:.2f})")
             logger.info(f"综合评分: {score:.1f} ({'偏多' if score>1 else '偏空' if score<-1 else '中性'})")
+            
+            # 显示与前一日评分的对比
+            if previous_score is not None:
+                score_change = score - previous_score
+                change_str = f"↑{score_change:+.1f}" if score_change > 0 else f"↓{score_change:.1f}" if score_change < 0 else "→持平"
+                logger.info(f"前日评分: {previous_score:.1f} → 今日评分: {score:.1f} ({change_str})")
+            else:
+                logger.info(f"前日评分: 无历史数据")
+            
             logger.info(f"关键信号: {'; '.join(reasons) if reasons else '无明显信号'}")
             logger.info(f"\n📊 最终判断: {conclusion}")
             

@@ -465,6 +465,7 @@ class FeishuNotifier:
                 score = trend_analysis.get('score', 0)
                 close_price = trend_analysis.get('close', 0)
                 conclusion = trend_analysis.get('conclusion', '')
+                previous_score = trend_analysis.get('previous_score')  # 获取前一日评分
                 
                 # 根据趋势类型选择emoji
                 if trend_type in ['BULLISH', 'SLIGHTLY_BULLISH']:
@@ -484,11 +485,31 @@ class FeishuNotifier:
                 }
                 trend_desc = trend_desc_map.get(trend_type, '未知')
                 
-                # 格式化多空信号行
+                # 格式化多空信号行（包含前一日评分对比）
                 if close_price > 0:
-                    content += f"**{trend_emoji} 多空信号**: {trend_desc}（{score:.1f}分），{close_price:.2f}元\n"
+                    content += f"**{trend_emoji} 多空信号**: {trend_desc}（{score:.1f}分），{close_price:.2f}元"
                 else:
-                    content += f"**{trend_emoji} 多空信号**: {trend_desc}（{score:.1f}分）\n"
+                    content += f"**{trend_emoji} 多空信号**: {trend_desc}（{score:.1f}分）"
+                
+                # 添加前一日评分对比
+                if previous_score is not None:
+                    score_change = score - previous_score
+                    if score_change > 0:
+                        change_icon = "📈"
+                        change_color = "red"
+                        change_text = f"↑+{score_change:.1f}"
+                    elif score_change < 0:
+                        change_icon = "📉"
+                        change_color = "green"
+                        change_text = f"↓{score_change:.1f}"
+                    else:
+                        change_icon = "➡️"
+                        change_color = "gray"
+                        change_text = "→持平"
+                    
+                    content += f" | {change_icon} 较昨日: <font color='{change_color}'>{change_text}</font>（昨{previous_score:.1f}分）"
+                
+                content += "\n"
 
             content += f"**━━━━━━━━━━━━━━━**\n\n"
             
