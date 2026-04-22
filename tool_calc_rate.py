@@ -2,9 +2,25 @@ from mootdx.reader import Reader
 import pandas as pd
 from datetime import datetime
 import os
+import yaml
 
 # ==================== 配置区 ====================
-TDX_DIR = r"D:\Install\zd_zxzq_gm"   # 通达信安装目录
+# 从 config.yaml 读取配置
+def load_config():
+    """加载配置文件"""
+    # 获取当前脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # config.yaml 在项目根目录（与 tool_calc_rate.py 同级）
+    config_path = os.path.join(script_dir, 'config.yaml')
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"⚠️  加载配置文件失败: {e}，使用默认配置")
+        return {}
+
+config = load_config()
+TDX_DIR = config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")  # 通达信安装目录（从配置文件读取）
 INITIAL_CAPITAL = 100000  # 初始资金10万元
 DATA_DIR = "data"  # 报告输出目录
 

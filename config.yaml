@@ -156,3 +156,6 @@ stock_news_monitor:
 database:
   type: "sqlite"
   path: "data/trading.db"
+
+# 通达信安装目录
+TDX_DIR: "D:\\Install\\zd_zxzq_gm"
