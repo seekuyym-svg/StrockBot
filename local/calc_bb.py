@@ -11,12 +11,11 @@
 6. 完全独立于项目配置系统，直接在代码中配置股票池
 
 使用方法：
-    在 STOCK_POOL 列表中配置需要评估的股票
-    运行: python tool_calc_stock.py
+    在 STOCK_POOL 列表中配置需要评估的股票（只需代码，无需名称）
+    运行: python calc_bb.py
 """
 
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from loguru import logger
@@ -24,49 +23,61 @@ import requests
 import os
 from pathlib import Path
 import time
+import sys
+
+# 添加当前目录到Python路径，以便导入utils模块
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import get_stock_name  # 导入统一的股票名称获取函数
 
 
 # ==================== 配置区域 ====================
 """
 # 股票列表1#0420
 STOCK_POOL = [
-    {"code": "sh.601991", "name": "大唐发电"},
-    {"code": "sh.603565", "name": "中谷物流"},
-    {"code": "sh.603606", "name": "东方电缆"},
-    {"code": "sh.688089", "name": "嘉必优"},
-    {"code": "sh.688211", "name": "中科微至"},
-    {"code": "sh.688392", "name": "骄成超声"},
-    {"code": "sh.688558", "name": "国盛智科"},
-    {"code": "sh.688683", "name": "莱尔科技"}
+    "sh.601991",
+    "sh.603565",
+    "sh.603606",
+    "sh.688089",
+    "sh.688211",
+    "sh.688392",
+    "sh.688558",
+    "sh.688683"
 ]
 """
 """
-# 股票列表2#0422
+# 股票列表2#仙人指路#0422
 STOCK_POOL = [
-    {"code": "sz.300179", "name": "四方达"},
-    {"code": "sz.301150", "name": "中一科技"},
-    {"code": "sz.301389", "name": "隆扬电子"},
-    {"code": "sh.688146", "name": "中船特气"},
-    {"code": "sh.688268", "name": "华特气体"},
-    {"code": "sh.688655", "name": "迅捷兴"},
-    {"code": "sh.688707", "name": "振华新材"}
+    "sz.300179",
+    "sz.301150",
+    "sz.301389",
+    "sh.688146",
+    "sh.688268",
+    "sh.688655",
+    "sh.688707"
 ]
 """
-# 股票列表3#0422
+
+# 股票列表3#持续放量#0422
 STOCK_POOL = [
-    {"code": "sz.000526", "name": "学大教育"},
-    {"code": "sz.002830", "name": "名雕股份"},
-    {"code": "sz.003013", "name": "地铁设计"},
-    {"code": "sh.600500", "name": "黑牡丹"},
-    {"code": "sh.600963", "name": "岳阳林纸"},
-    {"code": "sh.601166", "name": "兴业银行"},
-    {"code": "sh.601566", "name": "九牧王"},
-    {"code": "sh.601777", "name": "千里科技"},
-    {"code": "sh.688020", "name": "方邦股份"}  
+    "sz.000526",
+    "sz.002830",
+    "sz.003013",
+    "sh.600963",      
+    "sh.601777",
+    "sh.688020"  
 ]
 
-# 评分文件路径（相对于本脚本所在目录）
-SCORE_FILE_PATH = Path(__file__).parent / "data" / "trend_scores_1.txt"
+"""
+# 股票列表4#放量上攻#0422
+STOCK_POOL = [
+    "sz.000722",
+    "sh.603936"
+]
+"""
+
+# 评分文件路径
+SCORE_FILE_PATH = Path(__file__).parent.parent / "data" / "trend_scores_1.txt"
+# r'E:\LearnPY\Projects\StockBot\data\trend_scores_1.txt'
 # =================================================
 
 
@@ -455,12 +466,12 @@ class StockTrendAnalyzer:
         
         logger.info(f"\n🎯 最终判断: {result['conclusion']}")
     
-    def analyze_stock_pool(self, stock_pool: List[Dict]) -> List[Dict]:
+    def analyze_stock_pool(self, stock_pool: List[str]) -> List[Dict]:
         """
         批量分析股票池
         
         Args:
-            stock_pool: 股票列表 [{"code": "sh.600519", "name": "贵州茅台"}, ...]
+            stock_pool: 股票代码列表 ["sh.600519", "sz.000858", ...]
             
         Returns:
             分析结果列表
@@ -474,9 +485,18 @@ class StockTrendAnalyzer:
         logger.info(f"{'='*70}")
         
         results = []
-        for i, stock in enumerate(stock_pool, 1):
-            logger.info(f"\n[{i}/{len(stock_pool)}] 正在分析...")
-            result = self.analyze_stock(stock['code'], stock.get('name', ''))
+        for i, symbol in enumerate(stock_pool, 1):
+            # 自动获取股票名称
+            parts = symbol.split('.')
+            if len(parts) == 2:
+                code = parts[1]
+                name = get_stock_name(code)
+                logger.info(f"[{i}/{len(stock_pool)}] 正在分析 {name} ({symbol})...")
+            else:
+                logger.warning(f"⚠️ 股票代码格式错误: {symbol}，跳过")
+                continue
+            
+            result = self.analyze_stock(symbol, name)
             if result:
                 results.append(result)
             

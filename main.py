@@ -4,6 +4,10 @@ import sys
 import os
 from pathlib import Path
 
+# 设置环境变量以支持UTF-8输出（解决Windows GBK编码问题）
+# 必须在导入loguru之前设置
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
 # 添加项目根目录到路径
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -23,6 +27,7 @@ from src.models.models import SignalType
 from src.utils.signal_storage import save_signal_to_file, save_all_signals_to_file
 from src.utils.scheduler import start_signal_scheduler, stop_signal_scheduler
 from src.utils.news_scheduler import start_news_monitor_scheduler, stop_news_monitor_scheduler
+from src.utils.buy_order_scheduler import start_buy_order_scheduler, stop_buy_order_scheduler
 
 # 配置日志
 logger.remove()
@@ -31,6 +36,13 @@ logger.add(
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
     level="INFO"
 )
+
+# 解决Windows GBK编码问题：重新包装stdout为UTF-8
+import io
+if sys.platform == 'win32':
+    # Windows下强制使用UTF-8编码
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # 加载配置
 config = load_config()
@@ -344,15 +356,33 @@ def main():
     if news_monitor_config.enabled and news_monitor_config.stock_pool:
         try:
             news_scheduler = start_news_monitor_scheduler()
-            logger.info(f"✅ 股票资讯监控调度器启动成功")
+            logger.info(f"[OK] 股票资讯监控调度器启动成功")
             logger.info(f"   监控股票: {[f'{s.name}({s.code})' for s in news_monitor_config.stock_pool]}")
             schedule = news_monitor_config.schedule
             logger.info(f"   执行时间: 每天 {schedule.hour:02d}:{schedule.minute:02d}:{schedule.second:02d}\n")
         except Exception as e:
-            logger.error(f"❌ 股票资讯监控调度器启动失败: {e}")
-            logger.warning("⚠️ 系统将继续运行，但不会自动监控股票资讯\n")
+            logger.error(f"[ERROR] 股票资讯监控调度器启动失败: {e}")
+            logger.warning(f"[WARN] 系统将继续运行，但不会自动监控股票资讯\n")
     else:
-        logger.info("⏸️ 股票资讯监控已禁用或股票池为空\n")
+        logger.info(f"[INFO] 股票资讯监控已禁用或股票池为空\n")
+    
+    # 启动买入委托定时任务调度器
+    logger.info("\n" + "=" * 60)
+    logger.info("启动买入委托定时任务...")
+    logger.info("=" * 60)
+    
+    buy_order_config = config.buy_order_scheduler
+    if buy_order_config.enabled:
+        try:
+            buy_order_scheduler = start_buy_order_scheduler()
+            logger.info(f"[OK] 买入委托定时任务启动成功")
+            logger.info(f"   执行时间: 周一至周五 {buy_order_config.hour:02d}:{buy_order_config.minute:02d}")
+            logger.info(f"   最低评分要求: {buy_order_config.min_score}\n")
+        except Exception as e:
+            logger.error(f"[ERROR] 买入委托定时任务启动失败: {e}")
+            logger.warning(f"[WARN] 系统将继续运行，但不会自动执行买入委托计算\n")
+    else:
+        logger.info(f"[INFO] 买入委托定时任务已禁用（根据配置）\n")
 
     # 启动API服务
     logger.info(f"启动API服务: http://{config.api.host}:{config.api.port}")
@@ -366,12 +396,13 @@ def main():
             log_level="info"
         )
     except KeyboardInterrupt:
-        logger.info("\n🛑 接收到停止信号...")
+        logger.info("\n[STOP] 接收到停止信号...")
     finally:
-        # 停止定时任务
+        # 停止所有定时任务
         stop_signal_scheduler()
         stop_news_monitor_scheduler()
-        logger.info("👋 系统已退出")
+        stop_buy_order_scheduler()
+        logger.info("[EXIT] 系统已退出")
 
 
 if __name__ == "__main__":

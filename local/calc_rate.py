@@ -3,6 +3,8 @@ import pandas as pd
 from datetime import datetime
 import os
 import yaml
+from pathlib import Path
+from utils import get_stock_name  # 导入统一的股票名称获取函数
 
 # ==================== 配置区 ====================
 # 从 config.yaml 读取配置
@@ -10,8 +12,8 @@ def load_config():
     """加载配置文件"""
     # 获取当前脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # config.yaml 在项目根目录（与 tool_calc_rate.py 同级）
-    config_path = os.path.join(script_dir, 'config.yaml')
+    # config.yaml 在项目根目录（local目录的上一级）
+    config_path = os.path.join(script_dir, '..', 'config.yaml')
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
@@ -22,7 +24,7 @@ def load_config():
 config = load_config()
 TDX_DIR = config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")  # 通达信安装目录（从配置文件读取）
 INITIAL_CAPITAL = 100000  # 初始资金10万元
-DATA_DIR = "data"  # 报告输出目录
+DATA_DIR = Path(__file__).parent.parent / "data"  # 报告输出目录（项目根目录下的data文件夹）
 
 """
 # 自选股列表1（0420选股，放量金叉，共8只个股）
@@ -60,35 +62,6 @@ watchlist = [
     {'code': '601777', 'market': 'sh'},
     {'code': '688020', 'market': 'sh'}
 ]
-
-def get_stock_name(symbol: str) -> str:
-    """根据股票代码获取股票名称（使用腾讯财经API）"""
-    try:
-        import requests
-        if symbol.startswith('6') or symbol.startswith('9'):
-            market_prefix = 'sh'
-        else:
-            market_prefix = 'sz'
-        
-        full_code = f"{market_prefix}{symbol}"
-        url = f"http://qt.gtimg.cn/q={full_code}"
-        response = requests.get(url, timeout=5)
-        response.encoding = 'gbk'
-        
-        if response.status_code == 200:
-            data_str = response.text.strip()
-            if '=' in data_str:
-                content = data_str.split('=')[1].strip('"').strip(';')
-                parts = content.split('~')
-                if len(parts) >= 2:
-                    stock_name = parts[1]
-                    if stock_name and stock_name != '':
-                        return stock_name
-        
-        return symbol
-    except Exception as e:
-        print(f"获取股票 {symbol} 名称失败: {e}")
-        return symbol
 
 def ensure_data_dir():
     """确保data目录存在"""
@@ -338,17 +311,6 @@ def calculate_single_day_returns(target_date: str):
             total_investment += actual_investment
             total_value_at_close += value_at_close
             
-            # 打印单只股票结果
-            status = "🟢" if return_rate > 0 else "🔴" if return_rate < 0 else "⚪"
-            print(f"\n{status} {code} ({stock_name})")
-            print(f"   开盘价: {open_price:.2f} 元")
-            print(f"   收盘价: {close_price:.2f} 元")
-            print(f"   买入股数: {shares_bought} 股")
-            print(f"   投入金额: {actual_investment:,.2f} 元")
-            print(f"   收盘市值: {value_at_close:,.2f} 元")
-            print(f"   收益率: {return_rate:+.2f}%")
-            print(f"   盈亏: {profit_loss:+,.2f} 元")
-            
         except Exception as e:
             print(f"❌ {code}: 处理失败 - {e}")
             import traceback
@@ -359,56 +321,28 @@ def calculate_single_day_returns(target_date: str):
         total_return_rate = (total_value_at_close - total_investment) / total_investment * 100
         total_profit_loss = total_value_at_close - total_investment
         
-        print("\n" + "=" * 80)
-        print("📊 汇总报告")
-        print("=" * 80)
-        print(f"💰 总投入金额: {total_investment:,.2f} 元")
-        print(f"📈 总市值（收盘）: {total_value_at_close:,.2f} 元")
-        print(f"📊 综合收益率: {total_return_rate:+.2f}%")
-        print(f"💵 总盈亏: {total_profit_loss:+,.2f} 元")
-        
         # 统计涨跌情况
         winners = [r for r in results if r['return_rate'] > 0]
         losers = [r for r in results if r['return_rate'] < 0]
         flat = [r for r in results if r['return_rate'] == 0]
         
-        print(f"\n🟢 上涨: {len(winners)} 只")
-        print(f"🔴 下跌: {len(losers)} 只")
-        print(f"⚪ 持平: {len(flat)} 只")
-        
-        # 最佳和最差表现
-        if winners:
-            best = max(winners, key=lambda x: x['return_rate'])
-            print(f"\n🏆 最佳表现: {best['code']} ({best['name']}) {best['return_rate']:+.2f}%")
-        
-        if losers:
-            worst = min(losers, key=lambda x: x['return_rate'])
-            print(f"📉 最差表现: {worst['code']} ({worst['name']}) {worst['return_rate']:+.2f}%")
-        
-        # 详细表格
-        print("\n" + "=" * 80)
-        print("📋 详细数据表")
-        print("=" * 80)
-        print(f"{'代码':<10} {'名称':<15} {'开盘价':>8} {'收盘价':>8} {'收益率':>10} {'盈亏':>12}")
-        print("-" * 80)
-        
-        for r in sorted(results, key=lambda x: x['return_rate'], reverse=True):
-            print(f"{r['code']:<10} {r['name']:<15} {r['open_price']:>8.2f} {r['close_price']:>8.2f} {r['return_rate']:>+9.2f}% {r['profit_loss']:>+11,.2f}")
-        
-        # 生成并保存报告
+        # 生成报告内容
         report_content = format_single_day_report(
             target_date, results, total_investment, total_value_at_close,
             total_return_rate, total_profit_loss, winners, losers, flat
         )
         
+        # 打印报告到控制台
+        print(report_content)
+        
         # 生成文件名：report_YYYYMMDD.txt
         date_str = target_date.replace('-', '')
         filename = f"report_{date_str}.txt"
         save_report_to_file(report_content, filename)
-    
-    print("\n" + "=" * 80)
-    print("✅ 计算完成！")
-    print("=" * 80)
+    else:
+        print("\n" + "=" * 80)
+        print("✅ 计算完成！(无有效数据)")
+        print("=" * 80)
 
 def calculate_period_returns(start_date: str, end_date: str):
     """
@@ -508,18 +442,6 @@ def calculate_period_returns(start_date: str, end_date: str):
             total_investment += actual_investment
             total_value_at_end += value_at_end
             
-            # 打印单只股票结果
-            status = "🟢" if return_rate > 0 else "🔴" if return_rate < 0 else "⚪"
-            print(f"\n{status} {code} ({stock_name})")
-            print(f"   买入价 ({start_date}开盘): {buy_price:.2f} 元")
-            print(f"   卖出价 ({end_date}收盘): {sell_price:.2f} 元")
-            print(f"   买入股数: {shares_bought} 股")
-            print(f"   投入金额: {actual_investment:,.2f} 元")
-            print(f"   期末市值: {value_at_end:,.2f} 元")
-            print(f"   区间收益率: {return_rate:+.2f}%")
-            print(f"   价格涨跌幅: {price_change_pct:+.2f}%")
-            print(f"   盈亏: {profit_loss:+,.2f} 元")
-            
         except Exception as e:
             print(f"❌ {code}: 处理失败 - {e}")
             import traceback
@@ -530,57 +452,29 @@ def calculate_period_returns(start_date: str, end_date: str):
         total_return_rate = (total_value_at_end - total_investment) / total_investment * 100
         total_profit_loss = total_value_at_end - total_investment
         
-        print("\n" + "=" * 80)
-        print("📊 汇总报告")
-        print("=" * 80)
-        print(f"💰 总投入金额: {total_investment:,.2f} 元")
-        print(f"📈 期末总市值: {total_value_at_end:,.2f} 元")
-        print(f"📊 综合收益率: {total_return_rate:+.2f}%")
-        print(f"💵 总盈亏: {total_profit_loss:+,.2f} 元")
-        
         # 统计涨跌情况
         winners = [r for r in results if r['return_rate'] > 0]
         losers = [r for r in results if r['return_rate'] < 0]
         flat = [r for r in results if r['return_rate'] == 0]
         
-        print(f"\n🟢 盈利: {len(winners)} 只")
-        print(f"🔴 亏损: {len(losers)} 只")
-        print(f"⚪ 持平: {len(flat)} 只")
-        
-        # 最佳和最差表现
-        if winners:
-            best = max(winners, key=lambda x: x['return_rate'])
-            print(f"\n🏆 最佳表现: {best['code']} ({best['name']}) {best['return_rate']:+.2f}%")
-        
-        if losers:
-            worst = min(losers, key=lambda x: x['return_rate'])
-            print(f"📉 最差表现: {worst['code']} ({worst['name']}) {worst['return_rate']:+.2f}%")
-        
-        # 详细表格
-        print("\n" + "=" * 80)
-        print("📋 详细数据表")
-        print("=" * 80)
-        print(f"{'代码':<10} {'名称':<15} {'买入价':>8} {'卖出价':>8} {'收益率':>10} {'盈亏':>12}")
-        print("-" * 80)
-        
-        for r in sorted(results, key=lambda x: x['return_rate'], reverse=True):
-            print(f"{r['code']:<10} {r['name']:<15} {r['buy_price']:>8.2f} {r['sell_price']:>8.2f} {r['return_rate']:>+9.2f}% {r['profit_loss']:>+11,.2f}")
-        
-        # 生成并保存报告
+        # 生成报告内容
         report_content = format_period_report(
             start_date, end_date, results, total_investment, total_value_at_end,
             total_return_rate, total_profit_loss, winners, losers, flat
         )
+        
+        # 打印报告到控制台
+        print(report_content)
         
         # 生成文件名：report_YYYYMMDD_YYYYMMDD.txt
         start_str = start_date.replace('-', '')
         end_str = end_date.replace('-', '')
         filename = f"report_{start_str}_{end_str}.txt"
         save_report_to_file(report_content, filename)
-    
-    print("\n" + "=" * 80)
-    print("✅ 计算完成！")
-    print("=" * 80)
+    else:
+        print("\n" + "=" * 80)
+        print("✅ 计算完成！(无有效数据)")
+        print("=" * 80)
 
 if __name__ == "__main__":
     print("请选择计算模式：")

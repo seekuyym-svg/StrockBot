@@ -159,6 +159,14 @@ class StockNewsMonitorConfig(BaseModel):
     schedule: ScheduleConfig = ScheduleConfig()  # 定时任务配置
 
 
+class BuyOrderSchedulerConfig(BaseModel):
+    """买入委托定时任务配置"""
+    enabled: bool = True  # 是否启用买入委托定时任务
+    hour: int = 9  # 执行小时（24小时制）
+    minute: int = 26  # 执行分钟
+    min_score: float = 1.0  # 最低综合评分阈值
+
+
 class FeishuNotificationConfig(BaseModel):
     """飞书通知配置"""
     enabled: bool = False  # 是否启用飞书通知
@@ -193,6 +201,7 @@ class AppConfig(BaseModel):
     scheduler: SchedulerConfig = SchedulerConfig()
     notification: NotificationConfig = NotificationConfig()
     stock_news_monitor: StockNewsMonitorConfig = StockNewsMonitorConfig()
+    buy_order_scheduler: BuyOrderSchedulerConfig = BuyOrderSchedulerConfig()
     database: DatabaseConfig = DatabaseConfig()
 
 

@@ -140,7 +140,7 @@ stock_news_monitor:
     # 个股资讯（来自东方财富搜索）
     individual_news:
       enabled: true
-      url_template: "https://so.eastmoney.com/news/s?keyword={symbol}"
+      url_template: "https://so.eastmemory.com/news/s?keyword={symbol}"
     # 财务报告公告
     financial_reports:
       enabled: true
@@ -151,6 +151,16 @@ stock_news_monitor:
     hour: 21
     minute: 0
     second: 0
+
+# 买入委托定时任务配置
+buy_order_scheduler:
+  # 是否启用买入委托定时任务
+  enabled: true
+  # 执行时间（24小时制）
+  hour: 9
+  minute: 26
+  # 最低综合评分阈值
+  min_score: 1.0
 
 # 数据库配置
 database:
