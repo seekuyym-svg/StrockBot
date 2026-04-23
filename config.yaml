@@ -162,6 +162,12 @@ buy_order_scheduler:
   # 最低综合评分阈值
   min_score: 1.0
 
+# 成交量选股策略配置
+volume_strategy:
+  # 最大允许涨跌幅（%）：period天内涨幅超过此值的股票将被过滤
+  # 目的：避免追高，选择相对低位的放量股票
+  max_price_change_pct: 20.0
+
 # 数据库配置
 database:
   type: "sqlite"

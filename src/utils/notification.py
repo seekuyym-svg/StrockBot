@@ -459,7 +459,7 @@ class FeishuNotifier:
                 content += " | ".join(indicators) + "\n"
             
             # 添加多空信号
-            trend_analysis = stock_info.get('trend_analysis', {})
+            trend_analysis = stock_info.get('trend_analysis') or {}
             if trend_analysis:
                 trend_type = trend_analysis.get('trend', 'NEUTRAL')
                 score = trend_analysis.get('score', 0)

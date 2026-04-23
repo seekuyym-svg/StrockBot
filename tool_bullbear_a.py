@@ -238,14 +238,14 @@ class TrendAnalyzer:
     
     def get_previous_day_score(self, symbol: str, current_date: str) -> Optional[float]:
         """
-        获取指定股票前一日的评分
+        获取指定股票前一交易日的评分（自动跳过周末和节假日）
         
         Args:
             symbol: 股票代码 (格式: sz.002706 或 sh.600519)
             current_date: 当前日期 (格式: YYYY-MM-DD)
             
         Returns:
-            前一日的评分，如果没有则返回None
+            前一交易日的评分，如果没有则返回None
         """
         try:
             # 检查文件是否存在
@@ -253,14 +253,12 @@ class TrendAnalyzer:
                 logger.debug(f"⚠️ 评分文件不存在，无法获取历史评分")
                 return None
             
-            # 计算前一天的日期
-            current_dt = datetime.strptime(current_date, '%Y-%m-%d')
-            previous_dt = current_dt - timedelta(days=1)
-            previous_date = previous_dt.strftime('%Y-%m-%d')
-            
-            # 读取文件并查找匹配的记录
+            # 读取所有评分记录，找到该股票最近的一次评分（在当前日期之前）
             with open(self.score_file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
+                
+                # 存储该股票的所有评分记录
+                stock_scores = []
                 
                 # 跳过表头
                 for line in lines[1:]:
@@ -274,18 +272,32 @@ class TrendAnalyzer:
                         file_date = parts[1]
                         file_score = parts[2]
                         
-                        # 匹配股票代码和日期
-                        if file_symbol == symbol and file_date == previous_date:
+                        # 只收集当前股票的记录
+                        if file_symbol == symbol:
                             try:
                                 score = float(file_score)
-                                logger.debug(f"✅ 找到前一日评分: {symbol} | {previous_date} | {score:.1f}")
-                                return score
+                                stock_scores.append({
+                                    'date': file_date,
+                                    'score': score
+                                })
                             except ValueError:
-                                logger.warning(f"⚠️ 评分格式错误: {file_score}")
                                 continue
-            
-            logger.debug(f"⚠️ 未找到前一日评分: {symbol} | {previous_date}")
-            return None
+                
+                if not stock_scores:
+                    logger.debug(f"⚠️ 未找到股票 {symbol} 的历史评分")
+                    return None
+                
+                # 按日期排序（从新到旧）
+                stock_scores.sort(key=lambda x: x['date'], reverse=True)
+                
+                # 找到第一个早于当前日期的评分
+                for record in stock_scores:
+                    if record['date'] < current_date:
+                        logger.debug(f"✅ 找到前一交易日评分: {symbol} | {record['date']} | {record['score']:.1f}")
+                        return record['score']
+                
+                logger.debug(f"⚠️ 未找到 {symbol} 在 {current_date} 之前的评分")
+                return None
             
         except Exception as e:
             logger.error(f"❌ 读取前一日评分失败 ({symbol}): {e}")

@@ -288,6 +288,64 @@ def _compute_bollinger(df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> 
     return position, upper.iloc[-1], lower.iloc[-1]
 
 
+def calculate_price_change(market: str, code: str, start_date: str, end_date: str) -> Optional[float]:
+    """
+    计算指定时间段内的股票涨跌幅
+    
+    Args:
+        market: 市场代码 ('sh' 或 'sz')
+        code: 股票代码
+        start_date: 起始日期 (格式: 'YYYY-MM-DD' 或 'YYYYMMDD')
+        end_date: 结束日期 (格式: 'YYYY-MM-DD' 或 'YYYYMMDD')
+    
+    Returns:
+        float: 涨跌幅百分比（如 +15.5 表示上涨15.5%，-8.3 表示下跌8.3%）
+               失败返回None
+    
+    Example:
+        >>> calculate_price_change('sz', '000526', '2024-01-01', '2024-01-31')
+        5.23  # 表示上涨5.23%
+    """
+    try:
+        # 获取K线数据（需要足够的数据覆盖时间段）
+        df = _get_historical_klines(market, code, days=300)
+        
+        if df.empty:
+            return None
+        
+        # 标准化日期格式
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        
+        # 确保索引是datetime类型
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        
+        # 筛选指定时间段的数据
+        mask = (df.index >= start_dt) & (df.index <= end_dt)
+        period_data = df.loc[mask]
+        
+        if len(period_data) < 2:
+            # 数据不足，无法计算
+            return None
+        
+        # 获取起始日和结束日的收盘价
+        start_price = period_data['close'].iloc[0]
+        end_price = period_data['close'].iloc[-1]
+        
+        # 计算涨跌幅
+        if start_price == 0:
+            return None
+        
+        change_pct = (end_price - start_price) / start_price * 100
+        
+        return round(change_pct, 2)
+        
+    except Exception as e:
+        print(f"[WARN] 计算涨跌幅失败 ({market}{code}, {start_date}~{end_date}): {e}")
+        return None
+
+
 def format_number(num: float, decimals: int = 2) -> str:
     """
     格式化数字，添加千位分隔符
