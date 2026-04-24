@@ -1,4 +1,3 @@
-from mootdx.reader import Reader
 import pandas as pd
 import numpy as np
 import os
@@ -295,6 +294,7 @@ def main(period=5):
     print("=" * 80)
     
     # 初始化 Reader: 指向本地通达信数据目录
+    from mootdx.reader import Reader
     reader = Reader.factory(market='std', tdxdir=TDX_DIR)
     
     # 获取股票列表

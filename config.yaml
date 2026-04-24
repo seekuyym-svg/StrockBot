@@ -164,9 +164,37 @@ buy_order_scheduler:
 
 # 成交量选股策略配置
 volume_strategy:
-  # 最大允许涨跌幅（%）：period天内涨幅超过此值的股票将被过滤
+  # 最大最小允许涨跌幅（%）：5日涨跌幅区间筛选
   # 目的：避免追高，选择相对低位的放量股票
-  max_price_change_pct: 20.0
+  max_price_change_pct: 12.0
+  min_price_change_pct: 3.0
+  # 放量的天数，默认为5天（用于 select_daysvol.py）
+  period: 5
+  # 最小上市天数：上市不足此天数的股票将被过滤（默认365天=1年）
+  # 目的：过滤次新股，避免波动过大、数据不稳定的股票
+  min_listing_days: 365  
+
+# 缩量突破选股策略配置（用于 select_shrinkbreakvol.py）
+shrinkbreak_strategy:
+  # 缩量比例阈值：近5日均量 / 20日均量 < 此值
+  shrink_ratio: 0.6
+  # 相对昨日成交量倍数：当日量 > 昨日量 * 此值
+  vol_multiplier_yesterday: 2.0
+  # 相对20日均量倍数：当日量 > 20日均量 * 此值
+  vol_multiplier_avg: 1.5
+  # 回看天数：用于最高价突破判断
+  lookback_days: 20
+
+# 均线突破选股策略配置（用于 select_linebreakvol.py）
+linebreak_vol_strategy:
+  # 均线收敛阈值(%)：MA5/10/20/60 最大最小差距 < 此值
+  threshold: 2.0
+  # 最小涨幅(%)：当日涨幅 >= 此值
+  min_return: 1.0
+  # 最大涨幅(%)：当日涨幅 <= 此值
+  max_return: 7.0
+  # 成交量倍数：当日量 > 20日均量 * 此值
+  volume_ratio: 1.8
 
 # 数据库配置
 database:

@@ -1,11 +1,16 @@
-from mootdx.reader import Reader
+import sys
+import os
 import pandas as pd
 import numpy as np
-import os
 import yaml
 from pathlib import Path
 from datetime import datetime, timedelta
-from utils import get_stock_name, calculate_trend_score, calculate_price_change  # 导入综合评分和涨跌幅计算功能
+# 添加项目根目录到Python路径，确保可以导入local模块
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from local.utils import get_stock_name, calculate_trend_score, calculate_price_change, is_new_stock, calculate_5day_price_change  # 导入综合评分、涨跌幅计算、新股检测和5日涨跌幅计算功能
+from mootdx.reader import Reader
+
 
 # ==================== 配置区 ====================
 def load_config():
@@ -33,8 +38,16 @@ config = load_config()
 TDX_DIR = config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")  # 通达信安装目录
 DATA_DIR = Path(__file__).parent.parent / "data"  # 选股结果输出目录（项目根目录下的data文件夹）
 
-# 涨跌幅过滤配置
-MAX_PRICE_CHANGE_PCT = config.get('VOLUME_STRATEGY', {}).get('max_price_change_pct', 20.0)  # 最大允许涨跌幅（%）
+# 涨跌幅过滤配置（5日区间）
+MIN_PRICE_CHANGE_PCT = config.get('volume_strategy', {}).get('min_price_change_pct', 3.0)   # 最小允许涨跌幅（%）
+MAX_PRICE_CHANGE_PCT = config.get('volume_strategy', {}).get('max_price_change_pct', 18.0)  # 最大允许涨跌幅（%）
+
+# 新股过滤配置
+MIN_LISTING_DAYS = config.get('volume_strategy', {}).get('min_listing_days', 365)  # 最小上市天数，默认365天（1年）
+
+# 放量天数配置
+PERIOD = config.get('volume_strategy', {}).get('period', 5)  # 连续放量天数，默认5天
+
 
 def ensure_data_dir():
     """确保data目录存在"""
@@ -101,6 +114,59 @@ def save_selected_stocks(selected: list):
         import traceback
         traceback.print_exc()
         return False
+
+def get_all_stocks_from_local():
+    """
+    从通达信本地数据文件扫描获取全部A股股票列表
+    
+    数据来源:
+        - 通达信本地文件系统: 扫描 vipdoc/{market}/lday/ 目录下的 .day 文件
+        - 优点: 速度极快（本地IO），无需网络连接
+        - 缺点: 依赖通达信数据的完整性
+    
+    过滤规则:
+        - 只保留主板(60/00)、创业板(30)、科创板(68)开头的股票
+        - 排除北交所(83/87等)和其他市场
+    
+    Returns:
+        list: 股票代码列表（不含市场前缀的6位数字）
+    """
+    stock_codes = set()
+    vipdoc_dir = Path(TDX_DIR) / "vipdoc"
+    
+    print("[LOAD] 正在扫描本地通达信数据文件...")
+    
+    # 扫描上海和深圳市场
+    for market in ['sh', 'sz']:
+        lday_dir = vipdoc_dir / market / "lday"
+        
+        if not lday_dir.exists():
+            print(f"[WARN]  目录不存在: {lday_dir}")
+            continue
+        
+        # 遍历所有 .day 文件
+        day_files = list(lday_dir.glob("*.day"))
+        
+        for day_file in day_files:
+            # 文件名格式: {market}{code}.day (如 sh600000.day)
+            filename = day_file.stem  # 去掉 .day 扩展名
+            
+            # 提取6位股票代码（最后6个字符）
+            if len(filename) >= 6:
+                code = filename[-6:]
+                
+                # 验证是否为纯数字
+                if code.isdigit():
+                    # 过滤规则: 只保留 00/30/60/68 开头的股票
+                    if code.startswith(('00', '30', '60', '68')):
+                        stock_codes.add(code)
+    
+    # 转换为排序列表
+    stock_list = sorted(list(stock_codes))
+    
+    print(f"[OK] 从本地文件扫描到 {len(stock_list)} 只A股股票")
+    
+    return stock_list
 
 def get_all_stocks_from_tdx():
     """
@@ -211,7 +277,7 @@ def is_suspended_or_delisted(reader, stock_code, max_data_age_days=3):
         
     except Exception as e:
         # 静默处理错误，但打印调试信息
-        # print(f"  ⚠️  {stock_code} 检测异常: {e}")
+        # print(f"  [WARN]  {stock_code} 检测异常: {e}")
         return False
 
 def check_continuous_volume(reader, stock_code, period=5):
@@ -271,16 +337,19 @@ def main(period=5):
     
     流程概述:
         1. 初始化 mootdx Reader (绑定本地通达信目录)
-        2. 获取全市场股票列表 (akshare)
-        3. 循环遍历每只股票:
-           - 预处理: 剔除 ST/退市股、停牌股
-           - 核心计算: 检查本地数据是否满足持续放量
-        4. 二次筛选: 对选中的股票计算period天内的涨跌幅，过滤涨幅过大的股票
+        2. 获取全市场股票列表 (或白名单)
+        3. 第一阶段 (极速筛选):
+           - 仅使用股票代码 + 本地技术指标 (持续放量)
+           - 若非白名单模式，额外进行 ST/停牌检测 (需获取名称)
+           - 此阶段避免大规模网络请求
+        4. 第二阶段 (精细筛选):
+           - 仅对第一阶段选出的候选股票执行高成本操作
+           - 批量获取名称、新股检测、涨跌幅过滤
         5. 输出结果
     
     性能优化点:
-        - 当前为单线程串行处理，扫描全市场约需几分钟。
-        - 若需提速，可引入 concurrent.futures 进行多进程并行处理 (注意 mootdx 实例线程安全性，建议每个进程独立创建 Reader)。
+        - 将高成本的名称获取和网络请求延迟到第二阶段，大幅减少无效开销。
+        - 第一阶段仅处理代码和本地二进制数据，速度极快。
     
     Args:
         period: 连续放量天数，默认5天
@@ -289,120 +358,141 @@ def main(period=5):
         list: 选中的股票列表 [(code, name), ...]
     """
     print("=" * 80)
-    print(f"[INFO] 持续放量选股工具（本地数据源）")
+    print(f"[INFO] 持续放量选股工具（使用白名单加速）")
     print(f"[INFO] 连续放量天数: {period} 天")
-    print(f"[INFO] 涨跌幅过滤阈值: +{MAX_PRICE_CHANGE_PCT}% (超过此涨幅的股票将被过滤)")
+    print(f"[INFO] 涨跌幅过滤区间: {MIN_PRICE_CHANGE_PCT}% ~ {MAX_PRICE_CHANGE_PCT}% (超出此区间的股票将被过滤)")
+    print(f"[INFO] 新股过滤: 上市不足 {MIN_LISTING_DAYS} 天的股票将被过滤")
     print("=" * 80)
+    
+    # ========== 新增：加载白名单 ==========
+    from local.utils import load_whitelist
+    
+    whitelist = load_whitelist()
+    
+    if not whitelist:
+        print("[WARN] 白名单未生成，将使用传统方式扫描")
+        print("[TIP] 建议先运行: python local/manage_stock_list.py --update\n")
+        # 降级到原有逻辑
+        stock_codes = get_all_stocks_from_local()
+        use_whitelist = False
+    else:
+        stock_codes = list(whitelist)
+        use_whitelist = True
+        print(f"[OK] 使用白名单快速筛选，共 {len(stock_codes)} 只候选股票\n")
+    # ======================================
     
     # 初始化 Reader: 指向本地通达信数据目录
     reader = Reader.factory(market='std', tdxdir=TDX_DIR)
     
-    # 获取股票列表
-    print("\n[LOAD] 正在获取股票列表...")
-    stock_list = get_all_stocks_from_tdx()
-    
-    if stock_list.empty:
+    if not stock_codes:
         print("[ERROR] 无法获取股票列表，退出")
         return []
     
-    selected_codes = []  # 第一阶段选中的股票代码
-    total_count = len(stock_list)
+    selected_codes = []  # 第一阶段选中的股票代码（仅代码，无名称）
+    total_count = len(stock_codes)
     processed_count = 0
     filtered_st_count = 0  # 被过滤的ST股数量
     filtered_suspended_count = 0  # 被过滤的停牌股数量
     
     print(f"\n[SCAN] 开始扫描 {total_count} 只股票...\n")
     
-    # 第一阶段：基础筛选（停牌、ST、成交量）
-    for idx, row in stock_list.iterrows():
-        code = row['code']
-        name = row['name']
-        
+    # 第一阶段：极速筛选（仅使用股票代码 + 本地技术指标）
+    for idx, code in enumerate(stock_codes):
         processed_count += 1
         
         # 进度反馈: 每100只打印一次，减少IO开销
         if processed_count % 100 == 0:
             print(f"[PROGRESS] 进度: {processed_count}/{total_count} ({processed_count/total_count*100:.1f}%)")
         
-        # 1. 基本面过滤: 剔除 ST / 退市股
-        if is_st_or_terminated(code, name):
-            filtered_st_count += 1
-            continue
+        # 如果使用白名单，跳过ST和停牌检测（假设白名单已清洗过）
+        if not use_whitelist:
+            # 1. 基本面过滤: 剔除 ST / 退市股（需要名称，但仅在非白名单模式下执行）
+            name = get_stock_name(code)
+            if is_st_or_terminated(code, name):
+                filtered_st_count += 1
+                continue
+            
+            # 2. 停牌/摘牌检测: 剔除停牌股和已摘牌股
+            if is_suspended_or_delisted(reader, code):
+                filtered_suspended_count += 1
+                continue
         
-        # 2. 停牌/摘牌检测: 剔除停牌股和已摘牌股
-        if is_suspended_or_delisted(reader, code):
-            filtered_suspended_count += 1
-            continue
-        
-        # 3. 技术面过滤: 判断持续放量
+        # 3. 技术面过滤: 判断持续放量（纯本地数据，速度极快）
         if check_continuous_volume(reader, code, period):
-            selected_codes.append((code, name))
+            selected_codes.append(code)  # 仅保存代码
     
     print(f"\n[PHASE1] 第一阶段筛选完成，候选股票: {len(selected_codes)} 只")
+    if not use_whitelist:
+        print(f"[FILTER] 已过滤 ST股: {filtered_st_count} 只, 停牌/过时数据: {filtered_suspended_count} 只")
     
-    # 第二阶段：涨跌幅过滤
-    final_selected = []
-    filtered_high_change_count = 0
+    # 第二阶段：结果增强（仅对选中的股票执行高成本操作）
+    selected_codes_filtered = []
+    filtered_new_stock_count = 0
     
     if selected_codes:
-        print(f"\n[PHASE2] 开始第二阶段筛选：涨跌幅过滤...\n")
+        print(f"\n[PHASE2] 开始第二阶段：获取名称 + 新股检测 + 涨跌幅过滤...\n")
         
-        for idx, (code, name) in enumerate(selected_codes, 1):
+        # 2.1 批量获取候选股票的名称
+        print("[LOAD] 正在获取候选股票名称...")
+        stock_name_cache = {}
+        for code in selected_codes:
+            stock_name_cache[code] = get_stock_name(code)
+        print(f"[OK] 名称获取完成\n")
+        
+        # 2.2 对每个候选股票进行新股检测和涨跌幅过滤
+        for code in selected_codes:
+            name = stock_name_cache.get(code, code)
+            
+            # 1. 新股检测（仅对候选股票执行）
+            if is_new_stock(code, MIN_LISTING_DAYS):
+                filtered_new_stock_count += 1
+                print(f"[FILTER] {code} {name} - 新股（上市不足{MIN_LISTING_DAYS}天）")
+                continue
+            
+            # 2. 计算5日涨跌幅（仅对候选股票执行）
             # 确定市场前缀
             if code.startswith('6') or code.startswith('9'):
                 market = 'sh'
             else:
                 market = 'sz'
             
-            # 计算时间区间：从period天前到今天
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=period+5)  # 多取几天确保有足够数据
+            price_change_pct = calculate_5day_price_change(market, code)
             
-            # 格式化日期
-            start_date_str = start_date.strftime('%Y-%m-%d')
-            end_date_str = end_date.strftime('%Y-%m-%d')
-            
-            # 计算涨跌幅
-            change_pct = calculate_price_change(market, code, start_date_str, end_date_str)
-            
-            if change_pct is None:
-                # 计算失败，保守起见保留该股票
-                final_selected.append((code, name))
-                print(f"[KEEP] {code} {name} (涨跌幅计算失败，保留)")
-                continue
-            
-            # 检查是否超过阈值
-            if change_pct >= MAX_PRICE_CHANGE_PCT:
-                filtered_high_change_count += 1
-                print(f"[FILTER] {code} {name} - 涨跌幅: {change_pct:+.2f}% (超过阈值，过滤)")
+            # 如果涨跌幅超出允许范围，过滤掉
+            if price_change_pct is None:
+                # 计算失败，保守保留
+                selected_codes_filtered.append((code, name))
+                print(f"[KEEP] {code} {name} - 涨跌幅计算失败，保留")
+            elif price_change_pct < MIN_PRICE_CHANGE_PCT or price_change_pct > MAX_PRICE_CHANGE_PCT:
+                print(f"[FILTER] {code} {name} - 涨跌幅: {price_change_pct:+.2f}% (超出区间)")
             else:
-                final_selected.append((code, name))
-                print(f"[SELECTED] {code} {name} - 涨跌幅: {change_pct:+.2f}%")
+                selected_codes_filtered.append((code, name))
+                print(f"[SELECTED] {code} {name} - 涨跌幅: {price_change_pct:+.2f}%")
     
-    # 输出最终统计结果
-    print("\n" + "=" * 80)
-    print(f"[DONE] 选股完成！")
-    print(f"[INFO] 扫描总数: {total_count} 只")
-    print(f"[FILTER] 过滤ST/退市股: {filtered_st_count} 只")
-    print(f"[FILTER] 过滤停牌/摘牌股: {filtered_suspended_count} 只")
-    print(f"[FILTER] 过滤高涨幅股(>+{MAX_PRICE_CHANGE_PCT}%): {filtered_high_change_count} 只")
-    print(f"[RESULT] 最终选中数量: {len(final_selected)} 只")
-    print(f"[INFO] 选中比例: {len(final_selected)/total_count*100:.2f}%")
-    print("=" * 80)
+    print(f"\n[PHASE2] 第二阶段筛选完成")
+    print(f"[FILTER] 过滤新股: {filtered_new_stock_count} 只")
+    print(f"[RESULT] 最终选股结果: {len(selected_codes_filtered)} 只")
     
-    if final_selected:
-        print("\n[LIST] 最终选中股票列表:")
-        print("-" * 40)
-        for code, name in final_selected:
-            print(f"{code}  {name}")
+    # 保存结果
+    save_selected_stocks(selected_codes_filtered)
     
-    return final_selected
+    return selected_codes_filtered
+
 
 if __name__ == "__main__":
-    # 可以修改这里的period参数
-    period = 5  # 连续5天放量
-    selected_stocks = main(period)
+    """
+    主入口：执行持续放量选股策略
     
-    # 保存选股结果到文件
-    if selected_stocks:
-        save_selected_stocks(selected_stocks)
+    使用方法:
+        python select_daysvol.py [--period 5]
+    
+    参数说明:
+        --period: 连续放量天数，默认5天
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="持续放量选股工具")
+    parser.add_argument('--period', type=int, default=PERIOD, help='连续放量天数')
+    args = parser.parse_args()
+    
+    main(period=args.period)

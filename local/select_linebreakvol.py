@@ -7,6 +7,7 @@
     2. 当日收盘价同时突破所有均线(>MA5, >MA10, >MA20, >MA60)
     3. 成交量 > 20日均量 * 1.8 (放量)
     4. 涨幅适中(1%~7%)，实体阳线(收盘价>开盘价)
+    5. 5日涨跌幅在 3%~18% 区间内
 
 数据来源:
     - 通达信本地数据 (via mootdx): 读取 vipdoc 目录下的 .day 文件
@@ -21,15 +22,18 @@
     --volume-ratio: 成交量倍数，默认1.8
 """
 
-from mootdx.reader import Reader
 import pandas as pd
 import numpy as np
 import os
 import yaml
 import argparse
 from pathlib import Path
-from datetime import datetime
-from utils import get_stock_name
+from datetime import datetime, timedelta
+import sys
+# 添加项目根目录到Python路径，确保可以导入local模块
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from local.utils import get_stock_name, calculate_trend_score, calculate_5day_price_change, is_new_stock  # 导入涨跌幅计算函数和新股检测函数
 
 # ==================== 配置区 ====================
 def load_config():
@@ -51,6 +55,19 @@ def load_config():
 config = load_config()
 TDX_DIR = config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")  # 通达信安装目录
 DATA_DIR = Path(__file__).parent.parent / "data"  # 选股结果输出目录
+
+# 涨跌幅过滤配置（5日区间）
+MIN_PRICE_CHANGE_PCT = config.get('volume_strategy', {}).get('min_price_change_pct', 3.0)   # 最小允许涨跌幅（%）
+MAX_PRICE_CHANGE_PCT = config.get('volume_strategy', {}).get('max_price_change_pct', 18.0)  # 最大允许涨跌幅（%）
+
+# 新股过滤配置
+MIN_LISTING_DAYS = config.get('linebreak_vol_strategy', {}).get('min_listing_days', 365)  # 最小上市天数，默认365天（1年）
+
+# 均线突破策略默认参数（可通过命令行参数覆盖）
+DEFAULT_THRESHOLD = config.get('linebreak_vol_strategy', {}).get('threshold', 2.0)  # 均线收敛阈值
+DEFAULT_MIN_RETURN = config.get('linebreak_vol_strategy', {}).get('min_return', 1.0)  # 最小涨幅
+DEFAULT_MAX_RETURN = config.get('linebreak_vol_strategy', {}).get('max_return', 7.0)  # 最大涨幅
+DEFAULT_VOLUME_RATIO = config.get('linebreak_vol_strategy', {}).get('volume_ratio', 1.8)  # 成交量倍数
 
 def ensure_data_dir():
     """确保data目录存在"""
@@ -101,6 +118,59 @@ def save_selected_stocks(selected: list):
         import traceback
         traceback.print_exc()
         return False
+
+def get_all_stocks_from_local():
+    """
+    从通达信本地数据文件扫描获取全部A股股票列表
+    
+    数据来源:
+        - 通达信本地文件系统: 扫描 vipdoc/{market}/lday/ 目录下的 .day 文件
+        - 优点: 速度极快（本地IO），无需网络连接
+        - 缺点: 依赖通达信数据的完整性
+    
+    过滤规则:
+        - 只保留主板(60/00)、创业板(30)、科创板(68)开头的股票
+        - 排除北交所(83/87等)和其他市场
+    
+    Returns:
+        list: 股票代码列表（不含市场前缀的6位数字）
+    """
+    stock_codes = set()
+    vipdoc_dir = Path(TDX_DIR) / "vipdoc"
+    
+    print("[LOAD] 正在扫描本地通达信数据文件...")
+    
+    # 扫描上海和深圳市场
+    for market in ['sh', 'sz']:
+        lday_dir = vipdoc_dir / market / "lday"
+        
+        if not lday_dir.exists():
+            print(f"[WARN]  目录不存在: {lday_dir}")
+            continue
+        
+        # 遍历所有 .day 文件
+        day_files = list(lday_dir.glob("*.day"))
+        
+        for day_file in day_files:
+            # 文件名格式: {market}{code}.day (如 sh600000.day)
+            filename = day_file.stem  # 去掉 .day 扩展名
+            
+            # 提取6位股票代码（最后6个字符）
+            if len(filename) >= 6:
+                code = filename[-6:]
+                
+                # 验证是否为纯数字
+                if code.isdigit():
+                    # 过滤规则: 只保留 00/30/60/68 开头的股票
+                    if code.startswith(('00', '30', '60', '68')):
+                        stock_codes.add(code)
+    
+    # 转换为排序列表
+    stock_list = sorted(list(stock_codes))
+    
+    print(f"[OK] 从本地文件扫描到 {len(stock_list)} 只A股股票")
+    
+    return stock_list
 
 def get_all_stocks_from_tdx():
     """
@@ -318,58 +388,79 @@ def main(threshold=2.0, min_return=1.0, max_return=7.0, volume_ratio=1.8):
     print(f"   2. 价格突破: 收盘价 > 所有均线")
     print(f"   3. 成交量放大: 成交量 > 20日均量 * {volume_ratio}")
     print(f"   4. 涨幅范围: {min_return}% ~ {max_return}%，实体阳线")
+    print(f"   5. 5日涨跌幅区间: {MIN_PRICE_CHANGE_PCT}% ~ {MAX_PRICE_CHANGE_PCT}%")
     print("=" * 60)
     
     # 初始化 mootdx Reader
     try:
+        from mootdx.reader import Reader
         reader = Reader.factory(market='std', tdxdir=TDX_DIR)
-        print(f"✅ 成功初始化 mootdx Reader (通达信目录: {TDX_DIR})")
+        print(f"[OK] 成功初始化 mootdx Reader (通达信目录: {TDX_DIR})")
     except Exception as e:
-        print(f"❌ 初始化 mootdx Reader 失败: {e}")
-        print(f"💡 请检查 TDX_DIR 配置是否正确")
+        print(f"[ERROR] 初始化 mootdx Reader 失败: {e}")
+        print(f"[TIP] 请检查 TDX_DIR 配置是否正确")
         return
     
-    # 获取全市场股票列表
-    print("\n🔍 正在获取股票列表...")
-    stock_list = get_all_stocks_from_tdx()
+    # ========== 新增：加载白名单 ==========
+    from local.utils import load_whitelist
     
-    if stock_list.empty:
-        print("❌ 无法获取股票列表，程序退出")
+    whitelist = load_whitelist()
+    
+    if not whitelist:
+        print("[WARN] 白名单未生成，将使用传统方式扫描")
+        print("[TIP] 建议先运行: python local/manage_stock_list.py --update\n")
+        # 降级到原有逻辑
+        stock_codes = get_all_stocks_from_local()
+        use_whitelist = False
+    else:
+        stock_codes = list(whitelist)
+        use_whitelist = True
+        print(f"[OK] 使用白名单快速筛选，共 {len(stock_codes)} 只候选股票\n")
+    # ======================================
+    
+    if not stock_codes:
+        print("[ERROR] 无法获取股票列表，程序退出")
         return
     
-    # 存储选中的股票
-    selected_stocks = []
-    total_count = len(stock_list)
+    # 存储选中的股票（第一阶段仅保存代码）
+    selected_codes = []
+    total_count = len(stock_codes)
     processed_count = 0
     
-    print(f"\n🚀 开始扫描 {total_count} 只股票...\n")
+    print(f"\n[SCAN] 开始扫描 {total_count} 只股票...\n")
     
-    # 遍历每只股票
-    for idx, row in stock_list.iterrows():
-        stock_code = row['code']
-        stock_name = row['name']
-        
+    # 第一阶段：极速筛选（仅使用股票代码 + 本地技术指标）
+    for idx, stock_code in enumerate(stock_codes):
         processed_count += 1
         
         # 进度显示（每100只股票显示一次）
         if processed_count % 100 == 0:
-            print(f"⏳ 已处理: {processed_count}/{total_count}, 选中: {len(selected_stocks)}")
+            print(f"[PROGRESS] 已处理: {processed_count}/{total_count}, 选中: {len(selected_codes)}")
         
-        # 预处理: 剔除ST/退市股
-        if is_st_or_terminated(stock_name):
-            continue
-        
-        # 确定市场前缀
-        if stock_code.startswith('6') or stock_code.startswith('9'):
-            market_prefix = 'sh'
+        # 如果使用白名单，跳过ST和停牌检测
+        if not use_whitelist:
+            # 预处理: 剔除ST/退市股（需要名称）
+            stock_name = get_stock_name(stock_code)
+            if is_st_or_terminated(stock_name):
+                continue
+            
+            # 确定市场前缀
+            if stock_code.startswith('6') or stock_code.startswith('9'):
+                market_prefix = 'sh'
+            else:
+                market_prefix = 'sz'
+            
+            # 检查是否停牌
+            if is_suspended(reader, stock_code):
+                continue
         else:
-            market_prefix = 'sz'
+            # 确定市场前缀（使用白名单时仍需要）
+            if stock_code.startswith('6') or stock_code.startswith('9'):
+                market_prefix = 'sh'
+            else:
+                market_prefix = 'sz'
         
-        # 检查是否停牌
-        if is_suspended(reader, stock_code):
-            continue
-        
-        # 核心逻辑: 检查均线突破条件
+        # 核心逻辑: 检查均线突破条件（纯本地数据，速度极快）
         is_match, info = check_breakout_conditions(
             reader, 
             stock_code, 
@@ -380,36 +471,65 @@ def main(threshold=2.0, min_return=1.0, max_return=7.0, volume_ratio=1.8):
         )
         
         if is_match:
-            # 从utils导入评分函数
-            from utils import calculate_trend_score
+            selected_codes.append((stock_code, market_prefix))  # 保存代码和市场前缀
+    
+    print(f"\n[PHASE1] 第一阶段筛选完成，候选股票: {len(selected_codes)} 只")
+    
+    # 第二阶段：结果增强（仅对选中的股票执行高成本操作）
+    selected_stocks = []
+    filtered_new_stock_count = 0
+    
+    if selected_codes:
+        print(f"\n[PHASE2] 开始第二阶段：获取名称 + 新股检测 + 涨跌幅过滤...\n")
+        
+        # 2.1 批量获取候选股票的名称
+        print("[LOAD] 正在获取候选股票名称...")
+        stock_name_cache = {}
+        for code, _ in selected_codes:
+            stock_name_cache[code] = get_stock_name(code)
+        print(f"[OK] 名称获取完成\n")
+        
+        # 2.2 对每个候选股票进行新股检测和涨跌幅过滤
+        for stock_code, market_prefix in selected_codes:
+            stock_name = stock_name_cache.get(stock_code, stock_code)
             
-            # 计算综合评分
+            # 1. 新股检测（仅对候选股票执行）
+            if is_new_stock(stock_code, MIN_LISTING_DAYS):
+                filtered_new_stock_count += 1
+                print(f"[FILTER] {stock_code} {stock_name} - 新股（上市不足{MIN_LISTING_DAYS}天）")
+                continue
+            
+            # 2. 计算5日涨跌幅
+            change_pct = calculate_5day_price_change(market_prefix, stock_code)
+            
+            if change_pct is None:
+                # 计算失败，保守保留
+                score = calculate_trend_score(market_prefix, stock_code)
+                selected_stocks.append((stock_code, stock_name, score))
+                print(f"[KEEP] {stock_code} {stock_name} (5日涨跌幅计算失败，保留)")
+                continue
+            
+            # 检查是否在目标区间内
+            if change_pct < MIN_PRICE_CHANGE_PCT or change_pct > MAX_PRICE_CHANGE_PCT:
+                print(f"[FILTER] {stock_code} {stock_name} - 5日涨跌幅: {change_pct:+.2f}% (超出区间)")
+                continue
+            
+            # 符合条件，计算评分
             score = calculate_trend_score(market_prefix, stock_code)
-            
             selected_stocks.append((stock_code, stock_name, score))
-            
-            # 打印详细信息
-            print(f"\n✅ 选中: {stock_code} ({stock_name})")
-            print(f"   均线: MA5={info['ma5']:.2f}, MA10={info['ma10']:.2f}, "
-                  f"MA20={info['ma20']:.2f}, MA60={info['ma60']:.2f}")
-            print(f"   均线收敛度: {info['ma_gap_pct']:.2f}%")
-            print(f"   收盘价: {info['close']:.2f}")
-            print(f"   成交量比: {info['vol_ratio']:.2f}x")
-            print(f"   涨跌幅: {info['return_pct']:.2f}%")
-            print(f"   实体占比: {info['body_ratio']:.2f}")
-            if score is not None:
-                print(f"   综合评分: {score:+.1f}")
+            print(f"[SELECTED] {stock_code} {stock_name} - 5日涨跌幅: {change_pct:+.2f}%")
+    
+    print(f"\n[PHASE2] 第二阶段筛选完成")
+    print(f"[FILTER] 过滤新股: {filtered_new_stock_count} 只")
+    print(f"[RESULT] 最终选股结果: {len(selected_stocks)} 只")
     
     # 输出最终结果
-    print("\n" + "=" * 60)
-    print(f"📊 选股完成！共选中 {len(selected_stocks)} 只股票")
-    print("=" * 60)
-    
     if selected_stocks:
         # 按综合评分排序（从高到低）
         selected_stocks.sort(key=lambda x: x[2] if x[2] is not None else -999, reverse=True)
         
-        print("\n📋 选中股票列表:")
+        print("\n" + "=" * 60)
+        print("选中股票列表:")
         print("-" * 60)
         print(f"{'代码':<10} {'名称':<10} {'评分':<8}")
         print("-" * 60)
@@ -421,20 +541,31 @@ def main(threshold=2.0, min_return=1.0, max_return=7.0, volume_ratio=1.8):
         # 保存结果
         save_selected_stocks(selected_stocks)
     else:
-        print("\n⚠️  未找到符合条件的股票")
+        print("\n" + "=" * 60)
+        print("未找到符合条件的股票")
+        print("=" * 60)
 
-if __name__ == '__main__':
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description='均线突破选股工具')
-    parser.add_argument('--threshold', type=float, default=2.0, 
-                        help='均线收敛阈值(百分比)，默认2.0')
-    parser.add_argument('--min-return', type=float, default=1.0,
-                        help='最小涨幅(百分比)，默认1.0')
-    parser.add_argument('--max-return', type=float, default=7.0,
-                        help='最大涨幅(百分比)，默认7.0')
-    parser.add_argument('--volume-ratio', type=float, default=1.8,
-                        help='成交量倍数，默认1.8')
+
+if __name__ == "__main__":
+    """
+    主入口：执行均线突破选股策略
     
+    使用方法:
+        python select_linebreakvol.py [--threshold 2.0] [--min-return 1.0] [--max-return 7.0] [--volume-ratio 1.8]
+    
+    参数说明:
+        --threshold: 均线收敛阈值(百分比)，默认2.0
+        --min-return: 最小涨幅(百分比)，默认1.0
+        --max-return: 最大涨幅(百分比)，默认7.0
+        --volume-ratio: 成交量倍数，默认1.8
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="均线突破选股工具")
+    parser.add_argument('--threshold', type=float, default=DEFAULT_THRESHOLD, help='均线收敛阈值(百分比)')
+    parser.add_argument('--min-return', type=float, default=DEFAULT_MIN_RETURN, help='最小涨幅(百分比)')
+    parser.add_argument('--max-return', type=float, default=DEFAULT_MAX_RETURN, help='最大涨幅(百分比)')
+    parser.add_argument('--volume-ratio', type=float, default=DEFAULT_VOLUME_RATIO, help='成交量倍数')
     args = parser.parse_args()
     
     main(

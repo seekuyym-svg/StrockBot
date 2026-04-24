@@ -290,7 +290,7 @@ def _compute_bollinger(df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> 
 
 def calculate_price_change(market: str, code: str, start_date: str, end_date: str) -> Optional[float]:
     """
-    计算指定时间段内的股票涨跌幅
+    计算指定时间段内的股票涨跌幅（收盘价对比）
     
     Args:
         market: 市场代码 ('sh' 或 'sz')
@@ -346,6 +346,70 @@ def calculate_price_change(market: str, code: str, start_date: str, end_date: st
         return None
 
 
+def calculate_5day_price_change(market: str, code: str) -> Optional[float]:
+    """
+    计算5个交易日涨跌幅（按交易日而非自然日）
+    
+    计算逻辑：
+    - 如果当前时间在15:00前或是周末：使用上一个交易日作为结束日期，往前推4个交易日
+    - 如果当前时间在15:00后：使用今天作为结束日期，往前推4个交易日
+    - 涨跌幅 = (结束日收盘价 - 起始日开盘价) / 起始日开盘价 * 100
+    
+    Args:
+        market: 市场代码 ('sh' 或 'sz')
+        code: 股票代码
+    
+    Returns:
+        float: 5日涨跌幅百分比，失败返回None
+    
+    Example:
+        >>> calculate_5day_price_change('sh', '600000')
+        8.65  # 表示5个交易日上涨8.65%
+    """
+    try:
+        from datetime import datetime, time
+        
+        # 获取K线数据（至少需要10个交易日数据以确保有足够的历史）
+        df = _get_historical_klines(market, code, days=30)
+        
+        if df.empty or len(df) < 5:
+            return None
+        
+        # 确保索引是datetime类型
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        
+        # 按日期排序（从早到晚）
+        df = df.sort_index()
+        
+        # 确定结束日期和起始日期（基于交易日索引）
+        # 获取最后5个交易日的数据
+        last_5_days = df.iloc[-5:]
+        
+        if len(last_5_days) < 5:
+            return None
+        
+        # 起始日：5个交易日前的那一天（第1天）
+        start_day = last_5_days.iloc[0]
+        # 结束日：最后一个交易日（第5天）
+        end_day = last_5_days.iloc[-1]
+        
+        # 计算涨跌幅：(结束日收盘价 - 起始日开盘价) / 起始日开盘价 * 100
+        start_open = start_day['open']
+        end_close = end_day['close']
+        
+        if start_open == 0:
+            return None
+        
+        change_pct = (end_close - start_open) / start_open * 100
+        
+        return round(change_pct, 2)
+        
+    except Exception as e:
+        print(f"[WARN] 计算5日涨跌幅失败 ({market}{code}): {e}")
+        return None
+
+
 def format_number(num: float, decimals: int = 2) -> str:
     """
     格式化数字，添加千位分隔符
@@ -362,6 +426,122 @@ def format_number(num: float, decimals: int = 2) -> str:
         '1,234,567.89'
     """
     return f"{num:,.{decimals}f}"
+
+
+def get_stock_list_date(symbol: str) -> Optional[str]:
+    """
+    获取股票上市日期（使用akshare接口）
+    
+    Args:
+        symbol: 股票代码（不含市场前缀），如 '000526'
+    
+    Returns:
+        str: 上市日期（格式: 'YYYY-MM-DD'），获取失败返回None
+    
+    Example:
+        >>> get_stock_list_date('000526')
+        '1996-08-08'
+    """
+    try:
+        import akshare as ak
+        
+        # 获取A股股票基本信息
+        stock_info_df = ak.stock_individual_info_em(symbol=symbol)
+        
+        if stock_info_df is None or stock_info_df.empty:
+            return None
+        
+        # 查找上市日期字段
+        # akshare返回的列名为 'item' 和 'value'
+        list_date_row = stock_info_df[stock_info_df['item'] == '上市时间']
+        
+        if not list_date_row.empty:
+            list_date_str = list_date_row['value'].iloc[0]
+            # 标准化日期格式为 YYYY-MM-DD
+            if len(list_date_str) == 8 and list_date_str.isdigit():
+                # 格式: YYYYMMDD
+                return f"{list_date_str[:4]}-{list_date_str[4:6]}-{list_date_str[6:8]}"
+            else:
+                # 尝试直接解析
+                try:
+                    dt = pd.to_datetime(list_date_str)
+                    return dt.strftime('%Y-%m-%d')
+                except:
+                    return list_date_str
+        
+        return None
+        
+    except Exception as e:
+        print(f"⚠️  获取股票 {symbol} 上市日期失败: {e}")
+        return None
+
+
+def is_new_stock(symbol: str, min_listing_days: int = 365) -> bool:
+    """
+    判断股票是否为新股（上市时间不足指定天数）
+    
+    使用腾讯财经API间接验证：获取最近的历史K线数据
+    - 如果能获取到足够多的历史数据（>=min_listing_days天），说明上市超过指定天数
+    - 如果数据不足，可能是新股或长期停牌（都需过滤）
+    
+    Args:
+        symbol: 股票代码（不含市场前缀）
+        min_listing_days: 最小上市天数，默认365天（1年）
+    
+    Returns:
+        bool: True表示是新股（上市不足指定天数），False表示不是新股
+    
+    Example:
+        >>> is_new_stock('688001', 365)
+        False  # 如果上市超过1年
+    """
+    try:
+        # 确定市场前缀
+        if symbol.startswith('6') or symbol.startswith('9'):
+            market_prefix = 'sh'
+        else:
+            market_prefix = 'sz'
+        
+        full_code = f"{market_prefix}{symbol}"
+        
+        # 使用腾讯财经API获取历史K线数据（请求min_listing_days天的数据）
+        url = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        params = {
+            "param": f"{full_code},day,,,{min_listing_days + 30},qfq"  # 多取30天作为缓冲
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # 检查返回码
+        if result.get('code') != 0:
+            print(f"[WARN] {symbol} 腾讯财经API返回错误: {result.get('msg', '未知错误')}")
+            return True  # 保守策略：无法验证时视为新股
+        
+        # 解析数据
+        stock_data = result.get('data', {}).get(full_code, {})
+        
+        # 兼容处理：优先使用前复权数据，降级到普通日线
+        klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
+        
+        if not klines or len(klines) < min_listing_days:
+            # 历史数据不足，判定为新股或长期停牌
+            actual_days = len(klines) if klines else 0
+            print(f"[INFO] {symbol} 历史数据不足: 仅{actual_days}天（需要{min_listing_days}天），判定为新股/停牌")
+            return True
+        
+        # 有足够历史数据，说明上市超过指定天数
+        return False
+        
+    except Exception as e:
+        print(f"⚠️  判断股票 {symbol} 是否为新时失败: {e}")
+        return True  # 出错时保守策略：视为新股并过滤
 
 
 if __name__ == "__main__":
@@ -386,3 +566,91 @@ if __name__ == "__main__":
             print(f"{code}: {score:+.1f}分")
         else:
             print(f"{code}: 评分失败")
+    
+    print("\n\n测试上市日期获取功能:")
+    print("-" * 40)
+    for code in test_codes:
+        list_date = get_stock_list_date(code)
+        is_new = is_new_stock(code, 365)
+        print(f"{code}: 上市日期={list_date}, 是否新股(<1年)={is_new}")
+
+
+def load_whitelist(date_str=None):
+    """
+    加载股票白名单（正常交易股票）
+    
+    Args:
+        date_str: 日期字符串 YYYYMMDD，默认今天
+    
+    Returns:
+        set: 白名单股票代码集合
+    """
+    from pathlib import Path
+    from datetime import datetime
+    
+    if date_str is None:
+        date_str = datetime.now().strftime('%Y%m%d')
+    
+    # 项目根目录的 data 文件夹
+    data_dir = Path(__file__).parent.parent / "data"
+    whitelist_file = data_dir / f"whitelist_{date_str}.txt"
+    
+    if not whitelist_file.exists():
+        print(f"[WARN] 白名单文件不存在: {whitelist_file}")
+        return set()
+    
+    try:
+        whitelist_codes = set()
+        with open(whitelist_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    whitelist_codes.add(line)
+        
+        print(f"[LOAD] 加载白名单: {len(whitelist_codes)} 只股票")
+        return whitelist_codes
+    except Exception as e:
+        print(f"[ERROR] 加载白名单失败: {e}")
+        return set()
+
+
+def load_blacklist(date_str=None):
+    """
+    加载股票黑名单（ST/停牌/退市股）
+    
+    Args:
+        date_str: 日期字符串 YYYYMMDD，默认今天
+    
+    Returns:
+        dict: {code: (name, reason), ...}
+    """
+    from pathlib import Path
+    from datetime import datetime
+    
+    if date_str is None:
+        date_str = datetime.now().strftime('%Y%m%d')
+    
+    # 项目根目录的 data 文件夹
+    data_dir = Path(__file__).parent.parent / "data"
+    blacklist_file = data_dir / f"blacklist_{date_str}.txt"
+    
+    if not blacklist_file.exists():
+        print(f"[WARN] 黑名单文件不存在: {blacklist_file}")
+        return {}
+    
+    try:
+        blacklist_dict = {}
+        with open(blacklist_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split(',')
+                    if len(parts) >= 3:
+                        code, name, reason = parts[0], parts[1], parts[2]
+                        blacklist_dict[code] = (name, reason)
+        
+        print(f"[LOAD] 加载黑名单: {len(blacklist_dict)} 只股票")
+        return blacklist_dict
+    except Exception as e:
+        print(f"[ERROR] 加载黑名单失败: {e}")
+        return {}
