@@ -11,6 +11,13 @@ symbols:
     max_add_positions: 4  # 最大加仓次数
     initial_position_pct: 6  # 初始建仓比例（占总资金百分比）
     
+    # 个性化价格监控参数（可选，不设置则使用全局默认值）
+    price_monitor_enabled: true  # 是否启用价格监控
+    sell_trigger_rise_pct: 3.0   # 卖出监控触发涨幅阈值（%）
+    sell_pullback_pct: 0.5       # 卖出监控回落幅度阈值（%）
+    buy_trigger_drop_pct: 3.8    # 买入监控触发跌幅阈值（%）
+    buy_rebound_pct: 0.6         # 买入监控反弹幅度阈值（%）
+    
   - code: "sh.513050"  # 中概互联网ETF
     name: "中概互联网ETF"
     enabled: true
@@ -19,6 +26,13 @@ symbols:
     take_profit_threshold: 3.0  # 止盈涨幅：盈利2.5%止盈
     max_add_positions: 4  # 最大加仓次数
     initial_position_pct: 6  # 初始建仓比例（占总资金百分比）
+    
+    # 个性化价格监控参数（可选，不设置则使用全局默认值）
+    price_monitor_enabled: true  # 是否启用价格监控
+    sell_trigger_rise_pct: 2.6   # 卖出监控触发涨幅阈值（%）
+    sell_pullback_pct: 0.4       # 卖出监控回落幅度阈值（%）
+    buy_trigger_drop_pct: 3.5    # 买入监控触发跌幅阈值（%）
+    buy_rebound_pct: 0.5         # 买入监控反弹幅度阈值（%）
 
 # 初始资金
 initial_capital: 300000  # 30万
@@ -104,6 +118,20 @@ scheduler:
         end_time: "11:30"    # 上午收盘
       - start_time: "13:00"  # 下午开盘
         end_time: "15:00"    # 下午收盘
+  
+  # 价格极值追踪监控配置（仅在WAIT信号时生效，作为全局默认值）
+  price_monitor:
+    enabled: true  # 是否启用价格监控
+    
+    # 卖出监控参数
+    sell_monitor:
+      trigger_rise_pct: 3.0      # 触发监控的上涨幅度阈值（%）
+      pullback_pct: 0.5          # 从最高点回落幅度阈值（%）
+    
+    # 买入监控参数
+    buy_monitor:
+      trigger_drop_pct: 3.5      # 触发监控的下跌幅度阈值（%）
+      rebound_pct: 0.5           # 从最低点反弹幅度阈值（%）
 
 # 通知配置
 notification:
@@ -128,12 +156,9 @@ stock_news_monitor:
     - code: "sz.002706"
       name: "良信股份"
       index: "二"
-    - code: "sh.600521"
-      name: "华海药业"
-      index: "三"
     - code: "sz.002126"
       name: "银轮股份"
-      index: "四"
+      index: "三"
    
   # 资讯来源配置
   news_sources:
@@ -160,7 +185,7 @@ buy_order_scheduler:
   hour: 9
   minute: 26
   # 最低综合评分阈值
-  min_score: 1.0
+  min_score: 0.5
 
 # 成交量选股策略配置
 volume_strategy:

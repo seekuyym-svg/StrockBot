@@ -34,20 +34,31 @@ class FeishuNotifier:
         else:
             logger.info("ℹ️ 飞书通知未启用")
     
-    def should_notify(self, signal_type: str) -> bool:
+    def should_notify(self, signal_type: str, reason: str = "") -> bool:
         """
         判断是否应该发送通知
         
         Args:
             signal_type: 信号类型（BUY/SELL/ADD/STOP/WAIT）
+            reason: 信号原因（用于判断是否为价格监控提醒）
             
         Returns:
             bool: 是否应该发送通知
         """
+        logger.debug(f"🔧 [DEBUG-Notify] should_notify 检查: signal_type='{signal_type}', reason='{reason[:50]}...'")
+        
         if not self.enabled:
+            logger.debug(f"❌ [DEBUG-Notify] 飞书通知未启用，返回False")
             return False
         
-        return signal_type in self.notify_signals
+        # 如果是价格监控提醒，即使类型为WAIT也发送
+        if signal_type == "WAIT" and "价格监控" in reason:
+            logger.debug(f"✅ [DEBUG-Notify] 检测到价格监控提醒，允许发送")
+            return True
+        
+        result = signal_type in self.notify_signals
+        logger.debug(f"🔧 [DEBUG-Notify] 检查 signal_type 是否在 notify_signals {self.notify_signals} 中: {result}")
+        return result
     
     def send_signal_notification(self, signal_data: Dict[str, Any]) -> bool:
         """
@@ -59,33 +70,62 @@ class FeishuNotifier:
         Returns:
             bool: 是否发送成功
         """
+        logger.debug(f"\n{'='*60}")
+        logger.debug(f"📱 [DEBUG-Notify] 开始发送飞书通知")
+        logger.debug(f"📱 [DEBUG-Notify] 信号数据: symbol={signal_data.get('symbol')}, signal_type={signal_data.get('signal_type')}")
+        
         if not self.enabled:
+            logger.warning(f"❌ [DEBUG-Notify] 飞书通知未启用，直接返回False")
+            logger.debug(f"{'='*60}\n")
             return False
         
         symbol = signal_data.get('symbol', '')
         signal_type = signal_data.get('signal_type', '')
+        reason = signal_data.get('reason', '')
         symbol_signal_type = f"{symbol}_{signal_type}"
         
-        # 检查是否需要通知该类型的信号
-        if not self.should_notify(signal_type):
-            logger.debug(f"信号类型 {signal_type} 不需要通知")
+        logger.debug(f"🔧 [DEBUG-Notify] symbol={symbol}, signal_type={signal_type}, reason='{reason[:50]}...'")
+        logger.debug(f"🔧 [DEBUG-Notify] 频率控制键名: {symbol_signal_type}")
+        
+        # 检查是否需要通知该类型的信号（传入reason用于价格监控判断）
+        logger.debug(f"🔧 [DEBUG-Notify] 调用 should_notify...")
+        should_send = self.should_notify(signal_type, reason)
+        logger.debug(f"🔧 [DEBUG-Notify] should_notify 返回: {should_send}")
+        
+        if not should_send:
+            logger.debug(f"❌ [DEBUG-Notify] should_notify 返回False，不发送通知")
+            logger.debug(f"{'='*60}\n")
             return False
+        
+        logger.debug(f"✅ [DEBUG-Notify] 通过 should_notify 检查")
         
         # 检查频率控制
         current_time = datetime.now().timestamp()
         last_send_time = self.last_send_time.get(symbol_signal_type, 0)
         time_since_last_send = current_time - last_send_time
         
+        logger.debug(f"🔧 [DEBUG-Notify] 频率控制检查:")
+        logger.debug(f"   当前时间戳: {current_time:.0f}")
+        logger.debug(f"   上次发送时间戳: {last_send_time:.0f}")
+        logger.debug(f"   时间间隔: {time_since_last_send:.0f}秒 (要求>=60秒)")
+        
         if time_since_last_send < self.min_interval_seconds:
             remaining_time = self.min_interval_seconds - time_since_last_send
-            logger.warning(f"⚠️ 飞书通知频率限制：{symbol} {signal_type} 距上次发送仅 {time_since_last_send:.0f}秒，还需等待 {remaining_time:.0f}秒")
+            logger.warning(f"⚠️ [DEBUG-Notify] 飞书通知频率限制：{symbol} {signal_type} 距上次发送仅 {time_since_last_send:.0f}秒，还需等待 {remaining_time:.0f}秒")
+            logger.debug(f"❌ [DEBUG-Notify] 频率控制拦截，返回False")
+            logger.debug(f"{'='*60}\n")
             return False
+        
+        logger.debug(f"✅ [DEBUG-Notify] 通过频率控制检查")
         
         try:
             # 构建消息内容
+            logger.debug(f"🔧 [DEBUG-Notify] 调用 _build_message...")
             message = self._build_message(signal_data)
+            logger.debug(f"✅ [DEBUG-Notify] 消息构建成功")
             
             # 发送请求
+            logger.debug(f"🔧 [DEBUG-Notify] 准备发送HTTP请求到: {self.webhook_url[:50]}...")
             headers = {'Content-Type': 'application/json'}
             response = requests.post(
                 self.webhook_url,
@@ -94,12 +134,18 @@ class FeishuNotifier:
                 timeout=10
             )
             
+            logger.debug(f"🔧 [DEBUG-Notify] HTTP响应状态码: {response.status_code}")
+            
             # 检查响应
             if response.status_code == 200:
                 result = response.json()
+                logger.debug(f"🔧 [DEBUG-Notify] API响应: {result}")
+                
                 if result.get('StatusCode') == 0 or result.get('code') == 0:
                     logger.success(f"📱 飞书通知发送成功: {signal_data.get('symbol')} - {signal_type}")
+                    logger.debug(f"✅ [DEBUG-Notify] 更新最后发送时间: {symbol_signal_type} = {current_time:.0f}")
                     self.last_send_time[symbol_signal_type] = current_time
+                    logger.debug(f"{'='*60}\n")
                     return True
                 else:
                     error_code = result.get('code', 'unknown')
@@ -112,19 +158,29 @@ class FeishuNotifier:
                     else:
                         logger.error(f"❌ 飞书API返回错误 (code: {error_code}): {error_msg}")
                     
+                    logger.debug(f"❌ [DEBUG-Notify] API返回错误，返回False")
+                    logger.debug(f"{'='*60}\n")
                     return False
             else:
                 logger.error(f"❌ 飞书通知发送失败，HTTP状态码: {response.status_code}")
+                logger.debug(f"❌ [DEBUG-Notify] HTTP状态码非200，返回False")
+                logger.debug(f"{'='*60}\n")
                 return False
                 
         except requests.exceptions.Timeout:
             logger.error("❌ 飞书通知发送超时")
+            logger.debug(f"❌ [DEBUG-Notify] 请求超时异常，返回False")
+            logger.debug(f"{'='*60}\n")
             return False
         except requests.exceptions.ConnectionError:
             logger.error("❌ 飞书通知连接失败，请检查网络和Webhook URL")
+            logger.debug(f"❌ [DEBUG-Notify] 连接异常，返回False")
+            logger.debug(f"{'='*60}\n")
             return False
         except Exception as e:
             logger.error(f"❌ 飞书通知发送异常: {e}")
+            logger.debug(f"❌ [DEBUG-Notify] 未知异常: {type(e).__name__}: {e}")
+            logger.debug(f"{'='*60}\n")
             return False
     
     def _build_message(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -175,9 +231,27 @@ class FeishuNotifier:
             'STOP': '止损信号'
         }
         
-        color = color_map.get(signal_type, 'gray')
-        emoji = emoji_map.get(signal_type, '📊')
-        title = title_map.get(signal_type, '交易信号')
+        # 检测是否为价格监控提醒
+        is_price_alert = "价格监控" in reason
+        
+        if is_price_alert:
+            # 根据reason内容设置不同的颜色和标题
+            if "卖出提醒" in reason or "回落" in reason:
+                color = "red"
+                emoji = "🔴"
+                title = "卖出提醒（价格监控）"
+            elif "买入提醒" in reason or "反弹" in reason:
+                color = "green"
+                emoji = "🟢"
+                title = "买入提醒（价格监控）"
+            else:
+                color = "gray"
+                emoji = "📊"
+                title = "价格监控提醒"
+        else:
+            color = color_map.get(signal_type, 'gray')
+            emoji = emoji_map.get(signal_type, '📊')
+            title = title_map.get(signal_type, '交易信号')
         
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         

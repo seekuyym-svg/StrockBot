@@ -21,9 +21,11 @@ def load_config():
         return {}
 
 config = load_config()
-INITIAL_CAPITAL = 200000  # 初始资金20万元
+# 从配置文件读取初始资金，如果配置不存在则使用默认值20万
+INITIAL_CAPITAL = config.get('initial_capital', 200000)
 DATA_DIR = Path(__file__).parent / "data"  # 报告输出目录（项目根目录下的data文件夹）
-MIN_SCORE = 1.0  # 最低综合评分阈值
+# 从配置文件读取最低综合评分阈值，优先从buy_order_scheduler.min_score读取，如果不存在则使用默认值0.5
+MIN_SCORE = config.get('buy_order_scheduler', {}).get('min_score', 0.5)
 
 def load_stock_pool_from_file():
     """

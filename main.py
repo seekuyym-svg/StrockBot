@@ -34,7 +34,8 @@ logger.remove()
 logger.add(
     sys.stdout,
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
-    level="INFO"
+    #level="DEBUG"  # 修改为 DEBUG 级别，显示所有调试日志
+    level="INFO"  # 修改为 INFO 级别，显示正常运行日志，隐藏调试日志
 )
 
 # 解决Windows GBK编码问题：重新包装stdout为UTF-8
