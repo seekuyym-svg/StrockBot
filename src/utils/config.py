@@ -18,6 +18,13 @@ class SymbolConfig(BaseModel):
     take_profit_threshold: float = None  # 止盈涨幅阈值
     max_add_positions: int = None  # 最大加仓次数
     initial_position_pct: float = None  # 初始建仓比例
+    
+    # 可选的个性化价格监控参数（如果不设置则使用全局默认值）
+    price_monitor_enabled: bool = None  # 是否启用价格监控
+    sell_trigger_rise_pct: float = None  # 卖出监控触发涨幅阈值（%）
+    sell_pullback_pct: float = None  # 卖出监控回落幅度阈值（%）
+    buy_trigger_drop_pct: float = None  # 买入监控触发跌幅阈值（%）
+    buy_rebound_pct: float = None  # 买入监控反弹幅度阈值（%）
 
 
 class BrokerConfig(BaseModel):
@@ -119,6 +126,54 @@ class TradingHoursConfig(BaseModel):
     ]
 
 
+class StockPoolItem(BaseModel):
+    """股票池单项配置"""
+    code: str  # 股票代码（格式：sh.600000 或 sz.000001）
+    name: str  # 股票名称
+    index: str = ""  # 中文序号（一、二、三...）
+
+
+class NewsSourceConfig(BaseModel):
+    """资讯来源配置"""
+    enabled: bool = True  # 是否启用
+    url_template: str = ""  # URL模板
+
+
+class NewsSourcesConfig(BaseModel):
+    """资讯来源总配置"""
+    individual_news: NewsSourceConfig = NewsSourceConfig(
+        enabled=True,
+        url_template="https://so.eastmoney.com/news/s?keyword={symbol}"
+    )
+    financial_reports: NewsSourceConfig = NewsSourceConfig(
+        enabled=True,
+        url_template="https://data.eastmoney.com/notices/stock/{symbol}.html"
+    )
+
+
+class ScheduleConfig(BaseModel):
+    """定时任务调度配置"""
+    hour: int = 21  # 执行小时（24小时制）
+    minute: int = 0  # 执行分钟
+    second: int = 0  # 执行秒数
+
+
+class StockNewsMonitorConfig(BaseModel):
+    """股票资讯监控配置"""
+    enabled: bool = True  # 是否启用资讯监控
+    stock_pool: List[StockPoolItem] = []  # 股票池
+    news_sources: NewsSourcesConfig = NewsSourcesConfig()  # 资讯来源
+    schedule: ScheduleConfig = ScheduleConfig()  # 定时任务配置
+
+
+class BuyOrderSchedulerConfig(BaseModel):
+    """买入委托定时任务配置"""
+    enabled: bool = True  # 是否启用买入委托定时任务
+    hour: int = 9  # 执行小时（24小时制）
+    minute: int = 26  # 执行分钟
+    min_score: float = 1.0  # 最低综合评分阈值
+
+
 class FeishuNotificationConfig(BaseModel):
     """飞书通知配置"""
     enabled: bool = False  # 是否启用飞书通知
@@ -131,6 +186,25 @@ class NotificationConfig(BaseModel):
     feishu: FeishuNotificationConfig = FeishuNotificationConfig()
 
 
+class SellMonitorConfig(BaseModel):
+    """卖出监控配置"""
+    trigger_rise_pct: float = 3.0      # 触发监控的上涨幅度阈值（%）
+    pullback_pct: float = 0.5          # 从最高点回落幅度阈值（%）
+
+
+class BuyMonitorConfig(BaseModel):
+    """买入监控配置"""
+    trigger_drop_pct: float = 3.5      # 触发监控的下跌幅度阈值（%）
+    rebound_pct: float = 0.5           # 从最低点反弹幅度阈值（%）
+
+
+class PriceMonitorConfig(BaseModel):
+    """价格极值追踪监控配置"""
+    enabled: bool = True  # 是否启用价格监控
+    sell_monitor: SellMonitorConfig = SellMonitorConfig()  # 卖出监控参数
+    buy_monitor: BuyMonitorConfig = BuyMonitorConfig()  # 买入监控参数
+
+
 class SchedulerConfig(BaseModel):
     """定时任务配置"""
     signal_check_interval: int = 5  # 信号检查间隔（分钟）- 兼容旧配置
@@ -139,6 +213,7 @@ class SchedulerConfig(BaseModel):
     run_immediately_on_start: bool = True  # 启动时立即执行
     enabled: bool = True  # 是否启用定时任务
     trading_hours: TradingHoursConfig = TradingHoursConfig()  # 交易时间配置
+    price_monitor: PriceMonitorConfig = PriceMonitorConfig()  # 价格监控配置
 
 
 class AppConfig(BaseModel):
@@ -152,6 +227,8 @@ class AppConfig(BaseModel):
     api: APIConfig = APIConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     notification: NotificationConfig = NotificationConfig()
+    stock_news_monitor: StockNewsMonitorConfig = StockNewsMonitorConfig()
+    buy_order_scheduler: BuyOrderSchedulerConfig = BuyOrderSchedulerConfig()
     database: DatabaseConfig = DatabaseConfig()
 
 

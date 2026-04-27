@@ -55,12 +55,40 @@ class SignalScheduler:
         self.trading_days = trading_hours.trading_days
         self.sessions = self._parse_sessions(trading_hours.sessions)
         
+        # 价格监控状态 {symbol: monitor_state}
+        self.price_monitors = {}
+        
         logger.info(f"信号调度器已初始化")
         logger.info(f"  交易时间检查间隔: {self.config.scheduler.trading_check_interval}分钟 ({self.trading_check_interval_seconds}秒)")
         logger.info(f"  非交易时间检查间隔: {self.config.scheduler.non_trading_check_interval}分钟 ({self.non_trading_check_interval_seconds}秒)")
         logger.info(f"交易时间配置: 周{self.trading_days}")
         for i, session in enumerate(self.sessions, 1):
             logger.info(f"  时段{i}: {session['start'].strftime('%H:%M')} - {session['end'].strftime('%H:%M')}")
+        
+        # 显示价格监控配置
+        if hasattr(self.config.scheduler, 'price_monitor'):
+            global_pm = self.config.scheduler.price_monitor
+            logger.info(f"✅ 价格监控已启用（全局默认配置）")
+            logger.info(f"  卖出监控: 涨幅≥{global_pm.sell_monitor.trigger_rise_pct}%触发，回落≥{global_pm.sell_monitor.pullback_pct}%提醒")
+            logger.info(f"  买入监控: 跌幅≥{global_pm.buy_monitor.trigger_drop_pct}%触发，反弹≥{global_pm.buy_monitor.rebound_pct}%提醒")
+            
+            # 检查是否有个性化配置
+            has_custom_config = False
+            for symbol_cfg in self.config.symbols:
+                if symbol_cfg.enabled and symbol_cfg.price_monitor_enabled is not None:
+                    has_custom_config = True
+                    break
+            
+            if has_custom_config:
+                logger.info(f"📝 以下标的使用了个性化价格监控配置:")
+                for symbol_cfg in self.config.symbols:
+                    if symbol_cfg.enabled and symbol_cfg.price_monitor_enabled is not None:
+                        enabled_str = "启用" if symbol_cfg.price_monitor_enabled else "禁用"
+                        sell_trigger = symbol_cfg.sell_trigger_rise_pct if symbol_cfg.sell_trigger_rise_pct is not None else "默认"
+                        buy_trigger = symbol_cfg.buy_trigger_drop_pct if symbol_cfg.buy_trigger_drop_pct is not None else "默认"
+                        logger.info(f"  - {symbol_cfg.name}({symbol_cfg.code}): {enabled_str} | 卖出触发:{sell_trigger}% | 买入触发:{buy_trigger}%")
+        else:
+            logger.info(f"ℹ️ 价格监控未启用")
     
     def _parse_sessions(self, sessions_config):
         """
@@ -138,6 +166,28 @@ class SignalScheduler:
             elif signal.signal_type == SignalType.WAIT:
                 # 等待信号：仅打印
                 self._log_wait_signal(signal, current_time)
+                
+                # ✨ 新增：检查价格极值监控
+                # 直接使用 signal 中的数据，避免重复获取市场数据
+                from src.models.models import MarketData
+                
+                # 将 signal 转换为 MarketData 对象用于价格监控
+                market_data_for_monitor = MarketData(
+                    symbol=symbol,
+                    name=signal.name,
+                    current_price=signal.price,
+                    open_price=signal.price,  # WAIT信号中没有开盘价，使用当前价
+                    high_price=signal.price,  # 同上
+                    low_price=signal.price,   # 同上
+                    volume=0,
+                    amount=0,
+                    change_pct=signal.change_pct,
+                    timestamp=signal.timestamp,
+                    rsi=signal.rsi
+                )
+                
+                logger.debug(f"🔧 [DEBUG] 使用 signal 数据创建 MarketData 对象: price={signal.price:.3f}, change_pct={signal.change_pct:+.2f}%")
+                self._check_price_monitor(symbol, market_data_for_monitor, signal)
                 
             else:
                 # 其他信号（如STOP）：打印 + 持久化
@@ -287,10 +337,283 @@ class SignalScheduler:
         if signal.next_sell_price and signal.next_sell_price > 0:
             sell_profit_pct = (signal.next_sell_price - signal.price) / signal.price * 100
             logger.info(f"   📉 止盈卖出价: ¥{signal.next_sell_price:.3f} (需上涨 {sell_profit_pct:.2f}%)")
-            logger.success(f"{'='*60}\n")
+            logger.info(f"{'='*60}")
         
         if signal.reason:
             logger.debug(f"   原因: {signal.reason}")
+    
+    def _get_symbol_price_monitor_config(self, symbol: str):
+        """
+        获取指定标的的价格监控配置（优先使用个性化配置，否则使用全局默认值）
+        
+        Args:
+            symbol: ETF代码
+            
+        Returns:
+            dict: 包含enabled和监控参数的字典，如果未启用则返回None
+        """
+        logger.debug(f"🔧 [DEBUG] 获取 {symbol} 的价格监控配置...")
+        
+        # 查找该symbol的配置
+        symbol_cfg = None
+        for cfg in self.config.symbols:
+            if cfg.code == symbol:
+                symbol_cfg = cfg
+                break
+        
+        if not symbol_cfg:
+            logger.warning(f"⚠️ [DEBUG] 未找到 {symbol} 的配置，使用全局默认配置")
+            # 如果找不到配置，使用全局默认配置
+            if hasattr(self.config.scheduler, 'price_monitor'):
+                pm = self.config.scheduler.price_monitor
+                config_result = {
+                    'enabled': pm.enabled,
+                    'sell_trigger_rise_pct': pm.sell_monitor.trigger_rise_pct,
+                    'sell_pullback_pct': pm.sell_monitor.pullback_pct,
+                    'buy_trigger_drop_pct': pm.buy_monitor.trigger_drop_pct,
+                    'buy_rebound_pct': pm.buy_monitor.rebound_pct
+                }
+                logger.debug(f"🔧 [DEBUG] 使用全局配置: {config_result}")
+                return config_result
+            logger.error(f"❌ [DEBUG] 全局配置也不存在，返回None")
+            return None
+        
+        logger.debug(f"🔧 [DEBUG] 找到 {symbol} 的配置对象")
+        
+        # 检查是否启用了价格监控（优先使用个性化配置）
+        enabled = symbol_cfg.price_monitor_enabled
+        if enabled is None:
+            logger.debug(f"🔧 [DEBUG] {symbol} 未配置 price_monitor_enabled，检查全局配置")
+            # 如果symbol未配置，使用全局配置
+            if hasattr(self.config.scheduler, 'price_monitor'):
+                enabled = self.config.scheduler.price_monitor.enabled
+                logger.debug(f"🔧 [DEBUG] 使用全局 enabled={enabled}")
+            else:
+                enabled = False
+                logger.debug(f"🔧 [DEBUG] 全局配置不存在，设置 enabled=False")
+        
+        if not enabled:
+            logger.info(f"ℹ️ [DEBUG] {symbol} 价格监控未启用")
+            return None
+        
+        logger.debug(f"✅ [DEBUG] {symbol} 价格监控已启用")
+        
+        # 构建配置字典，优先使用个性化参数，否则使用全局默认值
+        global_pm = None
+        if hasattr(self.config.scheduler, 'price_monitor'):
+            global_pm = self.config.scheduler.price_monitor
+            logger.debug(f"🔧 [DEBUG] 找到全局配置对象")
+        
+        sell_trigger = symbol_cfg.sell_trigger_rise_pct if symbol_cfg.sell_trigger_rise_pct is not None else (global_pm.sell_monitor.trigger_rise_pct if global_pm else 3.0)
+        sell_pullback = symbol_cfg.sell_pullback_pct if symbol_cfg.sell_pullback_pct is not None else (global_pm.sell_monitor.pullback_pct if global_pm else 0.5)
+        buy_trigger = symbol_cfg.buy_trigger_drop_pct if symbol_cfg.buy_trigger_drop_pct is not None else (global_pm.buy_monitor.trigger_drop_pct if global_pm else 3.5)
+        buy_rebound = symbol_cfg.buy_rebound_pct if symbol_cfg.buy_rebound_pct is not None else (global_pm.buy_monitor.rebound_pct if global_pm else 0.5)
+        
+        config_result = {
+            'enabled': True,
+            'sell_trigger_rise_pct': sell_trigger,
+            'sell_pullback_pct': sell_pullback,
+            'buy_trigger_drop_pct': buy_trigger,
+            'buy_rebound_pct': buy_rebound
+        }
+        
+        logger.debug(f"🔧 [DEBUG] {symbol} 最终配置: {config_result}")
+        return config_result
+    
+    def _check_price_monitor(self, symbol: str, market_data, current_signal):
+        """
+        检查价格极值监控（仅在WAIT信号时调用）
+        
+        Args:
+            symbol: ETF代码
+            market_data: 市场数据对象
+            current_signal: 当前信号对象
+        """
+        logger.debug(f"\n{'='*60}")
+        logger.debug(f"🔍 [DEBUG] 开始检查 {symbol} 的价格监控")
+        logger.debug(f"🔍 [DEBUG] 当前价格: ¥{market_data.current_price:.3f}, 涨跌幅: {market_data.change_pct:+.2f}%")
+        
+        # 获取该symbol的价格监控配置（支持个性化配置）
+        monitor_config = self._get_symbol_price_monitor_config(symbol)
+        
+        # 如果未启用价格监控，直接返回
+        if not monitor_config or not monitor_config['enabled']:
+            logger.debug(f"❌ [DEBUG] {symbol} 价格监控未启用，跳过检查")
+            logger.debug(f"{'='*60}\n")
+            return
+        
+        logger.debug(f"✅ [DEBUG] {symbol} 价格监控已启用，开始检查逻辑")
+        
+        # 获取或初始化监控状态
+        if symbol not in self.price_monitors:
+            logger.debug(f"🔧 [DEBUG] 初始化 {symbol} 的监控状态")
+            self.price_monitors[symbol] = {
+                'sell': {'active': False, 'trigger_price': 0.0, 'highest_price': 0.0, 'last_notify_time': 0},
+                'buy': {'active': False, 'trigger_price': 0.0, 'lowest_price': 0.0, 'last_notify_time': 0}
+            }
+        
+        monitor = self.price_monitors[symbol]
+        current_price = market_data.current_price
+        change_pct = market_data.change_pct
+        current_time = datetime.now().timestamp()
+        
+        logger.debug(f"🔧 [DEBUG] 当前监控状态:")
+        logger.debug(f"   卖出监控: active={monitor['sell']['active']}, highest_price={monitor['sell']['highest_price']:.3f}")
+        logger.debug(f"   买入监控: active={monitor['buy']['active']}, lowest_price={monitor['buy']['lowest_price']:.3f}")
+        
+        # === 卖出监控逻辑 ===
+        logger.debug(f"\n📈 [DEBUG] === 开始检查卖出监控 ===")
+        sell_state = monitor['sell']
+        sell_trigger = monitor_config['sell_trigger_rise_pct']
+        sell_pullback = monitor_config['sell_pullback_pct']
+        
+        logger.debug(f"🔧 [DEBUG] 卖出监控参数: trigger={sell_trigger}%, pullback={sell_pullback}%")
+        
+        if not sell_state['active']:
+            logger.debug(f"🔧 [DEBUG] 卖出监控未激活，检查触发条件: {change_pct:+.2f}% >= {sell_trigger}%")
+            # 未激活：检查是否满足触发条件
+            if change_pct >= sell_trigger:
+                logger.debug(f"✅ [DEBUG] 满足触发条件！激活卖出监控")
+                sell_state['active'] = True
+                sell_state['trigger_price'] = current_price
+                sell_state['highest_price'] = current_price
+                logger.info(f"📈 [{symbol}] 卖出监控已激活 | 涨幅:{change_pct:+.2f}% | 触发价:¥{current_price:.3f}")
+            else:
+                logger.debug(f"❌ [DEBUG] 不满足触发条件，跳过")
+        else:
+            logger.debug(f"🔧 [DEBUG] 卖出监控已激活，检查是否需要更新最高价或触发回落")
+            # 已激活：更新最高价并检查回落
+            if current_price > sell_state['highest_price']:
+                old_highest = sell_state['highest_price']
+                sell_state['highest_price'] = current_price
+                logger.debug(f"📈 [DEBUG] 更新最高价: {old_highest:.3f} -> {current_price:.3f}")
+                logger.debug(f"📈 [{symbol}] 更新最高价: ¥{current_price:.3f}")
+            
+            # 计算从最高点回落幅度
+            pullback_pct = (sell_state['highest_price'] - current_price) / sell_state['highest_price'] * 100
+            logger.debug(f"🔧 [DEBUG] 计算回落幅度: ({sell_state['highest_price']:.3f} - {current_price:.3f}) / {sell_state['highest_price']:.3f} * 100 = {pullback_pct:.2f}%")
+            logger.debug(f"🔧 [DEBUG] 检查回落条件: {pullback_pct:.2f}% >= {sell_pullback}%")
+            
+            if pullback_pct >= sell_pullback:
+                logger.debug(f"✅ [DEBUG] 满足回落条件！检查频率控制")
+                # 检查频率控制（避免重复通知）
+                time_since_last = current_time - sell_state['last_notify_time']
+                logger.debug(f"🔧 [DEBUG] 距上次通知时间: {time_since_last:.0f}秒 (要求>=60秒)")
+                
+                if current_time - sell_state['last_notify_time'] >= 60:
+                    logger.debug(f"✅ [DEBUG] 通过频率控制检查，准备发送飞书通知")
+                    # 构建卖出提醒信号
+                    alert_signal = self._create_price_alert_signal(
+                        symbol, market_data, 
+                        signal_type="SELL_ALERT",
+                        reason=f"价格监控：从最高点¥{sell_state['highest_price']:.3f}回落{pullback_pct:.2f}%"
+                    )
+                    
+                    # 发送飞书通知（传递 Signal 对象，而非 dict）
+                    logger.debug(f"📱 [DEBUG] 调用 _send_feishu_notification...")
+                    self._send_feishu_notification(alert_signal)
+                    logger.success(f"🔴 [{symbol}] 卖出提醒 | 最高价:¥{sell_state['highest_price']:.3f} | 当前价:¥{current_price:.3f} | 回落:{pullback_pct:.2f}%")
+                    
+                    # 重置监控状态（一交易日内只触发一次）
+                    logger.debug(f"🔧 [DEBUG] 重置卖出监控状态")
+                    sell_state['active'] = False
+                    sell_state['last_notify_time'] = current_time
+                else:
+                    logger.warning(f"⚠️ [DEBUG] 频率控制拦截：还需等待 {60 - time_since_last:.0f} 秒")
+            else:
+                logger.debug(f"❌ [DEBUG] 不满足回落条件，继续监控")
+        
+        # === 买入监控逻辑 ===
+        logger.debug(f"\n📉 [DEBUG] === 开始检查买入监控 ===")
+        buy_state = monitor['buy']
+        buy_trigger = monitor_config['buy_trigger_drop_pct']
+        buy_rebound = monitor_config['buy_rebound_pct']
+        
+        logger.debug(f"🔧 [DEBUG] 买入监控参数: trigger={buy_trigger}%, rebound={buy_rebound}%")
+        
+        if not buy_state['active']:
+            logger.debug(f"🔧 [DEBUG] 买入监控未激活，检查触发条件: {change_pct:+.2f}% <= -{buy_trigger}%")
+            # 未激活：检查是否满足触发条件
+            if change_pct <= -buy_trigger:
+                logger.debug(f"✅ [DEBUG] 满足触发条件！激活买入监控")
+                buy_state['active'] = True
+                buy_state['trigger_price'] = current_price
+                buy_state['lowest_price'] = current_price
+                logger.info(f"📉 [{symbol}] 买入监控已激活 | 跌幅:{change_pct:+.2f}% | 触发价:¥{current_price:.3f}")
+            else:
+                logger.debug(f"❌ [DEBUG] 不满足触发条件，跳过")
+        else:
+            logger.debug(f"🔧 [DEBUG] 买入监控已激活，检查是否需要更新最低价或触发反弹")
+            # 已激活：更新最低价并检查反弹
+            if current_price < buy_state['lowest_price']:
+                old_lowest = buy_state['lowest_price']
+                buy_state['lowest_price'] = current_price
+                logger.debug(f"📉 [DEBUG] 更新最低价: {old_lowest:.3f} -> {current_price:.3f}")
+                logger.debug(f"📉 [{symbol}] 更新最低价: ¥{current_price:.3f}")
+            
+            # 计算从最低点反弹幅度
+            rebound_pct = (current_price - buy_state['lowest_price']) / buy_state['lowest_price'] * 100
+            logger.debug(f"🔧 [DEBUG] 计算反弹幅度: ({current_price:.3f} - {buy_state['lowest_price']:.3f}) / {buy_state['lowest_price']:.3f} * 100 = {rebound_pct:.2f}%")
+            logger.debug(f"🔧 [DEBUG] 检查反弹条件: {rebound_pct:.2f}% >= {buy_rebound}%")
+            
+            if rebound_pct >= buy_rebound:
+                logger.debug(f"✅ [DEBUG] 满足反弹条件！检查频率控制")
+                # 检查频率控制
+                time_since_last = current_time - buy_state['last_notify_time']
+                logger.debug(f"🔧 [DEBUG] 距上次通知时间: {time_since_last:.0f}秒 (要求>=60秒)")
+                
+                if current_time - buy_state['last_notify_time'] >= 60:
+                    logger.debug(f"✅ [DEBUG] 通过频率控制检查，准备发送飞书通知")
+                    # 构建买入提醒信号
+                    alert_signal = self._create_price_alert_signal(
+                        symbol, market_data,
+                        signal_type="BUY_ALERT",
+                        reason=f"价格监控：从最低价¥{buy_state['lowest_price']:.3f}反弹{rebound_pct:.2f}%"
+                    )
+                    
+                    # 发送飞书通知（传递 Signal 对象，而非 dict）
+                    logger.debug(f"📱 [DEBUG] 调用 _send_feishu_notification...")
+                    self._send_feishu_notification(alert_signal)
+                    logger.success(f"🟢 [{symbol}] 买入提醒 | 最低价:¥{buy_state['lowest_price']:.3f} | 当前价:¥{current_price:.3f} | 反弹:{rebound_pct:.2f}%")
+                    
+                    # 重置监控状态（一交易日内只触发一次）
+                    logger.debug(f"🔧 [DEBUG] 重置买入监控状态")
+                    buy_state['active'] = False
+                    buy_state['last_notify_time'] = current_time
+                else:
+                    logger.warning(f"⚠️ [DEBUG] 频率控制拦截：还需等待 {60 - time_since_last:.0f} 秒")
+            else:
+                logger.debug(f"❌ [DEBUG] 不满足反弹条件，继续监控")
+        
+        logger.debug(f"{'='*60}\n")
+    
+    def _create_price_alert_signal(self, symbol: str, market_data, signal_type: str, reason: str):
+        """
+        创建价格监控提醒信号
+        
+        Args:
+            symbol: ETF代码
+            market_data: 市场数据对象
+            signal_type: 信号类型（SELL_ALERT/BUY_ALERT）
+            reason: 原因描述
+            
+        Returns:
+            Signal对象
+        """
+        from src.models.models import Signal
+        
+        return Signal(
+            symbol=symbol,
+            name=market_data.name,
+            signal_type=SignalType.WAIT,  # 仍使用WAIT类型，但通过reason区分
+            price=market_data.current_price,
+            change_pct=market_data.change_pct,
+            reason=reason,
+            rsi=market_data.rsi,
+            boll_up_diff_pct=None,
+            boll_middle_diff_pct=None,
+            boll_down_diff_pct=None
+        )
     
     def _save_signal(self, signal):
         """保存信号到文件"""

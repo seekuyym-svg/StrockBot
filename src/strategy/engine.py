@@ -472,14 +472,53 @@ class MartingaleEngine:
         
         # 计算止盈卖出价（基于平均成本）
         next_sell_price = position.avg_cost * (1 + strategy_config.take_profit_threshold / 100)
+        
+        # 计算价格与BOLL三轨的价差百分比（统一公式：(价格 - 轨道价) / 价格 * 100%）
+        boll_up_diff_pct = None
+        boll_middle_diff_pct = None
+        boll_down_diff_pct = None
+        
+        if price > 0:
+            # 与上轨的价差：(价格 - 上轨) / 价格 * 100%
+            if market_data.boll_up and market_data.boll_up > 0:
+                boll_up_diff_pct = ((price - market_data.boll_up) / price) * 100
+            
+            # 与中轨的价差：(价格 - 中轨) / 价格 * 100%
+            if market_data.boll_middle and market_data.boll_middle > 0:
+                boll_middle_diff_pct = ((price - market_data.boll_middle) / price) * 100
+            
+            # 与下轨的价差：(价格 - 下轨) / 价格 * 100%
+            if market_data.boll_down and market_data.boll_down > 0:
+                boll_down_diff_pct = ((price - market_data.boll_down) / price) * 100
+        
+        return Signal(
+            symbol=position.symbol,
+            name=market_data.name,
+            signal_type=SignalType.ADD,
+            price=price,
+            change_pct=market_data.change_pct,
+            reason=f"第{position.add_count}次加仓：买入{shares}份，成本{price:.3f}元/份，累计下跌{drop_pct:.2f}%",
+            position_count=position.add_count,
+            avg_cost=position.avg_cost,
+            position_value=position.position_value,
+            target_shares=shares,
+            next_add_price=next_add_price,
+            next_sell_price=next_sell_price,
+            boll_up_diff_pct=boll_up_diff_pct,
+            boll_middle_diff_pct=boll_middle_diff_pct,
+            boll_down_diff_pct=boll_down_diff_pct,
+            rsi=market_data.rsi
+        )
 
     def _create_sell_signal(self, position: Position, market_data: MarketData, reason: str) -> Signal:
         """创建卖出信号"""
         price = market_data.current_price
         
-        # 计算收益（正确公式：市值 - 总成本）
+        # 计算收益（正确公式：当前市值 - 总成本）
+        # 注意：必须使用当前卖出价格计算市值，而不是position_value（可能是旧值）
+        current_market_value = position.total_shares * price
         total_cost = position.total_shares * position.avg_cost
-        profit = position.position_value - total_cost
+        profit = current_market_value - total_cost
         profit_pct = (profit / total_cost) * 100 if total_cost > 0 else 0
         
         # 重置持仓状态
@@ -518,7 +557,7 @@ class MartingaleEngine:
             reason=f"{reason}，总收益{profit:.2f}元 ({profit_pct:+.2f}%)",
             position_count=position.add_count,
             avg_cost=position.avg_cost,
-            position_value=position.position_value,
+            position_value=current_market_value,  # 使用当前市值
             boll_up_diff_pct=boll_up_diff_pct,
             boll_middle_diff_pct=boll_middle_diff_pct,
             boll_down_diff_pct=boll_down_diff_pct,
@@ -529,9 +568,11 @@ class MartingaleEngine:
         """创建止损信号"""
         price = market_data.current_price
         
-        # 计算损失（正确公式：总成本 - 市值）
+        # 计算损失（正确公式：总成本 - 当前市值）
+        # 注意：必须使用当前卖出价格计算市值，而不是position_value（可能是旧值）
+        current_market_value = position.total_shares * price
         total_cost = position.total_shares * position.avg_cost
-        loss = total_cost - position.position_value
+        loss = total_cost - current_market_value
         loss_pct = (loss / total_cost) * 100 if total_cost > 0 else 0
         
         # 重置持仓状态
@@ -570,7 +611,7 @@ class MartingaleEngine:
             reason=f"{reason}，总损失{loss:.2f}元 ({loss_pct:+.2f}%)",
             position_count=position.add_count,
             avg_cost=position.avg_cost,
-            position_value=position.position_value,
+            position_value=current_market_value,  # 使用当前市值
             boll_up_diff_pct=boll_up_diff_pct,
             boll_middle_diff_pct=boll_middle_diff_pct,
             boll_down_diff_pct=boll_down_diff_pct,

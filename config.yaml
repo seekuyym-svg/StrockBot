@@ -6,19 +6,33 @@ symbols:
     name: "港股创新药ETF"
     enabled: true
     # 个性化策略参数（可选，不设置则使用全局默认值）
-    add_drop_threshold: 3.5  # 加仓跌幅阈值：下跌3%加仓
-    take_profit_threshold: 4.0  # 止盈涨幅：盈利2%止盈
+    add_drop_threshold: 4  # 加仓跌幅阈值：下跌3%加仓
+    take_profit_threshold: 3.5  # 止盈涨幅：盈利2%止盈
     max_add_positions: 4  # 最大加仓次数
     initial_position_pct: 6  # 初始建仓比例（占总资金百分比）
+    
+    # 个性化价格监控参数（可选，不设置则使用全局默认值）
+    price_monitor_enabled: true  # 是否启用价格监控
+    sell_trigger_rise_pct: 3.0   # 卖出监控触发涨幅阈值（%）
+    sell_pullback_pct: 0.5       # 卖出监控回落幅度阈值（%）
+    buy_trigger_drop_pct: 3.8    # 买入监控触发跌幅阈值（%）
+    buy_rebound_pct: 0.6         # 买入监控反弹幅度阈值（%）
     
   - code: "sh.513050"  # 中概互联网ETF
     name: "中概互联网ETF"
     enabled: true
     # 个性化策略参数（可选，不设置则使用全局默认值）
-    add_drop_threshold: 2.5  # 加仓跌幅阈值：下跌3.5%加仓
+    add_drop_threshold: 3.5  # 加仓跌幅阈值：下跌3.5%加仓
     take_profit_threshold: 3.0  # 止盈涨幅：盈利2.5%止盈
     max_add_positions: 4  # 最大加仓次数
     initial_position_pct: 6  # 初始建仓比例（占总资金百分比）
+    
+    # 个性化价格监控参数（可选，不设置则使用全局默认值）
+    price_monitor_enabled: true  # 是否启用价格监控
+    sell_trigger_rise_pct: 2.6   # 卖出监控触发涨幅阈值（%）
+    sell_pullback_pct: 0.4       # 卖出监控回落幅度阈值（%）
+    buy_trigger_drop_pct: 3.5    # 买入监控触发跌幅阈值（%）
+    buy_rebound_pct: 0.5         # 买入监控反弹幅度阈值（%）
 
 # 初始资金
 initial_capital: 300000  # 30万
@@ -104,6 +118,20 @@ scheduler:
         end_time: "11:30"    # 上午收盘
       - start_time: "13:00"  # 下午开盘
         end_time: "15:00"    # 下午收盘
+  
+  # 价格极值追踪监控配置（仅在WAIT信号时生效，作为全局默认值）
+  price_monitor:
+    enabled: true  # 是否启用价格监控
+    
+    # 卖出监控参数
+    sell_monitor:
+      trigger_rise_pct: 3.0      # 触发监控的上涨幅度阈值（%）
+      pullback_pct: 0.5          # 从最高点回落幅度阈值（%）
+    
+    # 买入监控参数
+    buy_monitor:
+      trigger_drop_pct: 3.5      # 触发监控的下跌幅度阈值（%）
+      rebound_pct: 0.5           # 从最低点反弹幅度阈值（%）
 
 # 通知配置
 notification:
@@ -116,7 +144,87 @@ notification:
     # 通知类型：BUY/SELL/ADD/STOP
     notify_signals: ["BUY", "SELL", "ADD", "STOP"]
 
+# 股票资讯监控配置
+stock_news_monitor:
+  # 是否启用资讯监控
+  enabled: true
+  # 股票池配置（代码格式：sh.600000 或 sz.000001）
+  stock_pool:
+    - code: "sz.000792"
+      name: "盐湖股份"
+      index: "一"
+    - code: "sz.002706"
+      name: "良信股份"
+      index: "二"
+    - code: "sz.002126"
+      name: "银轮股份"
+      index: "三"
+   
+  # 资讯来源配置
+  news_sources:
+    # 个股资讯（来自东方财富搜索）
+    individual_news:
+      enabled: true
+      url_template: "https://so.eastmemory.com/news/s?keyword={symbol}"
+    # 财务报告公告
+    financial_reports:
+      enabled: true
+      url_template: "https://data.eastmoney.com/notices/stock/{symbol}.html"
+  # 定时任务配置（Cron表达式格式）
+  schedule:
+    # 每天执行时间（24小时制）
+    hour: 21
+    minute: 0
+    second: 0
+
+# 买入委托定时任务配置
+buy_order_scheduler:
+  # 是否启用买入委托定时任务
+  enabled: true
+  # 执行时间（24小时制）
+  hour: 9
+  minute: 26
+  # 最低综合评分阈值
+  min_score: 0.5
+
+# 成交量选股策略配置
+volume_strategy:
+  # 最大最小允许涨跌幅（%）：5日涨跌幅区间筛选
+  # 目的：避免追高，选择相对低位的放量股票
+  max_price_change_pct: 12.0
+  min_price_change_pct: 3.0
+  # 放量的天数，默认为5天（用于 select_daysvol.py）
+  period: 5
+  # 最小上市天数：上市不足此天数的股票将被过滤（默认365天=1年）
+  # 目的：过滤次新股，避免波动过大、数据不稳定的股票
+  min_listing_days: 365  
+
+# 缩量突破选股策略配置（用于 select_shrinkbreakvol.py）
+shrinkbreak_strategy:
+  # 缩量比例阈值：近5日均量 / 20日均量 < 此值
+  shrink_ratio: 0.6
+  # 相对昨日成交量倍数：当日量 > 昨日量 * 此值
+  vol_multiplier_yesterday: 2.0
+  # 相对20日均量倍数：当日量 > 20日均量 * 此值
+  vol_multiplier_avg: 1.5
+  # 回看天数：用于最高价突破判断
+  lookback_days: 20
+
+# 均线突破选股策略配置（用于 select_linebreakvol.py）
+linebreak_vol_strategy:
+  # 均线收敛阈值(%)：MA5/10/20/60 最大最小差距 < 此值
+  threshold: 2.0
+  # 最小涨幅(%)：当日涨幅 >= 此值
+  min_return: 1.0
+  # 最大涨幅(%)：当日涨幅 <= 此值
+  max_return: 7.0
+  # 成交量倍数：当日量 > 20日均量 * 此值
+  volume_ratio: 1.8
+
 # 数据库配置
 database:
   type: "sqlite"
   path: "data/trading.db"
+
+# 通达信安装目录
+TDX_DIR: "D:\\Install\\zd_zxzq_gm"
