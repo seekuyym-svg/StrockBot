@@ -1,20 +1,43 @@
+"""
+回测收益率计算工具
+
+基于通达信本地数据，计算股票池在指定日期或区间的收益率。
+支持单日收益率和区间收益率两种计算模式。
+
+使用示例:
+    # 计算单日收益率
+    python backtest/calc_backtest_rate.py --date 2026-04-20 --pooldate 20260420
+    
+    # 计算区间收益率
+    python backtest/calc_backtest_rate.py --start 2026-04-20 --end 2026-04-22 --pooldate 20260420
+    
+    # 同时计算单日和区间收益
+    python backtest/calc_backtest_rate.py --date 2026-04-20 --start 2026-04-20 --end 2026-04-22 --pooldate 20260420
+    
+    # 自定义初始资金
+    python backtest/calc_backtest_rate.py --date 2026-04-20 --pooldate 20260420 --capital 200000
+"""
+
 import pandas as pd
 from datetime import datetime
 import os
+import sys
 import yaml
+import argparse
 from pathlib import Path
-from utils import get_stock_name  # 导入统一的股票名称获取函数
+from typing import List, Dict, Optional
+
+# 添加 local 目录到路径，以便导入 utils 模块
+project_root = Path(__file__).parent.parent  # backtest/ -> 项目根目录
+sys.path.insert(0, str(project_root / 'local'))  # 添加 StockBot/local/ 到路径
+from utils import get_stock_name  # 从 local/utils.py 导入股票名称获取函数
 from mootdx.reader import Reader
 
 
 # ==================== 配置区 ====================
-# 从 config.yaml 读取配置
 def load_config():
     """加载配置文件"""
-    # 获取当前脚本所在目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # config.yaml 在项目根目录（local目录的上一级）
-    config_path = os.path.join(script_dir, '..', 'config.yaml')
+    config_path = project_root / 'config.yaml'
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
@@ -24,24 +47,80 @@ def load_config():
 
 config = load_config()
 TDX_DIR = config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")  # 通达信安装目录（从配置文件读取）
-INITIAL_CAPITAL = 100000  # 初始资金10万元
-DATA_DIR = Path(__file__).parent.parent / "data"  # 报告输出目录（项目根目录下的data文件夹）
+DATA_DIR = project_root / "data"  # 报告输出目录（项目根目录下的data文件夹）
 
-# 自选股列表（0428选股，持续放量+高评分，共7只个股）
-watchlist = [
-    {'code': '603768', 'market': 'sz'},
-    {'code': '600739', 'market': 'sz'},
-    {'code': '003013', 'market': 'sz'},
-    {'code': '600963', 'market': 'sh'},
-    {'code': '601777', 'market': 'sh'},
-    {'code': '688020', 'market': 'sh'}
-]
+# 从 config.yaml 的 backtest 节点读取初始资金，命令行参数可覆盖
+BACKTEST_CONFIG = config.get('backtest', {})
+DEFAULT_INITIAL_CAPITAL = BACKTEST_CONFIG.get('initial_capital', 100000)
+
+
+def load_stock_pool(pooldate: str) -> List[Dict[str, str]]:
+    """
+    从 data/stockpool_YYYYMMDD.txt 读取股票池
+    
+    Args:
+        pooldate: 股票池日期，格式 YYYYMMDD
+    
+    Returns:
+        [{'code': '603768', 'market': 'sh'}, ...]
+    
+    Raises:
+        FileNotFoundError: 股票池文件不存在
+    """
+    stockpool_file = DATA_DIR / f"stockpool_{pooldate}.txt"
+    
+    if not stockpool_file.exists():
+        raise FileNotFoundError(f"❌ 股票池文件不存在: {stockpool_file}")
+    
+    watchlist = []
+    
+    try:
+        with open(stockpool_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                
+                # 跳过空行和注释行
+                if not line or line.startswith('#'):
+                    continue
+                
+                # 按逗号分割，只取第一列（股票代码）
+                parts = line.split(',')
+                if not parts:
+                    continue
+                
+                code = parts[0].strip()
+                
+                # 验证股票代码格式（6位数字）
+                if not code.isdigit() or len(code) != 6:
+                    continue
+                
+                # 根据代码首位判断市场
+                if code.startswith('6') or code.startswith('9'):
+                    market = 'sh'
+                elif code.startswith('0') or code.startswith('3'):
+                    market = 'sz'
+                else:
+                    market = 'bj'
+                
+                watchlist.append({
+                    'code': code,
+                    'market': market
+                })
+        
+        print(f"✅ 成功读取股票池: {len(watchlist)} 只股票")
+        return watchlist
+        
+    except Exception as e:
+        print(f"❌ 读取股票池文件失败: {e}")
+        raise
+
 
 def ensure_data_dir():
     """确保data目录存在"""
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
+    if not DATA_DIR.exists():
+        DATA_DIR.mkdir(parents=True)
         print(f"✅ 创建目录: {DATA_DIR}")
+
 
 def save_report_to_file(content: str, filename: str):
     """
@@ -52,7 +131,7 @@ def save_report_to_file(content: str, filename: str):
         filename: 文件名（不含路径）
     """
     ensure_data_dir()
-    filepath = os.path.join(DATA_DIR, filename)
+    filepath = DATA_DIR / filename
     
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -63,16 +142,19 @@ def save_report_to_file(content: str, filename: str):
         print(f"❌ 保存报告失败: {e}")
         return False
 
+
 def format_single_day_report(target_date: str, results: list, total_investment: float, 
                              total_value_at_close: float, total_return_rate: float, 
-                             total_profit_loss: float, winners: list, losers: list, flat: list):
+                             total_profit_loss: float, winners: list, losers: list, flat: list,
+                             initial_capital: float, idle_capital: float = 0.0, 
+                             capital_utilization_rate: float = 0.0):
     """格式化单日收益率报告"""
     lines = []
     lines.append("=" * 80)
     lines.append(f"📊 单日收益率计算报告")
     lines.append(f"📅 目标日期: {target_date}")
-    lines.append(f"💰 初始资金: {INITIAL_CAPITAL:,} 元")
-    lines.append(f"📈 股票数量: {len(watchlist)} 只")
+    lines.append(f"💰 初始资金: {initial_capital:,} 元")
+    lines.append(f"📈 股票数量: {len(results)} 只")
     lines.append(f"⏰ 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("=" * 80)
     lines.append("")
@@ -99,6 +181,32 @@ def format_single_day_report(target_date: str, results: list, total_investment: 
     lines.append(f"📊 综合收益率: {total_return_rate:+.2f}%")
     lines.append(f"💵 总盈亏: {total_profit_loss:+,.2f} 元")
     lines.append("")
+    
+    # ========== 新增：资金使用率诊断 ==========
+    lines.append("=" * 80)
+    lines.append("💹 资金使用率诊断")
+    lines.append("=" * 80)
+    lines.append(f"💰 初始资金: {initial_capital:,.2f} 元")
+    lines.append(f"✅ 实际投入: {total_investment:,.2f} 元")
+    lines.append(f"⏸️ 闲置资金: {idle_capital:,.2f} 元")
+    lines.append(f"📊 资金使用率: {capital_utilization_rate:.2f}%")
+    lines.append("")
+    
+    if capital_utilization_rate < 80:
+        lines.append("⚠️  警告: 资金使用率低于 80%，存在较多闲置资金")
+        lines.append("💡 建议:")
+        lines.append("   1. 增加初始资金规模，使每只股票能买入至少100股")
+        lines.append("   2. 减少选股数量，集中资金到更少的股票")
+        lines.append("   3. 过滤掉高价股（股价 > 初始资金/股票数/100）")
+        lines.append("")
+    elif capital_utilization_rate < 95:
+        lines.append("ℹ️  提示: 资金使用率在 80%-95% 之间，有少量闲置资金")
+        lines.append("💡 这是正常现象，由于100股整数倍限制导致")
+        lines.append("")
+    else:
+        lines.append("✅ 资金使用率良好 (>95%)")
+        lines.append("")
+    
     lines.append(f"🟢 上涨: {len(winners)} 只")
     lines.append(f"🔴 下跌: {len(losers)} 只")
     lines.append(f"⚪ 持平: {len(flat)} 只")
@@ -130,17 +238,19 @@ def format_single_day_report(target_date: str, results: list, total_investment: 
     
     return "\n".join(lines)
 
+
 def format_period_report(start_date: str, end_date: str, results: list, total_investment: float,
                          total_value_at_end: float, total_return_rate: float, total_profit_loss: float,
-                         winners: list, losers: list, flat: list):
+                         winners: list, losers: list, flat: list, initial_capital: float,
+                         idle_capital: float = 0.0, capital_utilization_rate: float = 0.0):
     """格式化区间收益率报告"""
     lines = []
     lines.append("=" * 80)
     lines.append(f"📊 区间收益率计算报告")
     lines.append(f"📅 起始日期: {start_date} (开盘买入)")
     lines.append(f"📅 结束日期: {end_date} (收盘卖出)")
-    lines.append(f"💰 初始资金: {INITIAL_CAPITAL:,} 元")
-    lines.append(f"📈 股票数量: {len(watchlist)} 只")
+    lines.append(f"💰 初始资金: {initial_capital:,} 元")
+    lines.append(f"📈 股票数量: {len(results)} 只")
     lines.append(f"⏰ 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("=" * 80)
     lines.append("")
@@ -168,6 +278,32 @@ def format_period_report(start_date: str, end_date: str, results: list, total_in
     lines.append(f"📊 综合收益率: {total_return_rate:+.2f}%")
     lines.append(f"💵 总盈亏: {total_profit_loss:+,.2f} 元")
     lines.append("")
+    
+    # ========== 新增：资金使用率诊断 ==========
+    lines.append("=" * 80)
+    lines.append("💹 资金使用率诊断")
+    lines.append("=" * 80)
+    lines.append(f"💰 初始资金: {initial_capital:,.2f} 元")
+    lines.append(f"✅ 实际投入: {total_investment:,.2f} 元")
+    lines.append(f"⏸️ 闲置资金: {idle_capital:,.2f} 元")
+    lines.append(f"📊 资金使用率: {capital_utilization_rate:.2f}%")
+    lines.append("")
+    
+    if capital_utilization_rate < 80:
+        lines.append("⚠️  警告: 资金使用率低于 80%，存在较多闲置资金")
+        lines.append("💡 建议:")
+        lines.append("   1. 增加初始资金规模，使每只股票能买入至少100股")
+        lines.append("   2. 减少选股数量，集中资金到更少的股票")
+        lines.append("   3. 过滤掉高价股（股价 > 初始资金/股票数/100）")
+        lines.append("")
+    elif capital_utilization_rate < 95:
+        lines.append("ℹ️  提示: 资金使用率在 80%-95% 之间，有少量闲置资金")
+        lines.append("💡 这是正常现象，由于100股整数倍限制导致")
+        lines.append("")
+    else:
+        lines.append("✅ 资金使用率良好 (>95%)")
+        lines.append("")
+    
     lines.append(f"🟢 盈利: {len(winners)} 只")
     lines.append(f"🔴 亏损: {len(losers)} 只")
     lines.append(f"⚪ 持平: {len(flat)} 只")
@@ -199,17 +335,20 @@ def format_period_report(start_date: str, end_date: str, results: list, total_in
     
     return "\n".join(lines)
 
-def calculate_single_day_returns(target_date: str):
+
+def calculate_single_day_returns(target_date: str, watchlist: list, initial_capital: float):
     """
     计算指定日期的单日收益率
     
     Args:
         target_date: 目标日期，格式 YYYY-MM-DD
+        watchlist: 股票列表 [{'code': '603768', 'market': 'sh'}, ...]
+        initial_capital: 初始资金
     """
     print("=" * 80)
     print(f"📊 单日收益率计算工具")
     print(f"📅 目标日期: {target_date}")
-    print(f"💰 初始资金: {INITIAL_CAPITAL:,} 元")
+    print(f"💰 初始资金: {initial_capital:,} 元")
     print(f"📈 股票数量: {len(watchlist)} 只")
     print("=" * 80)
     
@@ -220,7 +359,7 @@ def calculate_single_day_returns(target_date: str):
     total_investment = 0
     total_value_at_close = 0
     
-    for stock in watchlist:
+    for idx, stock in enumerate(watchlist, 1):
         code = stock['code']
         market = stock['market']
         
@@ -232,7 +371,7 @@ def calculate_single_day_returns(target_date: str):
             df = reader.daily(symbol=code)
             
             if df is None or df.empty:
-                print(f"❌ {code} ({stock_name}): 无法读取数据")
+                print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): 无交易数据，跳过")
                 continue
             
             # 将索引转换为datetime
@@ -242,7 +381,7 @@ def calculate_single_day_returns(target_date: str):
             target_date_dt = pd.to_datetime(target_date)
             
             if target_date_dt not in df.index:
-                print(f"⚠️  {code} ({stock_name}): {target_date} 无交易数据（可能是非交易日）")
+                print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): {target_date} 无交易数据（可能是非交易日），跳过")
                 continue
             
             # 获取该日数据
@@ -253,10 +392,16 @@ def calculate_single_day_returns(target_date: str):
             close_price = float(day_data['close'])
             
             # 计算每只股票的投入金额（平均分配）
-            investment_per_stock = INITIAL_CAPITAL / len(watchlist)
+            investment_per_stock = initial_capital / len(watchlist)
             
-            # 计算买入股数（向下取整）
-            shares_bought = int(investment_per_stock / open_price)
+            # 计算买入股数（向下取整到100的整数倍）
+            raw_shares = int(investment_per_stock / open_price)
+            shares_bought = (raw_shares // 100) * 100  # 确保是100的整数倍
+            
+            # 如果不足100股，跳过
+            if shares_bought < 100:
+                print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): 股价过高，不足100股，跳过")
+                continue
             
             # 实际投入金额
             actual_investment = shares_bought * open_price
@@ -285,15 +430,23 @@ def calculate_single_day_returns(target_date: str):
             total_investment += actual_investment
             total_value_at_close += value_at_close
             
+            print(f"[{idx}/{len(watchlist)}] ✅ {code} ({stock_name}): 收益率 {return_rate:+.2f}%")
+            
         except Exception as e:
-            print(f"❌ {code}: 处理失败 - {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[{idx}/{len(watchlist)}] ❌ {code}: 处理失败 - {e}")
     
     # 汇总结果
     if results:
         total_return_rate = (total_value_at_close - total_investment) / total_investment * 100
         total_profit_loss = total_value_at_close - total_investment
+        
+        # ========== 新增：资金使用率诊断 ==========
+        # 理论应投入总额 = 初始资金（如果所有股票都能买入）
+        theoretical_investment = initial_capital
+        # 实际闲置资金
+        idle_capital = initial_capital - total_investment
+        # 资金使用率
+        capital_utilization_rate = (total_investment / theoretical_investment * 100) if theoretical_investment > 0 else 0
         
         # 统计涨跌情况
         winners = [r for r in results if r['return_rate'] > 0]
@@ -303,11 +456,12 @@ def calculate_single_day_returns(target_date: str):
         # 生成报告内容
         report_content = format_single_day_report(
             target_date, results, total_investment, total_value_at_close,
-            total_return_rate, total_profit_loss, winners, losers, flat
+            total_return_rate, total_profit_loss, winners, losers, flat,
+            initial_capital, idle_capital, capital_utilization_rate
         )
         
         # 打印报告到控制台
-        print(report_content)
+        print("\n" + report_content)
         
         # 生成文件名：report_YYYYMMDD.txt
         date_str = target_date.replace('-', '')
@@ -318,19 +472,22 @@ def calculate_single_day_returns(target_date: str):
         print("✅ 计算完成！(无有效数据)")
         print("=" * 80)
 
-def calculate_period_returns(start_date: str, end_date: str):
+
+def calculate_period_returns(start_date: str, end_date: str, watchlist: list, initial_capital: float):
     """
     计算指定区间的累计收益率
     
     Args:
         start_date: 起始日期，格式 YYYY-MM-DD（开盘买入）
         end_date: 结束日期，格式 YYYY-MM-DD（收盘卖出）
+        watchlist: 股票列表 [{'code': '603768', 'market': 'sh'}, ...]
+        initial_capital: 初始资金
     """
     print("=" * 80)
     print(f"📊 区间收益率计算工具")
     print(f"📅 起始日期: {start_date} (开盘买入)")
     print(f"📅 结束日期: {end_date} (收盘卖出)")
-    print(f"💰 初始资金: {INITIAL_CAPITAL:,} 元")
+    print(f"💰 初始资金: {initial_capital:,} 元")
     print(f"📈 股票数量: {len(watchlist)} 只")
     print("=" * 80)
     
@@ -341,7 +498,7 @@ def calculate_period_returns(start_date: str, end_date: str):
     total_investment = 0
     total_value_at_end = 0
     
-    for stock in watchlist:
+    for idx, stock in enumerate(watchlist, 1):
         code = stock['code']
         market = stock['market']
         
@@ -353,7 +510,7 @@ def calculate_period_returns(start_date: str, end_date: str):
             df = reader.daily(symbol=code)
             
             if df is None or df.empty:
-                print(f"❌ {code} ({stock_name}): 无法读取数据")
+                print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): 无交易数据，跳过")
                 continue
             
             # 将索引转换为datetime
@@ -364,11 +521,11 @@ def calculate_period_returns(start_date: str, end_date: str):
             end_date_dt = pd.to_datetime(end_date)
             
             if start_date_dt not in df.index:
-                print(f"⚠️  {code} ({stock_name}): {start_date} 无交易数据")
+                print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): {start_date} 无交易数据，跳过")
                 continue
             
             if end_date_dt not in df.index:
-                print(f"⚠️  {code} ({stock_name}): {end_date} 无交易数据")
+                print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): {end_date} 无交易数据，跳过")
                 continue
             
             # 获取起始日和结束日数据
@@ -380,10 +537,16 @@ def calculate_period_returns(start_date: str, end_date: str):
             sell_price = float(end_data['close'])       # 结束日收盘价卖出
             
             # 计算每只股票的投入金额（平均分配）
-            investment_per_stock = INITIAL_CAPITAL / len(watchlist)
+            investment_per_stock = initial_capital / len(watchlist)
             
-            # 计算买入股数（向下取整）
-            shares_bought = int(investment_per_stock / buy_price)
+            # 计算买入股数（向下取整到100的整数倍）
+            raw_shares = int(investment_per_stock / buy_price)
+            shares_bought = (raw_shares // 100) * 100  # 确保是100的整数倍
+            
+            # 如果不足100股，跳过
+            if shares_bought < 100:
+                print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): 股价过高，不足100股，跳过")
+                continue
             
             # 实际投入金额
             actual_investment = shares_bought * buy_price
@@ -416,15 +579,23 @@ def calculate_period_returns(start_date: str, end_date: str):
             total_investment += actual_investment
             total_value_at_end += value_at_end
             
+            print(f"[{idx}/{len(watchlist)}] ✅ {code} ({stock_name}): 收益率 {return_rate:+.2f}%")
+            
         except Exception as e:
-            print(f"❌ {code}: 处理失败 - {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[{idx}/{len(watchlist)}] ❌ {code}: 处理失败 - {e}")
     
     # 汇总结果
     if results:
         total_return_rate = (total_value_at_end - total_investment) / total_investment * 100
         total_profit_loss = total_value_at_end - total_investment
+        
+        # ========== 新增：资金使用率诊断 ==========
+        # 理论应投入总额 = 初始资金（如果所有股票都能买入）
+        theoretical_investment = initial_capital
+        # 实际闲置资金
+        idle_capital = initial_capital - total_investment
+        # 资金使用率
+        capital_utilization_rate = (total_investment / theoretical_investment * 100) if theoretical_investment > 0 else 0
         
         # 统计涨跌情况
         winners = [r for r in results if r['return_rate'] > 0]
@@ -434,11 +605,12 @@ def calculate_period_returns(start_date: str, end_date: str):
         # 生成报告内容
         report_content = format_period_report(
             start_date, end_date, results, total_investment, total_value_at_end,
-            total_return_rate, total_profit_loss, winners, losers, flat
+            total_return_rate, total_profit_loss, winners, losers, flat,
+            initial_capital, idle_capital, capital_utilization_rate
         )
         
         # 打印报告到控制台
-        print(report_content)
+        print("\n" + report_content)
         
         # 生成文件名：report_YYYYMMDD_YYYYMMDD.txt
         start_str = start_date.replace('-', '')
@@ -450,46 +622,105 @@ def calculate_period_returns(start_date: str, end_date: str):
         print("✅ 计算完成！(无有效数据)")
         print("=" * 80)
 
-if __name__ == "__main__":
-    print("请选择计算模式：")
-    print("1. 计算单日收益率")
-    print("2. 计算区间收益率")
-    print("3. 同时计算单日及区间收益")
-    
-    choice = input("\n请输入选项 (1/2/3，默认3): ").strip() or "3"
-    
-    if choice == "1":
-        target_date = input("请输入目标日期 (YYYY-MM-DD，默认2026-04-20): ").strip() or "2026-04-20"
-        calculate_single_day_returns(target_date)
-    
-    elif choice == "2":
-        start_date = input("请输入起始日期 (YYYY-MM-DD，默认2026-04-20): ").strip() or "2026-04-20"
-        end_date = input("请输入结束日期 (YYYY-MM-DD，默认2026-04-22): ").strip() or "2026-04-22"
-        calculate_period_returns(start_date, end_date)
-    
-    elif choice == "3":
-        print("\n" + "=" * 80)
-        print("开始计算 4月20日 单日收益率...")
-        print("=" * 80)
-        calculate_single_day_returns("2026-04-20")
-        
-        print("\n\n")
-        print("=" * 80)
-        print("开始计算 4月21日 单日收益率...")
-        print("=" * 80)
-        calculate_single_day_returns("2026-04-21")
 
-        print("\n\n")
-        print("=" * 80)
-        print("开始计算 4月22日 单日收益率...")
-        print("=" * 80)
-        calculate_single_day_returns("2026-04-22")
-        
-        print("\n\n")
-        print("=" * 80)
-        print("开始计算 4月20日开盘至4月21日收盘 区间收益率...")
-        print("=" * 80)
-        calculate_period_returns("2026-04-20", "2026-04-22")
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(
+        description='回测收益率计算工具 - 基于通达信本地数据计算股票池的单日或区间收益率',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  # 计算单日收益率
+  python backtest/calc_backtest_rate.py --date 2026-04-20 --pooldate 20260420
+  
+  # 计算区间收益率
+  python backtest/calc_backtest_rate.py --start 2026-04-20 --end 2026-04-22 --pooldate 20260420
+  
+  # 同时计算单日和区间收益
+  python backtest/calc_backtest_rate.py --date 2026-04-20 --start 2026-04-20 --end 2026-04-22 --pooldate 20260420
+  
+  # 自定义初始资金
+  python backtest/calc_backtest_rate.py --date 2026-04-20 --pooldate 20260420 --capital 200000
+        """
+    )
     
-    else:
-        print("❌ 无效选项")
+    parser.add_argument('--date', type=str, help='单日收益率计算日期 (YYYY-MM-DD)')
+    parser.add_argument('--start', type=str, help='区间起始日期 (YYYY-MM-DD)')
+    parser.add_argument('--end', type=str, help='区间结束日期 (YYYY-MM-DD)')
+    parser.add_argument('--pooldate', type=str, help='股票池日期 (YYYYMMDD)')
+    parser.add_argument('--capital', type=float, default=None, help=f'初始资金，默认从config.yaml读取（当前配置: {DEFAULT_INITIAL_CAPITAL:,}）')
+    
+    args = parser.parse_args()
+    
+    # 如果没有任何参数，显示帮助信息
+    if not any([args.date, args.start, args.end, args.pooldate]):
+        parser.print_help()
+        sys.exit(0)
+    
+    # 验证必需参数
+    if not args.pooldate:
+        print("\n❌ 错误: 必须指定 --pooldate（股票池日期）")
+        sys.exit(1)
+    
+    if not args.date and not (args.start and args.end):
+        print("\n❌ 错误: 必须指定 --date（单日）或 --start 和 --end（区间）")
+        sys.exit(1)
+    
+    # 设置初始资金：命令行参数优先，否则使用配置文件中的值
+    initial_capital = args.capital if args.capital is not None else DEFAULT_INITIAL_CAPITAL
+    
+    if args.start and not args.end:
+        print("❌ 错误: 指定 --start 时必须同时指定 --end")
+        sys.exit(1)
+    
+    if args.end and not args.start:
+        print("❌ 错误: 指定 --end 时必须同时指定 --start")
+        sys.exit(1)
+    
+    # 验证日期格式
+    def validate_date(date_str, name):
+        try:
+            datetime.strptime(date_str, '%Y-%m-%d')
+        except ValueError:
+            print(f"❌ 错误: {name} 日期格式不正确，应为 YYYY-MM-DD")
+            sys.exit(1)
+    
+    if args.date:
+        validate_date(args.date, '--date')
+    
+    if args.start:
+        validate_date(args.start, '--start')
+    
+    if args.end:
+        validate_date(args.end, '--end')
+    
+    # 验证股票池日期格式
+    try:
+        datetime.strptime(args.pooldate, '%Y%m%d')
+    except ValueError:
+        print("❌ 错误: --pooldate 日期格式不正确，应为 YYYYMMDD")
+        sys.exit(1)
+    
+    # 加载股票池
+    try:
+        watchlist = load_stock_pool(args.pooldate)
+    except FileNotFoundError as e:
+        print(str(e))
+        sys.exit(1)
+    
+    if not watchlist:
+        print("❌ 错误: 股票池为空")
+        sys.exit(1)
+    
+    # 执行计算
+    if args.date:
+        calculate_single_day_returns(args.date, watchlist, initial_capital)
+    
+    if args.start and args.end:
+        if args.date:
+            print("\n\n")
+        calculate_period_returns(args.start, args.end, watchlist, initial_capital)
+
+
+if __name__ == "__main__":
+    main()

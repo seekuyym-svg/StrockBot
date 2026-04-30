@@ -55,12 +55,13 @@ def ensure_data_dir():
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         print(f"[OK] 创建目录: {DATA_DIR}")
 
-def save_selected_stocks(selected: list):
+def save_selected_stocks(selected: list, target_date: datetime = None):
     """
     将选股结果保存到txt文件
     
     Args:
         selected: 选中的股票列表 [(code, name), ...]
+        target_date: 目标日期（用于生成文件名），默认为当前日期
     
     Returns:
         bool: 保存是否成功
@@ -71,15 +72,18 @@ def save_selected_stocks(selected: list):
     
     ensure_data_dir()
     
-    # 生成文件名：stockpool_YYYYMMDD.txt
-    date_str = datetime.now().strftime('%Y%m%d')
+    # 使用指定的日期或当前日期生成文件名
+    if target_date is None:
+        target_date = datetime.now()
+    
+    date_str = target_date.strftime('%Y%m%d')
     filename = f"stockpool_{date_str}.txt"
     filepath = DATA_DIR / filename
     
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
             # 写入表头注释
-            f.write(f"# 选股结果 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# 选股结果 - {target_date.strftime('%Y-%m-%d')}\n")
             f.write(f"# 格式: 股票代码,综合评分\n")
             f.write(f"# 总数: {len(selected)} 只\n")
             f.write("-" * 30 + "\n")
@@ -331,7 +335,7 @@ def check_continuous_volume(reader, stock_code, period=5):
         # 静默处理错误，避免在遍历几千只股票时刷屏
         return False
 
-def main(period=5):
+def main(period=5, target_date: datetime = None):
     """
     主函数：执行持续放量选股策略
     
@@ -353,12 +357,22 @@ def main(period=5):
     
     Args:
         period: 连续放量天数，默认5天
+        target_date: 目标选股日期，默认为None（使用当前日期）
     
     Returns:
         list: 选中的股票列表 [(code, name), ...]
     """
+    # 确定实际使用的日期
+    if target_date is None:
+        actual_date = datetime.now()
+        date_desc = "当前日期"
+    else:
+        actual_date = target_date
+        date_desc = f"指定日期 {target_date.strftime('%Y-%m-%d')}"
+    
     print("=" * 80)
     print(f"[INFO] 持续放量选股工具（使用白名单加速）")
+    print(f"[INFO] 选股日期: {date_desc}")
     print(f"[INFO] 连续放量天数: {period} 天")
     print(f"[INFO] 涨跌幅过滤区间: {MIN_PRICE_CHANGE_PCT}% ~ {MAX_PRICE_CHANGE_PCT}% (超出此区间的股票将被过滤)")
     print(f"[INFO] 新股过滤: 上市不足 {MIN_LISTING_DAYS} 天的股票将被过滤")
@@ -473,8 +487,8 @@ def main(period=5):
     print(f"[FILTER] 过滤新股: {filtered_new_stock_count} 只")
     print(f"[RESULT] 最终选股结果: {len(selected_codes_filtered)} 只")
     
-    # 保存结果
-    save_selected_stocks(selected_codes_filtered)
+    # 保存结果（传入目标日期）
+    save_selected_stocks(selected_codes_filtered, target_date=actual_date)
     
     return selected_codes_filtered
 
@@ -484,15 +498,27 @@ if __name__ == "__main__":
     主入口：执行持续放量选股策略
     
     使用方法:
-        python select_daysvol.py [--period 5]
+        python select_daysvol.py [--period 5] [--date 2024-01-15]
     
     参数说明:
         --period: 连续放量天数，默认5天
+        --date: 指定选股日期 (YYYY-MM-DD)，默认为当前日期
     """
     import argparse
     
     parser = argparse.ArgumentParser(description="持续放量选股工具")
     parser.add_argument('--period', type=int, default=PERIOD, help='连续放量天数')
+    parser.add_argument('--date', type=str, default=None, help='指定选股日期 (YYYY-MM-DD)，默认为当前日期')
     args = parser.parse_args()
     
-    main(period=args.period)
+    # 解析日期参数
+    target_date = None
+    if args.date:
+        try:
+            target_date = datetime.strptime(args.date, '%Y-%m-%d')
+            print(f"[INFO] 使用指定日期: {target_date.strftime('%Y-%m-%d')}")
+        except ValueError:
+            print(f"[ERROR] 日期格式错误，请使用 YYYY-MM-DD 格式")
+            sys.exit(1)
+    
+    main(period=args.period, target_date=target_date)

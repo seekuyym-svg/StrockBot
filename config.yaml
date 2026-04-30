@@ -35,7 +35,7 @@ symbols:
     buy_rebound_pct: 0.5         # 买入监控反弹幅度阈值（%）
 
 # 初始资金
-initial_capital: 300000  # 30万
+initial_capital: 500000  # 30万
 
 # 马丁格尔策略参数（针对T+0优化）
 strategy:
@@ -228,3 +228,14 @@ database:
 
 # 通达信安装目录
 TDX_DIR: "D:\\Install\\zd_zxzq_gm"
+
+# 回测配置
+backtest:
+  # 持仓天数（交易日）
+  hold_days: 3
+  # 连续放量天数
+  volume_period: 5
+  # 初始资金（元）
+  initial_capital: 1000000
+  # 综合评分最小值
+  backtest_minscore: -6.5
