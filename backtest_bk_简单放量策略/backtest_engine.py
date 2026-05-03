@@ -106,22 +106,16 @@ class BacktestEngine:
         self.hold_days = config.get('hold_days', 3)
         self.whitelist_file = config.get('whitelist_file')
         self.tdx_dir = config.get('tdx_dir', r"D:\Install\zd_zxzq_gm")
-        
-        # 从 config.yaml 读取回测配置
-        yaml_config = load_config()
-        backtest_config = yaml_config.get('backtest', {})
-        
-        # 评分相关配置（第一阶段新增）
-        self.min_score = config.get('min_score', backtest_config.get('min_score', 60.0))
-        self.max_stocks_per_cycle = config.get('max_stocks_per_cycle', backtest_config.get('max_stocks_per_cycle', 10))
-        self.min_stocks_per_cycle = config.get('min_stocks_per_cycle', backtest_config.get('min_stocks_per_cycle', 3))
+        self.min_score = config.get('min_score', 0.5)  # 最小评分阈值
         
         # 数据缓存
         self.whitelist = set()
         self.trades: List[TradeRecord] = []
         self.trading_cycles: List[TradingCycle] = []  # 交易周期列表
         
-        # 初始资金
+        # 从 config.yaml 读取初始资金（与 calc_backtest_rate.py 保持一致）
+        yaml_config = load_config()
+        backtest_config = yaml_config.get('backtest', {})
         self.initial_capital = config.get('initial_capital', backtest_config.get('initial_capital', 1000000.0))
         
         # 数据目录
@@ -136,7 +130,6 @@ class BacktestEngine:
         logger.info(f"  - 持仓天数: {self.hold_days} 天")
         logger.info(f"  - 初始资金: {self.initial_capital:,.2f} 元")
         logger.info(f"  - 最小评分: {self.min_score}")
-        logger.info(f"  - 选股数量限制: {self.min_stocks_per_cycle}-{self.max_stocks_per_cycle} 只")
     
     def load_whitelist_stocks(self):
         """
@@ -274,50 +267,12 @@ class BacktestEngine:
     
     def get_trading_days(self) -> List[datetime]:
         """
-        获取回测期间的所有交易日（自动过滤周末和法定节假日）
+        获取回测期间的所有交易日
         
         Returns:
             List[datetime]: 交易日列表
         """
-        try:
-            import akshare as ak
-            
-            logger.info("[INFO] 正在从 akshare 获取A股交易日历...")
-            
-            # 获取中国A股交易日历
-            # 注意：akshare 的 stock_trade_date_hist_em 返回的是所有历史交易日
-            trade_dates_df = ak.tool_trade_date_hist_sina()
-            
-            if trade_dates_df is None or trade_dates_df.empty:
-                logger.warning("[WARN] 无法从 akshare 获取交易日历，降级为仅过滤周末")
-                return self._get_trading_days_fallback()
-            
-            # 转换为 datetime 对象
-            trade_dates = pd.to_datetime(trade_dates_df['trade_date']).tolist()
-            
-            # 筛选指定日期范围内的交易日
-            trading_days = []
-            for date in trade_dates:
-                if self.start_date <= date <= self.end_date:
-                    trading_days.append(date)
-            
-            # 按日期排序
-            trading_days.sort()
-            
-            logger.info(f"[OK] 成功获取 {len(trading_days)} 个交易日（已自动过滤周末和法定节假日）")
-            return trading_days
-            
-        except Exception as e:
-            logger.warning(f"[WARN] 获取交易日历失败: {e}，降级为仅过滤周末")
-            return self._get_trading_days_fallback()
-    
-    def _get_trading_days_fallback(self) -> List[datetime]:
-        """
-        降级方案：仅过滤周末（不处理法定节假日）
-        
-        Returns:
-            List[datetime]: 工作日列表
-        """
+        # 简化实现：假设周一至周五为交易日（实际应使用交易日历）
         trading_days = []
         current = self.start_date
         while current <= self.end_date:
@@ -325,7 +280,7 @@ class BacktestEngine:
                 trading_days.append(current)
             current += timedelta(days=1)
         
-        logger.info(f"[FALLBACK] 使用降级方案，共 {len(trading_days)} 个工作日（未过滤节假日）")
+        logger.info(f"[INFO] 回测期间共 {len(trading_days)} 个交易日")
         return trading_days
     
     def check_volume_condition(self, stock_code: str, check_date: datetime) -> bool:
@@ -799,29 +754,16 @@ class BacktestEngine:
                 continue
             
             # 过滤评分低于阈值的股票
-            filtered_stocks = [
-                (code, score) for code, score in stock_scores.items() 
+            selected_codes = [
+                code for code, score in stock_scores.items() 
                 if score >= self.min_score
             ]
             
-            if not filtered_stocks:
+            if not selected_codes:
                 i += 1
                 continue
             
-            # 按评分降序排序
-            sorted_stocks = sorted(filtered_stocks, key=lambda x: x[1], reverse=True)
-            
-            # 限制选股数量（取Top N）
-            selected_with_scores = sorted_stocks[:self.max_stocks_per_cycle]
-            selected_codes = [code for code, score in selected_with_scores]
-            
-            # 如果股票数量少于最小值，跳过该周期
-            if len(selected_codes) < self.min_stocks_per_cycle:
-                logger.warning(f"[CYCLE {cycle_index}] {current_date.strftime('%Y-%m-%d')}: 仅 {len(selected_codes)} 只股票满足条件，少于最小值 {self.min_stocks_per_cycle}，跳过")
-                i += 1
-                continue
-            
-            logger.info(f"[CYCLE {cycle_index}] {current_date.strftime('%Y-%m-%d')}: 选中 {len(selected_codes)} 只股票（原始 {len(stock_scores)} 只，筛选后 {len(filtered_stocks)} 只）")
+            logger.info(f"[CYCLE {cycle_index}] {current_date.strftime('%Y-%m-%d')}: 选中 {len(selected_codes)} 只股票")
             
             # 创建新交易周期
             cycle = TradingCycle(cycle_index, current_date)

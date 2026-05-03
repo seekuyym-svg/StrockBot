@@ -188,7 +188,7 @@ class HistoricalStockScorer:
             analysis_date: 分析日期 (格式: YYYY-MM-DD)
             
         Returns:
-            综合评分 (float)，如果分析失败返回 None（新版：0-100分制）
+            综合评分 (float)，如果分析失败返回 None
         """
         try:
             # 解析股票代码
@@ -199,9 +199,60 @@ class HistoricalStockScorer:
             market = parts[0].lower()
             code = parts[1]
             
-            # 使用新版100分评分系统
-            from local.utils import calculate_trend_score_v2
-            score = calculate_trend_score_v2(market, code, days=300)
+            # 获取历史K线数据（截断到 analysis_date）
+            df = self._get_historical_klines(code, analysis_date, days=300)
+            if df.empty:
+                return None
+            
+            # 计算均线
+            df = self._calculate_ma(df)
+            
+            # 判断趋势
+            trend, ma_msg = self._check_trend_alignment(df)
+            
+            # 计算辅助指标
+            dif, dea, macd_bar = self._compute_macd(df)
+            rsi_val = self._compute_rsi(df)
+            boll_pos, upper, lower = self._compute_bollinger(df)
+            
+            latest_close = df['close'].iloc[-1]
+            latest_vol = df['volume'].iloc[-1]
+            vol_ma20 = df['volume'].rolling(20).mean().iloc[-1]
+            vol_ratio = latest_vol / vol_ma20 if vol_ma20 > 0 else 1
+            
+            # 综合评分
+            score = 0
+            
+            # 均线排列评分
+            if trend == 'bullish':
+                score += 3
+            elif trend == 'bearish':
+                score -= 3
+            
+            # MACD评分
+            if dif > dea and dif > 0:
+                score += 1
+            elif dif < dea and dif < 0:
+                score -= 1
+            
+            # RSI评分
+            if rsi_val > 60:
+                score += 1
+            elif rsi_val < 40:
+                score -= 1
+            
+            # 布林带评分
+            if boll_pos == 1:
+                score += 1
+            elif boll_pos == -1:
+                score -= 1
+            
+            # 成交量评分
+            prev_close = df['close'].iloc[-2]
+            if vol_ratio > 1.2 and latest_close > prev_close:
+                score += 0.5
+            elif vol_ratio > 1.2 and latest_close < prev_close:
+                score -= 0.5
             
             return score
                 
@@ -257,17 +308,14 @@ class HistoricalStockScorer:
         
         return stocks
     
-    def append_scores_to_file(self, date_str: str, scored_results: List[Tuple[str, float]], 
-                             backup: bool = False, min_score: float = 60.0, max_count: int = 10):
+    def append_scores_to_file(self, date_str: str, scored_results: List[Tuple[str, float]], backup: bool = False):
         """
-        将评分结果追加到股票池文件，并应用评分筛选和数量限制
+        将评分结果追加到股票池文件
         
         Args:
             date_str: 日期字符串 (格式: YYYY-MM-DD)
             scored_results: 评分结果列表 [(股票代码, 评分), ...]
             backup: 是否创建备份文件（默认False）
-            min_score: 最低评分阈值（默认60）
-            max_count: 最多保留的股票数量（默认10）
         """
         # 转换日期格式为 YYYYMMDD
         formatted_date = date_str.replace("-", "")
@@ -276,25 +324,6 @@ class HistoricalStockScorer:
         
         if not filepath.exists():
             return
-        
-        # === 第一步：按评分筛选 ===
-        filtered_results = [(symbol, score) for symbol, score in scored_results if score >= min_score]
-        
-        original_count = len(scored_results)
-        after_filter_count = len(filtered_results)
-        
-        logger.info(f"[FILTER] {date_str}: 原始 {original_count} 只 -> 评分>= {min_score} 筛选后 {after_filter_count} 只")
-        
-        if not filtered_results:
-            logger.warning(f"[WARN] {date_str}: 无股票满足评分要求（>= {min_score}），跳过保存")
-            return
-        
-        # === 第二步：按评分降序排序，取Top N ===
-        sorted_results = sorted(filtered_results, key=lambda x: x[1], reverse=True)
-        top_results = sorted_results[:max_count]
-        
-        final_count = len(top_results)
-        logger.info(f"[TOP] {date_str}: 保留评分最高的 {final_count} 只股票")
         
         # 根据参数决定是否创建备份文件
         if backup:
@@ -320,11 +349,9 @@ class HistoricalStockScorer:
             
             # 添加评分数据标识
             f.write(f"\n# === 技术评分数据 (自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
-            f.write(f"# 筛选条件: 评分 >= {min_score}, 最多保留 {max_count} 只\n")
-            f.write(f"# 原始数量: {original_count}, 筛选后: {after_filter_count}, 最终保留: {final_count}\n")
             
             # 写入评分数据（不带市场前缀，保持与原文件格式一致）
-            for symbol, score in top_results:
+            for symbol, score in scored_results:
                 # 移除市场前缀以保持与原文件格式一致
                 code_without_prefix = symbol.split('.')[1] if '.' in symbol else symbol
                 f.write(f"{code_without_prefix},{score:.1f}\n")
@@ -338,23 +365,6 @@ class HistoricalStockScorer:
             end_date: 结束日期 (格式: YYYY-MM-DD)
             backup: 是否创建备份文件（默认False）
         """
-        # 从 config.yaml 读取评分配置
-        try:
-            import yaml
-            config_path = Path(__file__).parent.parent / 'config.yaml'
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            
-            backtest_config = config.get('backtest', {})
-            min_score = backtest_config.get('min_score', 60.0)
-            max_stocks = backtest_config.get('max_stocks_per_cycle', 10)
-            
-            logger.info(f"[CONFIG] 评分阈值: {min_score}, 最大选股数: {max_stocks}")
-        except Exception as e:
-            logger.warning(f"[WARN] 读取配置文件失败: {e}，使用默认值")
-            min_score = 60.0
-            max_stocks = 10
-        
         current = datetime.strptime(start_date, '%Y-%m-%d')
         end = datetime.strptime(end_date, '%Y-%m-%d')
         
@@ -385,10 +395,9 @@ class HistoricalStockScorer:
             
             total_stocks += len(stocks)
             
-            # 3. 保存结果（应用筛选和限制）
+            # 3. 保存结果
             if scored_results:
-                self.append_scores_to_file(date_str, scored_results, backup=backup, 
-                                          min_score=min_score, max_count=max_stocks)
+                self.append_scores_to_file(date_str, scored_results, backup=backup)
                 processed_count += 1
             
             # 4. 打印进度（每处理完一个文件）

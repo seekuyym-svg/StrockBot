@@ -575,9 +575,77 @@ if __name__ == "__main__":
         print(f"{code}: 上市日期={list_date}, 是否新股(<1年)={is_new}")
 
 
+def _find_latest_whitelist(data_dir: Path):
+    """
+    查找最新的白名单文件
+    
+    Args:
+        data_dir: 数据目录路径
+    
+    Returns:
+        str or None: 最新白名单的日期字符串 (YYYYMMDD)，如果未找到返回 None
+    """
+    import glob
+    import os
+    
+    # 查找所有 whitelist_*.txt 文件
+    pattern = str(data_dir / "whitelist_*.txt")
+    files = glob.glob(pattern)
+    
+    if not files:
+        return None
+    
+    # 提取日期并排序
+    dates = []
+    for f in files:
+        filename = os.path.basename(f)
+        # 提取 YYYYMMDD
+        date_str = filename.replace('whitelist_', '').replace('.txt', '')
+        if date_str.isdigit() and len(date_str) == 8:
+            dates.append(date_str)
+    
+    if not dates:
+        return None
+    
+    # 返回最新的日期
+    return max(dates)
+
+
+def _load_whitelist_file(filepath: Path, date_str: str):
+    """
+    加载单个白名单文件
+    
+    Args:
+        filepath: 白名单文件路径
+        date_str: 日期字符串
+    
+    Returns:
+        set: 白名单股票代码集合
+    """
+    try:
+        whitelist_codes = set()
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    whitelist_codes.add(line)
+        
+        print(f"[LOAD] 加载白名单 ({date_str}): {len(whitelist_codes)} 只股票")
+        print(f"[PATH] 文件路径: {filepath}")
+        return whitelist_codes
+    except Exception as e:
+        print(f"[ERROR] 加载白名单失败: {e}")
+        return set()
+
+
 def load_whitelist(date_str=None):
     """
-    加载股票白名单（正常交易股票）
+    加载股票白名单（正常交易股票，支持智能回退）
+    
+    加载策略:
+        1. 优先使用指定日期的白名单
+        2. 如果不存在，自动查找最近的白名单文件
+        3. 如果完全没有，返回空集合并提示用户生成
     
     Args:
         date_str: 日期字符串 YYYYMMDD，默认今天
@@ -588,30 +656,33 @@ def load_whitelist(date_str=None):
     from pathlib import Path
     from datetime import datetime
     
+    data_dir = Path(__file__).parent.parent / "data"
+    
+    # 1. 尝试加载指定日期的白名单
     if date_str is None:
         date_str = datetime.now().strftime('%Y%m%d')
     
-    # 项目根目录的 data 文件夹
-    data_dir = Path(__file__).parent.parent / "data"
     whitelist_file = data_dir / f"whitelist_{date_str}.txt"
     
-    if not whitelist_file.exists():
-        print(f"[WARN] 白名单文件不存在: {whitelist_file}")
-        return set()
+    if whitelist_file.exists():
+        # 成功加载指定日期
+        return _load_whitelist_file(whitelist_file, date_str)
     
-    try:
-        whitelist_codes = set()
-        with open(whitelist_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    whitelist_codes.add(line)
-        
-        print(f"[LOAD] 加载白名单: {len(whitelist_codes)} 只股票")
-        return whitelist_codes
-    except Exception as e:
-        print(f"[ERROR] 加载白名单失败: {e}")
-        return set()
+    # 2. 智能回退：查找最新的白名单
+    print(f"[WARNING] 指定日期白名单不存在: {whitelist_file.name}")
+    print("[INFO] 正在查找最近的白名单文件...")
+    
+    latest_date = _find_latest_whitelist(data_dir)
+    
+    if latest_date:
+        latest_file = data_dir / f"whitelist_{latest_date}.txt"
+        print(f"[OK] 使用最近白名单: {latest_date}")
+        return _load_whitelist_file(latest_file, latest_date)
+    
+    # 3. 完全没有白名单
+    print("[ERROR] 未找到任何白名单文件")
+    print("[TIP] 请先运行: python local/manage_stock_list.py --update")
+    return set()
 
 
 def load_blacklist(date_str=None):
@@ -654,3 +725,233 @@ def load_blacklist(date_str=None):
     except Exception as e:
         print(f"[ERROR] 加载黑名单失败: {e}")
         return {}
+
+
+def calculate_trend_score_v2(market: str, code: str, days: int = 300) -> Optional[float]:
+    """
+    计算股票综合趋势评分（新版，满分100分）
+    
+    评分维度及权重：
+    1. 量能因子（30分）
+       - 成交量递增强度（15分）
+       - 量比大小（10分）
+       - 换手率活跃度（5分）
+    
+    2. 趋势因子（25分）
+       - 均线多头排列（15分）
+       - 均线斜率（10分）
+    
+    3. 动量因子（20分）
+       - 5日/10日涨幅（10分）
+       - 相对强度RS（10分）
+    
+    4. 形态因子（15分）
+       - MACD金叉及位置（8分）
+       - 布林带位置（7分）
+    
+    5. 风险因子（10分）
+       - RSI超买超卖（5分）
+       - 波动率控制（5分）
+    
+    Args:
+        market: 市场代码 ('sh' 或 'sz')
+        code: 股票代码
+        days: 获取历史数据天数，默认300天
+    
+    Returns:
+        float: 综合评分（0-100分），失败返回None
+    """
+    try:
+        # 1. 获取K线数据
+        df = _get_historical_klines(market, code, days)
+        if df.empty or len(df) < 60:
+            return None
+        
+        # 2. 计算技术指标
+        df = _calculate_ma(df, periods=[5, 10, 20, 60])
+        dif, dea, macd_bar = _compute_macd(df)
+        rsi_val = _compute_rsi(df)
+        boll_pos, upper, lower = _compute_bollinger(df)
+        
+        # 3. 综合评分（满分100分）
+        total_score = 0
+        
+        # ========== 1. 量能因子（30分）==========
+        latest_vol = df['volume'].iloc[-1]
+        vol_ma5 = df['volume'].rolling(5).mean().iloc[-1]
+        vol_ma20 = df['volume'].rolling(20).mean().iloc[-1]
+        
+        # 1.1 成交量递增强度（15分）
+        volumes_5d = df['volume'].iloc[-5:].values
+        vol_increase_days = sum(1 for i in range(1, 5) if volumes_5d[i] > volumes_5d[i-1])
+        if vol_increase_days >= 4:
+            total_score += 15  # 连续4天以上递增
+        elif vol_increase_days >= 3:
+            total_score += 12  # 连续3天递增
+        elif vol_increase_days >= 2:
+            total_score += 8   # 连续2天递增
+        elif vol_increase_days >= 1:
+            total_score += 4   # 有1天递增
+        
+        # 1.2 量比大小（10分）
+        vol_ratio = latest_vol / vol_ma20 if vol_ma20 > 0 else 1
+        if vol_ratio >= 3.0:
+            total_score += 10  # 显著放量
+        elif vol_ratio >= 2.0:
+            total_score += 8   # 明显放量
+        elif vol_ratio >= 1.5:
+            total_score += 6   # 温和放量
+        elif vol_ratio >= 1.2:
+            total_score += 4   # 轻微放量
+        elif vol_ratio >= 1.0:
+            total_score += 2   # 正常水平
+        
+        # 1.3 换手率活跃度（5分）- 简化版，用成交量绝对值替代
+        # 注意：真实场景需要流通股本数据
+        if vol_ratio > 2.0:
+            total_score += 5   # 高活跃度
+        elif vol_ratio > 1.5:
+            total_score += 3   # 中等活跃度
+        elif vol_ratio > 1.0:
+            total_score += 1   # 低活跃度
+        
+        # ========== 2. 趋势因子（25分）==========
+        ma5 = df['MA5'].iloc[-1]
+        ma10 = df['MA10'].iloc[-1]
+        ma20 = df['MA20'].iloc[-1]
+        ma60 = df['MA60'].iloc[-1]
+        
+        # 2.1 均线多头排列（15分）
+        if pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and pd.notna(ma60):
+            if ma5 > ma10 > ma20 > ma60:
+                # 检查发散程度
+                spread_ratio = (ma5 - ma60) / ma60 if ma60 > 0 else 0
+                if spread_ratio > 0.05:  # 发散超过5%
+                    total_score += 15  # 强势多头
+                else:
+                    total_score += 12  # 弱多头
+            elif ma5 > ma10 > ma20:
+                total_score += 10  # 短期多头
+            elif ma5 > ma20:
+                total_score += 6   # 仅MA5>MA20
+            elif ma5 < ma10 < ma20 < ma60:
+                total_score += 0   # 空头排列，不给分
+            else:
+                total_score += 3   # 震荡状态
+        
+        # 2.2 均线斜率（10分）
+        if pd.notna(ma20):
+            ma20_5d_ago = df['MA20'].iloc[-5] if len(df) >= 5 else ma20
+            ma20_slope = (ma20 - ma20_5d_ago) / ma20_5d_ago * 100 if ma20_5d_ago > 0 else 0
+            
+            if ma20_slope > 2.0:
+                total_score += 10  # 陡峭上升
+            elif ma20_slope > 1.0:
+                total_score += 8   # 缓步上升
+            elif ma20_slope > 0:
+                total_score += 5   # 微幅上升
+            elif ma20_slope > -1.0:
+                total_score += 2   # 基本持平
+            else:
+                total_score += 0   # 下降趋势
+        
+        # ========== 3. 动量因子（20分）==========
+        latest_close = df['close'].iloc[-1]
+        
+        # 3.1 5日/10日涨幅（10分）
+        close_5d_ago = df['close'].iloc[-5] if len(df) >= 5 else latest_close
+        close_10d_ago = df['close'].iloc[-10] if len(df) >= 10 else latest_close
+        
+        return_5d = (latest_close - close_5d_ago) / close_5d_ago * 100 if close_5d_ago > 0 else 0
+        return_10d = (latest_close - close_10d_ago) / close_10d_ago * 100 if close_10d_ago > 0 else 0
+        
+        # 综合5日和10日涨幅
+        avg_return = (return_5d + return_10d) / 2
+        
+        if avg_return > 10:
+            total_score += 10  # 强势上涨
+        elif avg_return > 5:
+            total_score += 8   # 明显上涨
+        elif avg_return > 2:
+            total_score += 6   # 温和上涨
+        elif avg_return > 0:
+            total_score += 4   # 微幅上涨
+        elif avg_return > -2:
+            total_score += 2   # 基本持平
+        else:
+            total_score += 0   # 下跌
+        
+        # 3.2 相对强度RS（10分）- 简化版，用个股涨幅替代
+        # 注意：真实场景需要对比沪深300指数
+        if return_5d > 8:
+            total_score += 10  # 超强相对强度
+        elif return_5d > 5:
+            total_score += 8   # 强相对强度
+        elif return_5d > 2:
+            total_score += 6   # 中等相对强度
+        elif return_5d > 0:
+            total_score += 4   # 弱相对强度
+        else:
+            total_score += 2   # 负相对强度
+        
+        # ========== 4. 形态因子（15分）==========
+        
+        # 4.1 MACD金叉及位置（8分）
+        if dif > dea and dif > 0:
+            total_score += 8   # MACD金叉且在零轴上方
+        elif dif > dea and dif <= 0:
+            total_score += 5   # MACD金叉但在零轴下方
+        elif dif < dea and dif > 0:
+            total_score += 3   # MACD死叉但在零轴上方
+        else:
+            total_score += 0   # MACD死叉且在零轴下方
+        
+        # 4.2 布林带位置（7分）
+        if boll_pos == 1:
+            total_score += 7   # 突破上轨
+        elif boll_pos == 0:
+            # 在中轨附近，判断更接近上轨还是下轨
+            mid = (upper + lower) / 2
+            if latest_close > mid:
+                total_score += 4  # 中轨上方
+            else:
+                total_score += 2  # 中轨下方
+        else:
+            total_score += 0   # 跌破下轨
+        
+        # ========== 5. 风险因子（10分）==========
+        
+        # 5.1 RSI超买超卖（5分）
+        if 50 <= rsi_val <= 70:
+            total_score += 5   # 理想区间
+        elif rsi_val > 70:
+            total_score += 2   # 超买区，有风险
+        elif 40 <= rsi_val < 50:
+            total_score += 3   # 偏弱
+        elif rsi_val < 40:
+            total_score += 1   # 超卖区，可能有反弹机会
+        else:
+            total_score += 0
+        
+        # 5.2 波动率控制（5分）- 简化版，用近期振幅替代
+        high_10d = df['high'].iloc[-10:].max()
+        low_10d = df['low'].iloc[-10:].min()
+        volatility = (high_10d - low_10d) / low_10d * 100 if low_10d > 0 else 0
+        
+        if 5 <= volatility <= 15:
+            total_score += 5   # 适中波动
+        elif volatility < 5:
+            total_score += 3   # 波动过低，缺乏活力
+        elif volatility < 25:
+            total_score += 2   # 波动较高
+        else:
+            total_score += 0   # 波动过高，风险大
+        
+        # 确保分数在0-100范围内
+        total_score = max(0, min(100, total_score))
+        
+        return round(total_score, 1)
+        
+    except Exception as e:
+        print(f"⚠️  计算评分失败 ({market}{code}): {e}")
+        return None

@@ -106,22 +106,16 @@ class BacktestEngine:
         self.hold_days = config.get('hold_days', 3)
         self.whitelist_file = config.get('whitelist_file')
         self.tdx_dir = config.get('tdx_dir', r"D:\Install\zd_zxzq_gm")
-        
-        # 从 config.yaml 读取回测配置
-        yaml_config = load_config()
-        backtest_config = yaml_config.get('backtest', {})
-        
-        # 评分相关配置（第一阶段新增）
-        self.min_score = config.get('min_score', backtest_config.get('min_score', 60.0))
-        self.max_stocks_per_cycle = config.get('max_stocks_per_cycle', backtest_config.get('max_stocks_per_cycle', 10))
-        self.min_stocks_per_cycle = config.get('min_stocks_per_cycle', backtest_config.get('min_stocks_per_cycle', 3))
+        self.min_score = config.get('min_score', 0.5)  # 最小评分阈值
         
         # 数据缓存
         self.whitelist = set()
         self.trades: List[TradeRecord] = []
         self.trading_cycles: List[TradingCycle] = []  # 交易周期列表
         
-        # 初始资金
+        # 从 config.yaml 读取初始资金（与 calc_backtest_rate.py 保持一致）
+        yaml_config = load_config()
+        backtest_config = yaml_config.get('backtest', {})
         self.initial_capital = config.get('initial_capital', backtest_config.get('initial_capital', 1000000.0))
         
         # 数据目录
@@ -136,7 +130,6 @@ class BacktestEngine:
         logger.info(f"  - 持仓天数: {self.hold_days} 天")
         logger.info(f"  - 初始资金: {self.initial_capital:,.2f} 元")
         logger.info(f"  - 最小评分: {self.min_score}")
-        logger.info(f"  - 选股数量限制: {self.min_stocks_per_cycle}-{self.max_stocks_per_cycle} 只")
     
     def load_whitelist_stocks(self):
         """
@@ -274,50 +267,12 @@ class BacktestEngine:
     
     def get_trading_days(self) -> List[datetime]:
         """
-        获取回测期间的所有交易日（自动过滤周末和法定节假日）
+        获取回测期间的所有交易日
         
         Returns:
             List[datetime]: 交易日列表
         """
-        try:
-            import akshare as ak
-            
-            logger.info("[INFO] 正在从 akshare 获取A股交易日历...")
-            
-            # 获取中国A股交易日历
-            # 注意：akshare 的 stock_trade_date_hist_em 返回的是所有历史交易日
-            trade_dates_df = ak.tool_trade_date_hist_sina()
-            
-            if trade_dates_df is None or trade_dates_df.empty:
-                logger.warning("[WARN] 无法从 akshare 获取交易日历，降级为仅过滤周末")
-                return self._get_trading_days_fallback()
-            
-            # 转换为 datetime 对象
-            trade_dates = pd.to_datetime(trade_dates_df['trade_date']).tolist()
-            
-            # 筛选指定日期范围内的交易日
-            trading_days = []
-            for date in trade_dates:
-                if self.start_date <= date <= self.end_date:
-                    trading_days.append(date)
-            
-            # 按日期排序
-            trading_days.sort()
-            
-            logger.info(f"[OK] 成功获取 {len(trading_days)} 个交易日（已自动过滤周末和法定节假日）")
-            return trading_days
-            
-        except Exception as e:
-            logger.warning(f"[WARN] 获取交易日历失败: {e}，降级为仅过滤周末")
-            return self._get_trading_days_fallback()
-    
-    def _get_trading_days_fallback(self) -> List[datetime]:
-        """
-        降级方案：仅过滤周末（不处理法定节假日）
-        
-        Returns:
-            List[datetime]: 工作日列表
-        """
+        # 简化实现：假设周一至周五为交易日（实际应使用交易日历）
         trading_days = []
         current = self.start_date
         while current <= self.end_date:
@@ -325,7 +280,7 @@ class BacktestEngine:
                 trading_days.append(current)
             current += timedelta(days=1)
         
-        logger.info(f"[FALLBACK] 使用降级方案，共 {len(trading_days)} 个工作日（未过滤节假日）")
+        logger.info(f"[INFO] 回测期间共 {len(trading_days)} 个交易日")
         return trading_days
     
     def check_volume_condition(self, stock_code: str, check_date: datetime) -> bool:
@@ -646,9 +601,7 @@ class BacktestEngine:
         """
         from pathlib import Path
         
-        # 使用项目根目录的 data 文件夹
-        project_root = Path(__file__).parent.parent
-        csv_file = project_root / "data" / "hs300_eastmoney.csv"
+        csv_file = Path("data/hs300_eastmoney.csv")
         
         if not csv_file.exists():
             raise FileNotFoundError(f"CSV文件不存在: {csv_file}")
@@ -757,20 +710,21 @@ class BacktestEngine:
             logger.error(f"[ERROR] 从腾讯财经获取沪深300数据失败: {e}")
             raise
     
-    def run_backtest(self):
+    def run_backtest(self, use_stockpool: bool = False):
         """
-        执行回测（严格交易周期模式）
+        执行回测
         
-        核心原则：
-        1. 选股日 = 卖出日（同一天完成卖出和选股）
-        2. 买入日 = 选股日 + 1个交易日
-        3. 卖出日 = 买入日 + (hold_days - 1)个交易日
-        4. 下一个周期的选股日 = 当前周期的卖出日
-        5. 周期之间绝不重叠
+        Args:
+            use_stockpool: 是否使用预生成的股票池文件
+                          - True: 从 data/stockpool_YYYYMMDD.txt 读取
+                          - False: 实时检查每只股票的放量条件
         """
         logger.info("=" * 80)
         logger.info("[START] 开始执行回测")
-        logger.info("[MODE] 严格交易周期模式")
+        if use_stockpool:
+            logger.info("[MODE] 使用预生成股票池模式")
+        else:
+            logger.info("[MODE] 实时选股模式")
         logger.info("=" * 80)
         
         # 1. 加载白名单
@@ -781,294 +735,404 @@ class BacktestEngine:
         logger.info("\n[STEP 2] 获取交易日列表...")
         trading_days = self.get_trading_days()
         
-        # 3. 严格按交易周期执行
-        logger.info("\n[STEP 3] 开始按交易周期回测...")
+        # 3. 逐日回测
+        logger.info("\n[STEP 3] 开始逐日回测...")
+        pending_trades = []  # 待卖出的交易
+        total_signals = 0
+        total_executed = 0
+        total_skipped = 0
         
-        cycles = []  # 存储所有交易周期
-        current_capital = self.initial_capital
-        cycle_index = 1
-        
-        i = 0
-        while i < len(trading_days):
-            current_date = trading_days[i]
+        for idx, current_date in enumerate(trading_days):
+            if (idx + 1) % 50 == 0:
+                progress = (idx + 1) / len(trading_days) * 100
+                logger.info(f"[PROGRESS] 进度: {idx + 1}/{len(trading_days)} ({progress:.1f}%)")
             
-            # 3.1 选股：从股票池文件读取
-            stock_scores = self.load_daily_stockpool(current_date)
-            if not stock_scores:
-                i += 1
-                continue
+            # 3.1 选股：根据模式选择股票
+            selected_stocks = []
             
-            # 过滤评分低于阈值的股票
-            filtered_stocks = [
-                (code, score) for code, score in stock_scores.items() 
-                if score >= self.min_score
-            ]
-            
-            if not filtered_stocks:
-                i += 1
-                continue
-            
-            # 按评分降序排序
-            sorted_stocks = sorted(filtered_stocks, key=lambda x: x[1], reverse=True)
-            
-            # 限制选股数量（取Top N）
-            selected_with_scores = sorted_stocks[:self.max_stocks_per_cycle]
-            selected_codes = [code for code, score in selected_with_scores]
-            
-            # 如果股票数量少于最小值，跳过该周期
-            if len(selected_codes) < self.min_stocks_per_cycle:
-                logger.warning(f"[CYCLE {cycle_index}] {current_date.strftime('%Y-%m-%d')}: 仅 {len(selected_codes)} 只股票满足条件，少于最小值 {self.min_stocks_per_cycle}，跳过")
-                i += 1
-                continue
-            
-            logger.info(f"[CYCLE {cycle_index}] {current_date.strftime('%Y-%m-%d')}: 选中 {len(selected_codes)} 只股票（原始 {len(stock_scores)} 只，筛选后 {len(filtered_stocks)} 只）")
-            
-            # 创建新交易周期
-            cycle = TradingCycle(cycle_index, current_date)
-            cycle.initial_capital = current_capital
-            
-            # 3.2 次日买入
-            buy_date_idx = i + 1
-            if buy_date_idx >= len(trading_days):
-                logger.warning(f"[CYCLE {cycle_index}] 买入日超出回测周期，跳过该周期")
-                i += 1
-                continue
-            
-            buy_date = trading_days[buy_date_idx]
-            cycle.buy_date = buy_date
-            
-            # 为每只股票创建交易记录
-            for code in selected_codes:
-                # 获取买入价格
-                buy_price = self.get_next_day_open_price(code, current_date)
-                if buy_price is None:
-                    logger.warning(f"  [SKIP] {code}: 买入日无数据，跳过")
-                    continue
+            if use_stockpool:
+                # 模式A: 从预生成的股票池文件读取
+                # 只有在选股日才有股票池文件，非选股日返回空字典
+                stock_scores = self.load_daily_stockpool(current_date)
                 
-                # 计算卖出日期
-                sell_date_idx = buy_date_idx + (self.hold_days - 1)
-                if sell_date_idx >= len(trading_days):
-                    logger.warning(f"  [SKIP] {code}: 卖出日超出回测周期，跳过")
-                    continue
+                if stock_scores:
+                    # 只选择评分 >= min_score 的股票
+                    selected_stocks = [
+                        code for code, score in stock_scores.items() 
+                        if score >= self.min_score
+                    ]
+                    logger.debug(f"[SIGNAL] {current_date.strftime('%Y-%m-%d')}: 选股日，选中 {len(selected_stocks)} 只股票（共{len(stock_scores)}只，过滤掉{len(stock_scores) - len(selected_stocks)}只低分股票）")
+                else:
+                    logger.debug(f"[SKIP] {current_date.strftime('%Y-%m-%d')}: 非选股日或无股票池数据")
+            else:
+                # 模式B: 实时检查每只股票是否满足放量条件
+                # 同样遵循每隔hold_days天选一次的逻辑
+                should_select = (idx % self.hold_days == 0)
                 
-                sell_date = trading_days[sell_date_idx]
-                
-                # 获取卖出价格
-                sell_price = self._get_close_price_at_date(code, sell_date)
-                if sell_price is None:
-                    logger.warning(f"  [SKIP] {code}: 卖出日无数据，跳过")
-                    continue
-                
-                # 计算收益率
-                return_pct = (sell_price - buy_price) / buy_price * 100
-                
-                # 创建交易记录
-                trade = TradeRecord(
-                    stock_code=code,
-                    stock_name=get_stock_name(code),
-                    buy_date=buy_date,
-                    buy_price=buy_price,
-                    sell_date=sell_date,
-                    sell_price=sell_price,
-                    return_pct=return_pct,
-                    hold_days=self.hold_days
-                )
-                
-                cycle.stocks.append(trade)
+                if should_select:
+                    for stock_code in self.whitelist:
+                        if self.check_volume_condition(stock_code, current_date):
+                            # 实时选股模式下，所有股票评分视为0，不满足min_score要求
+                            # 因此不会买入任何股票（除非min_score <= 0）
+                            pass
+                    
+                    if selected_stocks:
+                        logger.debug(f"[SIGNAL] {current_date.strftime('%Y-%m-%d')}: 选股日，选中 {len(selected_stocks)} 只股票")
+                else:
+                    logger.debug(f"[SKIP] {current_date.strftime('%Y-%m-%d')}: 非选股日")
             
-            if not cycle.stocks:
-                logger.warning(f"[CYCLE {cycle_index}] 所有股票均被跳过，该周期无有效交易")
-                i += 1
-                continue
+            total_signals += len(selected_stocks)
             
-            # 设置卖出日期
-            cycle.sell_date = cycle.stocks[0].sell_date
+            # 3.2 执行买入（次日开盘价）
+            # 只有在选股日才执行买入操作
+            if selected_stocks:
+                for stock_code in selected_stocks:
+                    # 检查次日是否停牌
+                    next_day = current_date + timedelta(days=1)
+                    if self.is_suspended(stock_code, next_day):
+                        total_skipped += 1
+                        continue
+                    
+                    # 获取次日开盘价
+                    buy_price = self.get_next_day_open_price(stock_code, current_date)
+                    if buy_price is None:
+                        total_skipped += 1
+                        continue
+                    
+                    stock_name = get_stock_name(stock_code)
+                    
+                    # 计算卖出日期和价格
+                    sell_info = self.get_sell_close_price(stock_code, next_day, self.hold_days)
+                    if sell_info is None:
+                        total_skipped += 1
+                        continue
+                    
+                    sell_date, sell_price = sell_info
+                    
+                    # 检查卖出日是否停牌
+                    if self.is_suspended(stock_code, sell_date):
+                        total_skipped += 1
+                        continue
+                    
+                    # 计算收益率
+                    return_pct = (sell_price - buy_price) / buy_price * 100
+                    
+                    # 创建交易记录
+                    trade = TradeRecord(
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                        buy_date=next_day,
+                        buy_price=buy_price,
+                        sell_date=sell_date,
+                        sell_price=sell_price,
+                        return_pct=return_pct,
+                        hold_days=self.hold_days
+                    )
+                    
+                    self.trades.append(trade)
+                    total_executed += 1
             
-            # 3.3 计算周期收益率（对齐 calc_backtest_rate.py 的逻辑）
-            cycle.return_pct = self.calculate_cycle_return(cycle)
-            
-            # 3.4 计算周期期末资金
-            cycle_final_capital = self._calculate_cycle_final_capital(cycle)
-            cycle.final_capital = cycle_final_capital
-            current_capital = cycle_final_capital  # 复利到下一周期
-            
-            # 3.5 记录交易记录到总列表
-            self.trades.extend(cycle.stocks)
-            
-            logger.info(
-                f"[CYCLE {cycle_index}] 完成: {len(cycle.stocks)} 只股票, "
-                f"收益率: {cycle.return_pct:+.2f}%, "
-                f"期初资金: {cycle.initial_capital:,.2f}, "
-                f"期末资金: {cycle_final_capital:,.2f}"
-            )
-            
-            # 添加到周期列表
-            cycles.append(cycle)
-            cycle_index += 1
-            
-            # 跳到卖出日的下一个交易日（准备新周期）
-            i = sell_date_idx + 1
-        
-        # 保存所有交易周期
-        self.trading_cycles = cycles
+            # 3.3 计算当日组合价值（简化：假设每笔交易等额）
+            daily_value = self._calculate_daily_portfolio_value(current_date, pending_trades)
+            self.daily_portfolio_value.append({
+                'date': current_date,
+                'value': daily_value
+            })
         
         logger.info(f"\n[RESULT] 回测完成")
-        logger.info(f"  - 总交易周期: {len(cycles)} 个")
-        logger.info(f"  - 总交易次数: {len(self.trades)} 次")
-        logger.info(f"  - 初始资金: {self.initial_capital:,.2f} 元")
-        logger.info(f"  - 最终资金: {current_capital:,.2f} 元")
-        if self.initial_capital > 0:
-            total_return = (current_capital - self.initial_capital) / self.initial_capital * 100
-            logger.info(f"  - 总收益率: {total_return:+.2f}%")
+        logger.info(f"  - 总信号数: {total_signals}")
+        logger.info(f"  - 执行交易: {total_executed}")
+        logger.info(f"  - 跳过交易: {total_skipped}")
+        logger.info(f"  - 有效交易: {len(self.trades)}")
         
-        # ========== 输出前几个周期的详细信息 ==========
-        if cycles:
+        # ========== 调试：输出前10笔交易的详细信息 ==========
+        if self.trades:
             logger.info("\n" + "="*80)
-            logger.info("📊 【交易周期汇总】")
+            logger.info("🔍 【调试】前10笔交易详情")
             logger.info("="*80)
-            logger.info(f"{'周期':<6} {'选股日':<12} {'买入日':<12} {'卖出日':<12} {'股票数':<6} {'期初资金':<15} {'期末资金':<15} {'周期收益':<10}")
-            logger.info("-"*80)
-            
-            for cycle in cycles[:5]:  # 只显示前5个
+            for i, trade in enumerate(self.trades[:10]):
                 logger.info(
-                    f"{cycle.cycle_index:<6} "
-                    f"{cycle.select_date.strftime('%Y-%m-%d'):<12} "
-                    f"{cycle.buy_date.strftime('%Y-%m-%d'):<12} "
-                    f"{cycle.sell_date.strftime('%Y-%m-%d'):<12} "
-                    f"{len(cycle.stocks):<6} "
-                    f"{cycle.initial_capital:<15,.2f} "
-                    f"{cycle.final_capital:<15,.2f} "
-                    f"{cycle.return_pct:<10.2f}%"
+                    f"  {i+1}. {trade.stock_code} {trade.stock_name}: "
+                    f"买入{trade.buy_date.strftime('%Y-%m-%d')}@{trade.buy_price:.2f}, "
+                    f"卖出{trade.sell_date.strftime('%Y-%m-%d')}@{trade.sell_price:.2f}, "
+                    f"收益{trade.return_pct:+.2f}%, "
+                    f"持仓{trade.hold_days}天"
                 )
             
-            if len(cycles) > 5:
-                logger.info(f"... 还有 {len(cycles) - 5} 个周期")
+            # 统计收益率分布
+            returns = [t.return_pct for t in self.trades]
+            logger.info(f"\n  📊 收益率统计:")
+            logger.info(f"     平均收益: {np.mean(returns):+.2f}%")
+            logger.info(f"     中位数: {np.median(returns):+.2f}%")
+            logger.info(f"     最大值: {max(returns):+.2f}%")
+            logger.info(f"     最小值: {min(returns):+.2f}%")
+            logger.info(f"     标准差: {np.std(returns):.2f}%")
+            logger.info("="*80 + "\n")
+        
+        # 输出每个交易周期的详细资金和收益率信息
+        if self.trades:
+            logger.info("\n" + "="*80)
+            logger.info("📊 【交易周期资金明细】")
+            logger.info("="*80)
             
+            from collections import defaultdict
+            cycle_groups = defaultdict(list)
+            for trade in self.trades:
+                cycle_groups[trade.buy_date].append(trade)
+            
+            cycle_initial_capital = self.initial_capital
+            cycle_index = 1
+            
+            for buy_date in sorted(cycle_groups.keys()):
+                cycle_trades = cycle_groups[buy_date]
+                num_stocks = len(cycle_trades)
+                
+                if num_stocks == 0:
+                    continue
+                
+                # 计算该周期的期末资金
+                capital_per_stock_theoretical = cycle_initial_capital / num_stocks
+                cycle_final_capital = 0
+                skipped_count = 0
+                
+                for trade in cycle_trades:
+                    buy_price = trade.buy_price
+                    theoretical_shares = int(capital_per_stock_theoretical / buy_price)
+                    actual_shares = (theoretical_shares // 100) * 100
+                    
+                    if actual_shares >= 100:
+                        actual_investment = actual_shares * buy_price
+                        stock_final_value = actual_investment * (1 + trade.return_pct / 100)
+                        cycle_final_capital += stock_final_value
+                    else:
+                        skipped_count += 1
+                
+                # 计算该周期的收益率
+                cycle_return = (cycle_final_capital - cycle_initial_capital) / cycle_initial_capital * 100
+                cumulative_return = (cycle_final_capital - self.initial_capital) / self.initial_capital * 100
+                
+                # 输出周期信息
+                logger.info(
+                    f"\n【周期 {cycle_index}】买入日期: {buy_date.strftime('%Y-%m-%d')}"
+                )
+                logger.info(f"  股票数量: {num_stocks} 只")
+                logger.info(f"  期初资金: {cycle_initial_capital:,.2f} 元")
+                logger.info(f"  期末资金: {cycle_final_capital:,.2f} 元")
+                logger.info(f"  周期收益: {cycle_return:+.2f}%")
+                logger.info(f"  累计收益: {cumulative_return:+.2f}%")
+                
+                if skipped_count > 0:
+                    logger.warning(f"  ⚠️  {skipped_count} 只股票因不足100股被跳过")
+                
+                # 输出前3只股票的详细信息
+                logger.info(f"  📈 部分股票详情:")
+                for i, trade in enumerate(cycle_trades[:3]):
+                    buy_price = trade.buy_price
+                    theoretical_shares = int(capital_per_stock_theoretical / buy_price)
+                    actual_shares = (theoretical_shares // 100) * 100
+                    
+                    if actual_shares >= 100:
+                        actual_investment = actual_shares * buy_price
+                        final_value = actual_investment * (1 + trade.return_pct / 100)
+                        logger.info(
+                            f"    {i+1}. {trade.stock_code} {trade.stock_name}: "
+                            f"买入价{buy_price:.2f}元, "
+                            f"{actual_shares}股, "
+                            f"投入{actual_investment:,.2f}元, "
+                            f"收益{trade.return_pct:+.2f}%, "
+                            f"最终{final_value:,.2f}元"
+                        )
+                    else:
+                        logger.info(
+                            f"    {i+1}. {trade.stock_code} {trade.stock_name}: "
+                            f"买入价{buy_price:.2f}元 - ❌ 跳过(不足100股)"
+                        )
+                
+                if len(cycle_trades) > 3:
+                    logger.info(f"    ... 还有 {len(cycle_trades) - 3} 只股票")
+                
+                # 更新下一周期的期初资金
+                cycle_initial_capital = cycle_final_capital
+                cycle_index += 1
+            
+            logger.info("\n" + "="*80)
+            logger.info(f"✅ 共完成 {len(cycle_groups)} 个交易周期")
+            logger.info(f"   初始资金: {self.initial_capital:,.2f} 元")
+            logger.info(f"   最终资金: {cycle_initial_capital:,.2f} 元")
+            logger.info(f"   总收益率: {(cycle_initial_capital - self.initial_capital) / self.initial_capital * 100:+.2f}%")
             logger.info("="*80 + "\n")
     
-    # ========== 已废弃：该方法不再需要，交易周期逻辑已在 run_backtest 中实现 ==========
-    # def _calculate_daily_portfolio_value(self, current_date: datetime, pending_trades: list = None) -> float:
-    #     """
-    #     计算当日组合总价值（基于交易周期概念）- 已废弃
-    #     
-    #     资金管理策略（交易周期模式）：
-    #     1. 定义交易周期：选股日 → 次日买入 → 持有N天卖出
-    #     2. 每个周期的期初资金 = 上一周期的期末资金
-    #     3. 在周期内，将期初资金平均分配到所有选中的股票
-    #     4. 买入限制：每只股票的买入股数必须是100的整数倍
-    #     5. 持仓N天后卖出，得到该周期的期末资金
-    #     6. 下一个周期以上一周期期末资金作为期初资金
-    #     
-    #     Args:
-    #         current_date: 当前日期
-    #         pending_trades: 待卖出交易列表（保留参数以兼容旧代码）
-    #     
-    #     Returns:
-    #         float: 组合总价值
-    #     """
-    #     # 获取截至当前日期已完成的交易
-    #     completed_trades = [trade for trade in self.trades if trade.sell_date <= current_date]
-    #     
-    #     if not completed_trades:
-    #         return self.initial_capital
-    #     
-    #     # 按交易周期分组（同一买入日期的为同一周期）
-    #     from collections import defaultdict
-    #     cycle_groups = defaultdict(list)
-    #     for trade in completed_trades:
-    #         cycle_groups[trade.buy_date].append(trade)
-    #     
-    #     # 按期初资金顺序处理每个交易周期
-    #     current_capital = self.initial_capital
-    #     
-    #     # 按时间顺序处理每个交易周期
-    #     for buy_date in sorted(cycle_groups.keys()):
-    #         cycle_trades = cycle_groups[buy_date]
-    #         num_stocks = len(cycle_trades)
-    #         
-    #         if num_stocks == 0:
-    #             continue
-    #         
-    #         # ========== 该交易周期的计算 ==========
-    #         # 期初资金 = current_capital（上一周期期末资金）
-    #         cycle_initial_capital = current_capital
-    #         
-    #         # 每只股票理论分配的资金
-    #         capital_per_stock_theoretical = cycle_initial_capital / num_stocks
-    #         
-    #         # 计算该周期的期末资金
-    #         cycle_final_capital = 0
-    #         
-    #         for trade in cycle_trades:
-    #             buy_price = trade.buy_price
-    #             
-    #             # 步骤1: 计算理论可买股数
-    #             theoretical_shares = int(capital_per_stock_theoretical / buy_price)
-    #             
-    #             # 步骤2: 向下取整到100的倍数（A股最小交易单位）
-    #             actual_shares = (theoretical_shares // 100) * 100
-    #             
-    #             # 步骤3: 如果不足100股，则无法买入（实际投入为0）
-    #             if actual_shares < 100:
-    #                 actual_investment = 0
-    #             else:
-    #                 # 实际投入金额 = 实际股数 × 买入价格
-    #                 actual_investment = actual_shares * buy_price
-    #             
-    #             # 步骤4: 每只股票的最终价值 = 实际投入 × (1 + 收益率)
-    #             stock_final_value = actual_investment * (1 + trade.return_pct / 100)
-    #             cycle_final_capital += stock_final_value
-    #         
-    #         # 该周期的期末资金 = 下一周期的期初资金
-    #         current_capital = cycle_final_capital
-    #     
-    #     return current_capital
+    def _calculate_daily_portfolio_value(self, current_date: datetime, pending_trades: list = None) -> float:
+        """
+        计算当日组合总价值（基于交易周期概念）
+        
+        资金管理策略（交易周期模式）：
+        1. 定义交易周期：选股日 → 次日买入 → 持有N天卖出
+        2. 每个周期的期初资金 = 上一周期的期末资金
+        3. 在周期内，将期初资金平均分配到所有选中的股票
+        4. 买入限制：每只股票的买入股数必须是100的整数倍
+        5. 持仓N天后卖出，得到该周期的期末资金
+        6. 下一个周期以上一周期期末资金作为期初资金
+        
+        Args:
+            current_date: 当前日期
+            pending_trades: 待卖出交易列表（保留参数以兼容旧代码）
+        
+        Returns:
+            float: 组合总价值
+        """
+        # 获取截至当前日期已完成的交易
+        completed_trades = [trade for trade in self.trades if trade.sell_date <= current_date]
+        
+        if not completed_trades:
+            return self.initial_capital
+        
+        # 按交易周期分组（同一买入日期的为同一周期）
+        from collections import defaultdict
+        cycle_groups = defaultdict(list)
+        for trade in completed_trades:
+            cycle_groups[trade.buy_date].append(trade)
+        
+        # 按期初资金顺序处理每个交易周期
+        current_capital = self.initial_capital
+        
+        # 按时间顺序处理每个交易周期
+        for buy_date in sorted(cycle_groups.keys()):
+            cycle_trades = cycle_groups[buy_date]
+            num_stocks = len(cycle_trades)
+            
+            if num_stocks == 0:
+                continue
+            
+            # ========== 该交易周期的计算 ==========
+            # 期初资金 = current_capital（上一周期期末资金）
+            cycle_initial_capital = current_capital
+            
+            # 每只股票理论分配的资金
+            capital_per_stock_theoretical = cycle_initial_capital / num_stocks
+            
+            # 计算该周期的期末资金
+            cycle_final_capital = 0
+            
+            for trade in cycle_trades:
+                buy_price = trade.buy_price
+                
+                # 步骤1: 计算理论可买股数
+                theoretical_shares = int(capital_per_stock_theoretical / buy_price)
+                
+                # 步骤2: 向下取整到100的倍数（A股最小交易单位）
+                actual_shares = (theoretical_shares // 100) * 100
+                
+                # 步骤3: 如果不足100股，则无法买入（实际投入为0）
+                if actual_shares < 100:
+                    actual_investment = 0
+                else:
+                    # 实际投入金额 = 实际股数 × 买入价格
+                    actual_investment = actual_shares * buy_price
+                
+                # 步骤4: 每只股票的最终价值 = 实际投入 × (1 + 收益率)
+                stock_final_value = actual_investment * (1 + trade.return_pct / 100)
+                cycle_final_capital += stock_final_value
+            
+            # 该周期的期末资金 = 下一周期的期初资金
+            current_capital = cycle_final_capital
+        
+        return current_capital
     
     def calculate_cycle_metrics(self) -> List[dict]:
         """
-        计算每个交易周期的详细指标（已简化，直接使用 trading_cycles）
+        计算每个交易周期的详细指标
         
         Returns:
             List[dict]: 每个交易周期的指标列表
         """
-        if not self.trading_cycles:
+        if not self.trades:
             return []
         
+        # 按交易周期分组
+        from collections import defaultdict
+        cycle_groups = defaultdict(list)
+        for trade in self.trades:
+            cycle_groups[trade.buy_date].append(trade)
+        
         cycle_metrics = []
+        cycle_initial_capital = self.initial_capital
         
         logger.info("\n" + "="*80)
         logger.info("📊 【交易周期明细】")
         logger.info("="*80)
-        logger.info(f"{'周期':<6} {'选股日':<12} {'买入日':<12} {'卖出日':<12} {'股票数':<6} {'期初资金':<15} {'期末资金':<15} {'周期收益':<10}")
+        logger.info(f"{'周期':<6} {'买入日期':<12} {'卖出日期':<12} {'股票数':<8} {'期初资金':<15} {'期末资金':<15} {'周期收益':<10} {'累计收益':<10}")
         logger.info("-"*80)
         
-        for cycle in self.trading_cycles:
+        # 按时间顺序处理每个交易周期
+        cycle_index = 1
+        for buy_date in sorted(cycle_groups.keys()):
+            cycle_trades = cycle_groups[buy_date]
+            num_stocks = len(cycle_trades)
+            
+            if num_stocks == 0:
+                continue
+            
+            # 计算该周期的期末资金
+            capital_per_stock_theoretical = cycle_initial_capital / num_stocks
+            cycle_final_capital = 0
+            
+            for trade in cycle_trades:
+                buy_price = trade.buy_price
+                theoretical_shares = int(capital_per_stock_theoretical / buy_price)
+                actual_shares = (theoretical_shares // 100) * 100
+                
+                if actual_shares >= 100:
+                    actual_investment = actual_shares * buy_price
+                    stock_final_value = actual_investment * (1 + trade.return_pct / 100)
+                    cycle_final_capital += stock_final_value
+            
+            # 计算该周期的收益率
+            cycle_return = (cycle_final_capital - cycle_initial_capital) / cycle_initial_capital * 100
+            
+            # 计算累计收益率
+            cumulative_return = (cycle_final_capital - self.initial_capital) / self.initial_capital * 100
+            
+            # 获取卖出日期（同一周期内所有交易的卖出日期应该相同）
+            sell_date = cycle_trades[0].sell_date if cycle_trades else None
+            
+            # ========== 调试信息：检查是否有异常值 ==========
+            if cycle_final_capital <= 0:
+                logger.error(f"         ❌ 错误：期末资金为 {cycle_final_capital:.2f} 元（异常！）")
+                logger.error(f"            期初资金: {cycle_initial_capital:,.2f} 元")
+                logger.error(f"            股票数量: {num_stocks} 只")
+            
             # 记录周期指标
             cycle_info = {
-                'cycle_index': cycle.cycle_index,
-                'cycle_start_date': cycle.select_date,
-                'cycle_end_date': cycle.sell_date,
-                'num_stocks': len(cycle.stocks),
-                'initial_capital': cycle.initial_capital,
-                'final_capital': cycle.final_capital,
-                'cycle_return': cycle.return_pct,
-                'cumulative_return': (cycle.final_capital - self.initial_capital) / self.initial_capital * 100,
-                'trades': [t.to_dict() for t in cycle.stocks]
+                'cycle_index': cycle_index,
+                'cycle_start_date': buy_date,
+                'cycle_end_date': sell_date,
+                'num_stocks': num_stocks,
+                'initial_capital': cycle_initial_capital,
+                'final_capital': cycle_final_capital,
+                'cycle_return': cycle_return,
+                'cumulative_return': cumulative_return,
+                'trades': [t.to_dict() for t in cycle_trades]
             }
             
             cycle_metrics.append(cycle_info)
             
-            # 输出周期汇总信息
+            # 输出周期汇总信息（简洁版）
+            sell_date_str = sell_date.strftime('%Y-%m-%d') if sell_date else "N/A"
             logger.info(
-                f"{cycle.cycle_index:<6} "
-                f"{cycle.select_date.strftime('%Y-%m-%d'):<12} "
-                f"{cycle.buy_date.strftime('%Y-%m-%d'):<12} "
-                f"{cycle.sell_date.strftime('%Y-%m-%d'):<12} "
-                f"{len(cycle.stocks):<6} "
-                f"{cycle.initial_capital:<15,.2f} "
-                f"{cycle.final_capital:<15,.2f} "
-                f"{cycle.return_pct:<10.2f}%"
+                f"{cycle_index:<6} "
+                f"{buy_date.strftime('%Y-%m-%d'):<12} "
+                f"{sell_date_str:<12} "
+                f"{num_stocks:<8} "
+                f"{cycle_initial_capital:<15,.2f} "
+                f"{cycle_final_capital:<15,.2f} "
+                f"{cycle_return:<10.2f}% "
+                f"{cumulative_return:<10.2f}%"
             )
+            
+            # 更新下一周期的期初资金
+            cycle_initial_capital = cycle_final_capital
+            cycle_index += 1
         
         logger.info("="*80)
         logger.info(f"✅ 共完成 {len(cycle_metrics)} 个交易周期")
@@ -1078,18 +1142,18 @@ class BacktestEngine:
     
     def calculate_metrics(self) -> dict:
         """
-        计算统计指标（基于交易周期）
+        计算统计指标（基于交易周期概念）
         
         Returns:
             dict: 包含所有统计指标的字典
         """
-        if not self.trading_cycles:
-            logger.warning("[WARN] 没有交易周期，无法计算指标")
+        if not self.trades:
+            logger.warning("[WARN] 没有交易记录，无法计算指标")
             return {}
         
         metrics = {}
         
-        # 从所有交易中提取收益率数组
+        # 提取收益率数组
         returns = np.array([trade.return_pct for trade in self.trades])
         
         # 1. 基础指标
@@ -1098,19 +1162,124 @@ class BacktestEngine:
         metrics['losing_trades'] = int(np.sum(returns < 0))
         metrics['win_rate'] = metrics['winning_trades'] / metrics['total_trades'] * 100
         
-        # 2. 总收益率（直接从最后一个周期的期末资金计算）
-        final_capital = self.trading_cycles[-1].final_capital
+        # ========== 总收益率计算（基于交易周期）==========
+        # 核心逻辑：
+        # 1. 按交易周期分组（同一买入日期为同一周期）
+        # 2. 每个周期的期初资金 = 上一周期的期末资金
+        # 3. 总收益率 = (最终期末资金 - 初始资金) / 初始资金 * 100%
+        
+        from collections import defaultdict
+        cycle_groups = defaultdict(list)
+        for trade in self.trades:
+            cycle_groups[trade.buy_date].append(trade)
+        
+        # 按期初资金顺序处理每个交易周期
+        current_capital = self.initial_capital
+        
+        # 记录每个周期的资金变化（用于计算最大回撤）
+        cycle_capitals = [self.initial_capital]  # 第一个元素是初始资金
+        
+        # ========== 新增：资金利用率统计 ==========
+        total_theoretical_investment_all_cycles = 0  # 所有周期理论应投入总额
+        total_actual_investment_all_cycles = 0       # 所有周期实际投入总额
+        total_skipped_stocks = 0                     # 因不足100股被跳过的股票总数
+        cycle_details = []                           # 存储每个周期的详细信息
+        
+        for buy_date in sorted(cycle_groups.keys()):
+            cycle_trades = cycle_groups[buy_date]
+            num_stocks = len(cycle_trades)
+            
+            if num_stocks == 0:
+                continue
+            
+            # 该周期的期初资金
+            cycle_initial_capital = current_capital
+            
+            # 每只股票理论分配的资金
+            capital_per_stock_theoretical = cycle_initial_capital / num_stocks
+            
+            # 计算该周期的期末资金
+            cycle_final_capital = 0
+            
+            # 当前周期的理论/实际投入统计
+            cycle_theoretical_investment = 0
+            cycle_actual_investment = 0
+            cycle_skipped_count = 0
+            
+            for trade in cycle_trades:
+                buy_price = trade.buy_price
+                
+                # 计算理论可买股数
+                theoretical_shares = int(capital_per_stock_theoretical / buy_price)
+                
+                # 向下取整到100的倍数
+                actual_shares = (theoretical_shares // 100) * 100
+                
+                # 如果不足100股，则无法买入
+                if actual_shares < 100:
+                    actual_investment = 0
+                    cycle_skipped_count += 1
+                else:
+                    actual_investment = actual_shares * buy_price
+                
+                # 累加理论/实际投入
+                cycle_theoretical_investment += capital_per_stock_theoretical
+                cycle_actual_investment += actual_investment
+                
+                # 每只股票的最终价值
+                stock_final_value = actual_investment * (1 + trade.return_pct / 100)
+                cycle_final_capital += stock_final_value
+            
+            # 该周期的期末资金 = 下一周期的期初资金
+            current_capital = cycle_final_capital
+            cycle_capitals.append(current_capital)
+            
+            # 累加到总计
+            total_theoretical_investment_all_cycles += cycle_theoretical_investment
+            total_actual_investment_all_cycles += cycle_actual_investment
+            total_skipped_stocks += cycle_skipped_count
+            
+            # 记录周期详情
+            cycle_details.append({
+                'buy_date': buy_date,
+                'num_stocks': num_stocks,
+                'initial_capital': cycle_initial_capital,
+                'final_capital': cycle_final_capital,
+                'theoretical_investment': cycle_theoretical_investment,
+                'actual_investment': cycle_actual_investment,
+                'skipped_count': cycle_skipped_count
+            })
+        
+        # 计算总收益率
+        final_capital = current_capital
         total_return = (final_capital - self.initial_capital) / self.initial_capital * 100
         
         metrics['total_return'] = total_return
         metrics['initial_capital'] = self.initial_capital
         metrics['final_capital'] = final_capital
         
-        logger.info(f"[CALC] 总收益率计算:")
+        # ========== 新增：资金利用率指标 ==========
+        if total_theoretical_investment_all_cycles > 0:
+            overall_capital_utilization = total_actual_investment_all_cycles / total_theoretical_investment_all_cycles * 100
+        else:
+            overall_capital_utilization = 0
+        
+        total_idle_capital = total_theoretical_investment_all_cycles - total_actual_investment_all_cycles
+        
+        metrics['capital_utilization_rate'] = overall_capital_utilization
+        metrics['total_idle_capital'] = total_idle_capital
+        metrics['total_skipped_stocks'] = total_skipped_stocks
+        metrics['cycle_details'] = cycle_details
+        
+        logger.info(f"[CALC] 总收益率计算（交易周期模式）:")
         logger.info(f"       期初资金: {self.initial_capital:,.2f} 元")
         logger.info(f"       期末资金: {final_capital:,.2f} 元")
         logger.info(f"       总收益率: {total_return:.2f}%")
-        logger.info(f"       交易周期数: {len(self.trading_cycles)}")
+        logger.info(f"       交易周期数: {len(cycle_groups)}")
+        logger.info(f"\n[CALC] 资金利用率分析:")
+        logger.info(f"       总体资金利用率: {overall_capital_utilization:.1f}%")
+        logger.info(f"       累计闲置资金: {total_idle_capital:,.2f} 元")
+        logger.info(f"       跳过股票数(不足100股): {total_skipped_stocks} 只")
         
         # 年化收益率
         days_span = (self.end_date - self.start_date).days
@@ -1121,7 +1290,7 @@ class BacktestEngine:
         else:
             metrics['annualized_return'] = 0
         
-        # 3. 进阶指标
+        # 2. 进阶指标
         # 平均收益
         metrics['avg_return'] = np.mean(returns)
         
@@ -1142,9 +1311,7 @@ class BacktestEngine:
         else:
             metrics['sharpe_ratio'] = 0
         
-        # 4. 最大回撤（基于交易周期资金曲线）
-        cycle_capitals = [self.initial_capital] + [c.final_capital for c in self.trading_cycles]
-        
+        # ========== 最大回撤计算（基于交易周期资金曲线）==========
         if len(cycle_capitals) > 1:
             capital_array = np.array(cycle_capitals)
             
@@ -1158,10 +1325,14 @@ class BacktestEngine:
             
             logger.info(f"[CALC] 最大回撤计算: 基于{len(cycle_capitals)}个交易周期的资金曲线")
         else:
-            metrics['max_drawdown'] = 0
-            logger.warning("[WARN] 交易周期数据不足，无法计算最大回撤")
+            # 降级方案：使用单笔交易收益率计算
+            cumulative_returns = np.cumprod([1 + r/100 for r in returns])
+            peak = np.maximum.accumulate(cumulative_returns)
+            drawdown = (cumulative_returns - peak) / peak
+            metrics['max_drawdown'] = np.min(drawdown) * 100
+            logger.warning("[WARN] 交易周期数据不足，使用单笔交易方式计算最大回撤")
         
-        # 5. 基准对比
+        # 3. 基准对比
         benchmark_df = self.get_benchmark_data()
         if not benchmark_df.empty:
             benchmark_start_price = benchmark_df.iloc[0]['close']
