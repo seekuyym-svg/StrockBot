@@ -42,18 +42,29 @@ class StockPoolGenerator:
                 - hold_days: 持仓天数（决定选股频率）(int)
                 - whitelist_file: 白名单文件路径 (str)
                 - tdx_dir: 通达信安装目录 (str)
+                - min_price_change_pct: 最小涨跌幅 (float)
+                - max_price_change_pct: 最大涨跌幅 (float)
+                - min_volume_ratio: 最小量比 (float)
+                - max_volume_ratio: 最大量比 (float)
         """
         self.config = config
         self.start_date = config['start_date']
         self.end_date = config['end_date']
-        self.volume_period = config.get('volume_period', 5)
+        self.volume_period = config.get('volume_period', 3)
         self.hold_days = config.get('hold_days', 3)  # 持仓天数，默认3天
         self.whitelist_file = config.get('whitelist_file')
         self.tdx_dir = config.get('tdx_dir', r"D:\Install\zd_zxzq_gm")
         
+        # 粗筛参数配置（从配置文件读取）
+        self.min_price_change_pct = config.get('min_price_change_pct', -5.0)
+        self.max_price_change_pct = config.get('max_price_change_pct', 25.0)
+        self.min_volume_ratio = config.get('min_volume_ratio', 1.3)
+        self.max_volume_ratio = config.get('max_volume_ratio', 8.0)
+        
         # 数据缓存
         self.whitelist = set()
         self.data_dir = project_root / "data"
+        self.data_cache = {}  # 内存缓存: {stock_code: DataFrame}
         
         # 初始化Reader
         self.reader = Reader.factory(market='std', tdxdir=self.tdx_dir)
@@ -63,7 +74,44 @@ class StockPoolGenerator:
         logger.info(f"  - 放量周期: {self.volume_period} 天")
         logger.info(f"  - 持仓天数: {self.hold_days} 天")
         logger.info(f"  - 选股频率: 每隔 {self.hold_days} 个交易日选一次")
+        logger.info(f"  - 涨跌幅区间: [{self.min_price_change_pct}%, {self.max_price_change_pct}%]")
+        logger.info(f"  - 量比范围: [{self.min_volume_ratio}x, {self.max_volume_ratio}x]")
         logger.info(f"  - 输出目录: {self.data_dir}")
+    
+    def get_stock_data(self, stock_code: str) -> pd.DataFrame:
+        """
+        获取股票K线数据（带内存缓存）
+        
+        Args:
+            stock_code: 股票代码（6位数字，不含市场前缀）
+        
+        Returns:
+            DataFrame 或 None（如果数据为空或读取失败）
+        """
+        # 检查缓存
+        if stock_code in self.data_cache:
+            return self.data_cache[stock_code]
+        
+        # 首次读取，从磁盘加载
+        try:
+            df = self.reader.daily(symbol=stock_code)
+            
+            if df is None or df.empty:
+                self.data_cache[stock_code] = None  # 标记为空数据
+                return None
+            
+            # 数据处理：转换索引并排序
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+            
+            # 存入缓存
+            self.data_cache[stock_code] = df
+            return df
+            
+        except Exception as e:
+            logger.debug(f"[CACHE] 读取 {stock_code} 数据失败: {e}")
+            self.data_cache[stock_code] = None  # 标记为失败
+            return None
     
     def load_whitelist_stocks(self):
         """加载白名单股票（复用backtest_engine的逻辑）"""
@@ -135,7 +183,51 @@ class StockPoolGenerator:
             raise ValueError("白名单为空，请先生成白名单文件")
     
     def get_trading_days(self) -> List[datetime]:
-        """获取回测期间的所有交易日"""
+        """
+        获取回测期间的所有交易日（自动过滤周末和法定节假日）
+        
+        Returns:
+            List[datetime]: 交易日列表
+        """
+        try:
+            import akshare as ak
+            
+            logger.info("[INFO] 正在从 akshare 获取A股交易日历...")
+            
+            # 获取中国A股交易日历
+            # 注意：akshare 的 stock_trade_date_hist_em 返回的是所有历史交易日
+            trade_dates_df = ak.tool_trade_date_hist_sina()
+            
+            if trade_dates_df is None or trade_dates_df.empty:
+                logger.warning("[WARN] 无法从 akshare 获取交易日历，降级为仅过滤周末")
+                return self._get_trading_days_fallback()
+            
+            # 转换为 datetime 对象
+            trade_dates = pd.to_datetime(trade_dates_df['trade_date']).tolist()
+            
+            # 筛选指定日期范围内的交易日
+            trading_days = []
+            for date in trade_dates:
+                if self.start_date <= date <= self.end_date:
+                    trading_days.append(date)
+            
+            # 按日期排序
+            trading_days.sort()
+            
+            logger.info(f"[OK] 成功获取 {len(trading_days)} 个交易日（已自动过滤周末和法定节假日）")
+            return trading_days
+            
+        except Exception as e:
+            logger.warning(f"[WARN] 获取交易日历失败: {e}，降级为仅过滤周末")
+            return self._get_trading_days_fallback()
+    
+    def _get_trading_days_fallback(self) -> List[datetime]:
+        """
+        降级方案：仅过滤周末（不处理法定节假日）
+        
+        Returns:
+            List[datetime]: 工作日列表
+        """
         trading_days = []
         current = self.start_date
         while current <= self.end_date:
@@ -143,12 +235,12 @@ class StockPoolGenerator:
                 trading_days.append(current)
             current += timedelta(days=1)
         
-        logger.info(f"[INFO] 回测期间共 {len(trading_days)} 个交易日")
+        logger.info(f"[FALLBACK] 使用降级方案，共 {len(trading_days)} 个工作日（未过滤节假日）")
         return trading_days
     
     def check_volume_condition(self, stock_code: str, check_date: datetime) -> bool:
         """
-        检查股票在指定日期是否满足持续放量条件
+        检查股票在指定日期是否满足：放量 + 价格上涨 + 均线多头 + 位置合理
         
         Args:
             stock_code: 股票代码（不含市场前缀）
@@ -158,27 +250,55 @@ class StockPoolGenerator:
             bool: 是否满足条件
         """
         try:
-            df = self.reader.daily(symbol=stock_code)
+            # 使用缓存获取数据（首次读取会加载到缓存，后续直接返回）
+            df = self.get_stock_data(stock_code)
             
             if df is None or df.empty:
                 return False
             
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            
             # 找到check_date之前的数据
             df_before = df[df.index <= check_date]
             
-            if len(df_before) < self.volume_period + 1:
+            # 需要更多数据用于均线计算 (至少20天用于MA20)
+            if len(df_before) < self.volume_period + 20:
                 return False
             
-            # 提取最近 volume_period+1 天的成交量
+            # === 条件1：成交量连续递增（核心逻辑）===
             volumes = df_before['volume'].iloc[-self.volume_period-1:].values
-            
-            # 检查是否连续 volume_period 天递增
             for i in range(1, self.volume_period + 1):
                 if volumes[-i] <= volumes[-i-1]:
                     return False
+            
+            # === 条件2：价格整体呈上升趋势（优化：从"60%天数上涨"改为"整体上涨"）===
+            closes = df_before['close'].iloc[-self.volume_period:].values
+            opens = df_before['open'].iloc[-self.volume_period:].values
+            
+            # 最后一天收盘价 > 第一天开盘价，表示整体上涨
+            if closes[-1] < opens[0]:
+                return False
+            
+            # === 条件3：股价站上20日均线（保持不变）===
+            ma20 = df_before['close'].rolling(20).mean().iloc[-1]
+            latest_close = df_before['close'].iloc[-1]
+            if latest_close < ma20:
+                return False
+            
+            # === 条件4：近期涨幅适中，避免追高（使用配置化参数）===
+            recent_return = (closes[-1] - closes[0]) / closes[0] * 100
+            if recent_return > self.max_price_change_pct:
+                return False
+            if recent_return < self.min_price_change_pct:
+                return False
+            
+            # === 条件5：成交量放大倍数合理（使用配置化参数）===
+            vol_ma20 = df_before['volume'].rolling(20).mean().iloc[-1]
+            latest_vol = df_before['volume'].iloc[-1]
+            vol_ratio = latest_vol / vol_ma20 if vol_ma20 > 0 else 1
+            
+            if vol_ratio < self.min_volume_ratio:
+                return False
+            if vol_ratio > self.max_volume_ratio:
+                return False
             
             return True
             
@@ -223,14 +343,13 @@ class StockPoolGenerator:
         生成每日选股股票池
         
         选股策略：
-        - 每隔3个交易日选股一次（因为持有3个交易日）
-        - 例如：周一选股 -> 周二买入 -> 周四卖出
-        - 周四再次选股 -> 周五买入 -> 下周二卖出
-        - 这样可以避免重复选股和资金分散
+        - 每个交易日都选股（不再间隔）
+        - 后续回测时可根据需要选择如何使用股票池文件
+        - 这样可以保留完整的每日选股数据
         """
         logger.info("=" * 80)
         logger.info("[START] 开始生成每日选股股票池")
-        logger.info(f"[STRATEGY] 选股频率: 每隔 {self.hold_days} 个交易日选一次")
+        logger.info(f"[STRATEGY] 选股频率: 每个交易日都选股")
         logger.info("=" * 80)
         
         # 1. 加载白名单
@@ -241,15 +360,14 @@ class StockPoolGenerator:
         logger.info("\n[STEP 2] 获取交易日列表...")
         trading_days = self.get_trading_days()
         
-        # 3. 每隔hold_days天选股一次
-        logger.info(f"\n[STEP 3] 开始选股（每隔 {self.hold_days} 个交易日选一次）...\n")
+        # 3. 每个交易日都选股
+        logger.info(f"\n[STEP 3] 开始选股（每个交易日都选）...\n")
         total_selected = 0
         selection_count = 0
         
         for idx, current_date in enumerate(trading_days):
-            # 判断是否需要选股：每隔 hold_days 天选一次
-            # idx % hold_days == 0 表示第 0, 3, 6, 9... 个交易日需要选股
-            should_select = (idx % self.hold_days == 0)
+            # 每个交易日都选股
+            should_select = True
             
             if not should_select:
                 logger.debug(f"[SKIP] {current_date.strftime('%Y-%m-%d')}: 非选股日，跳过")
@@ -265,7 +383,7 @@ class StockPoolGenerator:
                 if self.check_volume_condition(stock_code, current_date):
                     selected_stocks.add(stock_code)
             
-            # 保存股票池
+            # 保存股票池（不做数量限制，留给评分阶段处理）
             self.save_stockpool(current_date, selected_stocks)
             total_selected += len(selected_stocks)
             selection_count += 1
@@ -325,13 +443,21 @@ def main():
                 default_start_date = backtest_config.get('start_date', '2024-01-01')
                 default_end_date = backtest_config.get('end_date', '2026-01-01')
                 default_hold_days = backtest_config.get('hold_days', 3)
-                default_volume_period = backtest_config.get('volume_period', 5)
+                default_volume_period = backtest_config.get('volume_period', 3)
+                
+                # 粗筛参数配置（新增）
+                default_min_price_change = backtest_config.get('min_price_change_pct', -5.0)
+                default_max_price_change = backtest_config.get('max_price_change_pct', 25.0)
+                default_min_volume_ratio = backtest_config.get('min_volume_ratio', 1.3)
+                default_max_volume_ratio = backtest_config.get('max_volume_ratio', 8.0)
                 
                 logger.info(f"[CONFIG] 从配置文件读取默认值:")
                 logger.info(f"  - start_date: {default_start_date}")
                 logger.info(f"  - end_date: {default_end_date}")
                 logger.info(f"  - hold_days: {default_hold_days}")
                 logger.info(f"  - volume_period: {default_volume_period}")
+                logger.info(f"  - 涨跌幅区间: [{default_min_price_change}%, {default_max_price_change}%]")
+                logger.info(f"  - 量比范围: [{default_min_volume_ratio}x, {default_max_volume_ratio}x]")
             
             tdx_dir_from_config = yaml_config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")
         else:
@@ -339,14 +465,22 @@ def main():
             default_start_date = '2024-01-01'
             default_end_date = '2026-01-01'
             default_hold_days = 3
-            default_volume_period = 5
+            default_volume_period = 3
+            default_min_price_change = -5.0
+            default_max_price_change = 25.0
+            default_min_volume_ratio = 1.3
+            default_max_volume_ratio = 8.0
             tdx_dir_from_config = r"D:\Install\zd_zxzq_gm"
     except Exception as e:
         logger.warning(f"[WARN] 读取配置文件失败: {e}，使用硬编码默认值")
         default_start_date = '2024-01-01'
         default_end_date = '2026-01-01'
         default_hold_days = 3
-        default_volume_period = 5
+        default_volume_period = 3
+        default_min_price_change = -5.0
+        default_max_price_change = 25.0
+        default_min_volume_ratio = 1.3
+        default_max_volume_ratio = 8.0
         tdx_dir_from_config = r"D:\Install\zd_zxzq_gm"
     
     # 构建配置（命令行参数优先，否则使用配置文件默认值）
@@ -356,7 +490,12 @@ def main():
         'volume_period': args.volume_period if args.volume_period is not None else default_volume_period,
         'hold_days': args.hold_days if args.hold_days is not None else default_hold_days,
         'whitelist_file': args.whitelist,
-        'tdx_dir': args.tdx_dir if args.tdx_dir else tdx_dir_from_config
+        'tdx_dir': args.tdx_dir if args.tdx_dir else tdx_dir_from_config,
+        # 粗筛参数配置
+        'min_price_change_pct': default_min_price_change,
+        'max_price_change_pct': default_max_price_change,
+        'min_volume_ratio': default_min_volume_ratio,
+        'max_volume_ratio': default_max_volume_ratio
     }
     
     generator = StockPoolGenerator(config)
