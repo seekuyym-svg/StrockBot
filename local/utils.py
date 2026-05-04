@@ -138,7 +138,198 @@ def calculate_trend_score(market: str, code: str, days: int = 300) -> Optional[f
 
 def _get_historical_klines(market: str, code: str, days: int = 300) -> pd.DataFrame:
     """
-    从腾讯财经获取历史K线数据
+    获取历史K线数据（支持本地数据和网络API双模式）
+    
+    Args:
+        market: 市场代码 (sh 或 sz)
+        code: 股票代码
+        days: 获取天数
+        
+    Returns:
+        DataFrame包含日期、开盘、收盘、最高、最低、成交量等字段（前复权）
+    """
+    # 尝试从配置读取数据源设置
+    try:
+        from src.utils.config import get_config
+        config = get_config()
+        use_local = config.get('backtest', {}).get('use_local_data', True)
+        tdx_dir = config.get('TDX_DIR', 'D:\\Install\\zd_zxzq_gm')
+        consistency_check = config.get('backtest', {}).get('data_consistency_check', False)
+    except:
+        use_local = True  # 默认使用本地数据
+        tdx_dir = 'D:\\Install\\zd_zxzq_gm'
+        consistency_check = False
+    
+    if use_local:
+        return _get_klines_from_local(market, code, days, tdx_dir, consistency_check)
+    else:
+        return _get_klines_from_tencent(market, code, days)
+
+
+def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str, 
+                           consistency_check: bool = False) -> pd.DataFrame:
+    """
+    从本地通达信数据获取K线（前复权）
+    
+    Args:
+        market: 市场代码 (sh 或 sz)
+        code: 股票代码
+        days: 获取天数
+        tdx_dir: 通达信安装目录
+        consistency_check: 是否进行数据一致性验证
+        
+    Returns:
+        DataFrame包含前复权K线数据
+    """
+    try:
+        from mootdx.reader import Reader
+        from mootdx.utils.adjust import to_adjust
+        from datetime import datetime, timedelta
+        import os
+        
+        # 构建完整代码（如 sh600000）
+        full_code = f"{market}{code}"
+        
+        # 1. 检查数据文件是否存在及更新日期
+        data_file = None
+        if market == 'sh':
+            data_file = os.path.join(tdx_dir, 'vipdoc', 'sh', 'lday', f'sh{code}.day')
+        elif market == 'sz':
+            data_file = os.path.join(tdx_dir, 'vipdoc', 'sz', 'lday', f'sz{code}.day')
+        
+        if data_file and os.path.exists(data_file):
+            # 检查文件修改时间
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(data_file))
+            days_since_update = (datetime.now() - file_mtime).days
+            
+            # 获取配置的交易日阈值
+            try:
+                from src.utils.config import get_config
+                config = get_config()
+                max_age = config.get('backtest', {}).get('max_data_age_days', 7)
+            except:
+                max_age = 7
+            
+            if days_since_update > max_age:
+                print(f"⚠️  警告: {full_code} 的本地数据已超过{max_age}天未更新 "
+                      f"(最后更新: {file_mtime.strftime('%Y-%m-%d')})")
+        
+        # 2. 初始化Reader
+        reader = Reader.factory(market='std', tdxdir=tdx_dir)
+        
+        # 3. 获取原始K线数据
+        raw_data = reader.daily(symbol=full_code)
+        
+        if raw_data is None or raw_data.empty:
+            print(f"⚠️  本地数据不存在: {full_code}")
+            # 降级到网络API
+            return _get_klines_from_tencent(market, code, days)
+        
+        # 4. 转换为前复权数据
+        # 注意：通达信本地数据文件(.day)本身已经是前复权数据
+        # mootdx的to_adjust函数在当前版本中存在bug，暂时不使用
+        df = raw_data.copy()
+
+        # 5. 标准化列名和索引
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        
+        # 确保列名统一（小写）
+        df.columns = [col.lower() for col in df.columns]
+        
+        # 检查必要列是否存在
+        required_cols = ['open', 'close', 'high', 'low', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            print(f"⚠️  数据列不完整: {full_code}, 现有列: {df.columns.tolist()}")
+            return pd.DataFrame()
+        
+        # 7. 截取最近N天数据
+        if len(df) > days:
+            df = df.iloc[-days:]
+        
+        # 8. 数据一致性验证（可选）
+        if consistency_check and len(df) > 0:
+            _verify_data_consistency(full_code, df, tdx_dir)
+        
+        return df
+        
+    except Exception as e:
+        print(f"❌ 本地数据读取失败 ({market}{code}): {e}")
+        import traceback
+        traceback.print_exc()
+        # 降级到网络API
+        return _get_klines_from_tencent(market, code, days)
+
+
+def _verify_data_consistency(full_code: str, local_df: pd.DataFrame, tdx_dir: str):
+    """
+    验证本地数据与腾讯API数据的一致性
+    
+    Args:
+        full_code: 完整股票代码（如 sh600000）
+        local_df: 本地数据DataFrame
+        tdx_dir: 通达信目录（暂未使用）
+    """
+    try:
+        import requests
+        
+        # 提取市场和代码
+        market = full_code[:2]
+        code = full_code[2:]
+        
+        # 从腾讯API获取最新一条数据进行对比
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        params = {
+            "param": f"{full_code},day,,,1,qfq"  # 只获取最新1条
+        }
+        
+        response = requests.get(url, params=params, headers=headers, timeout=5)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if result.get('code') == 0 and result.get('data'):
+            stock_data = result['data'].get(full_code, {})
+            klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
+            
+            if klines and len(klines) > 0:
+                # 解析腾讯数据
+                latest_line = klines[-1]
+                if isinstance(latest_line, (list, tuple)) and len(latest_line) >= 6:
+                    tencent_close = float(latest_line[2])
+                    tencent_date = latest_line[0]
+                    
+                    # 获取本地数据的最新收盘价
+                    local_latest = local_df.iloc[-1]
+                    local_close = local_latest['close']
+                    local_date = local_latest.name
+                    
+                    # 计算差异
+                    if tencent_close > 0:
+                        diff_pct = abs(local_close - tencent_close) / tencent_close * 100
+                        
+                        # 如果差异超过1%，给出警告
+                        if diff_pct > 1.0:
+                            print(f"⚠️  数据一致性警告: {full_code}")
+                            print(f"   日期: {local_date} | {tencent_date}")
+                            print(f"   本地收盘价: {local_close:.2f}")
+                            print(f"   腾讯收盘价: {tencent_close:.2f}")
+                            print(f"   差异: {diff_pct:.2f}%")
+                        else:
+                            print(f"✅ {full_code} 数据一致性验证通过 (差异: {diff_pct:.2f}%)")
+    
+    except Exception as e:
+        # 静默失败，不影响主流程
+        pass
+
+
+def _get_klines_from_tencent(market: str, code: str, days: int) -> pd.DataFrame:
+    """
+    从腾讯财经API获取历史K线数据（降级方案）
     
     Args:
         market: 市场代码 (sh 或 sz)

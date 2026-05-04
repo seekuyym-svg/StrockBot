@@ -374,7 +374,11 @@ class HistoricalStockScorer:
             
             # 2. 批量评分
             scored_results = []
+            day_start_time = time.time()
+            stock_index = 0
+            
             for symbol in stocks:
+                stock_index += 1
                 score = self.analyze_stock(symbol, date_str)
                 if score is not None:
                     scored_results.append((symbol, score))
@@ -382,6 +386,14 @@ class HistoricalStockScorer:
                 
                 # 避免请求过快
                 time.sleep(0.1)
+                
+                # 每10只股票或最后一只时更新进度
+                if stock_index % 10 == 0 or stock_index == len(stocks):
+                    elapsed = time.time() - day_start_time
+                    progress_pct = (stock_index / len(stocks)) * 100
+                    print(f"\r[{processed_count+1}/{total_days}] {date_str} | "
+                          f"股票 {stock_index}/{len(stocks)} ({progress_pct:.0f}%) | "
+                          f"已耗时: {elapsed:.0f}秒", end='', flush=True)
             
             total_stocks += len(stocks)
             
@@ -391,9 +403,9 @@ class HistoricalStockScorer:
                                           min_score=min_score, max_count=max_stocks)
                 processed_count += 1
             
-            # 4. 打印进度（每处理完一个文件）
+            # 4. 打印完成信息并换行
             formatted_date = date_str.replace("-", "")
-            print(f"[{processed_count}/{total_days}] {date_str} ({len(stocks)}只股票) - 完成")
+            print(f"\n[{processed_count}/{total_days}] {date_str} ({len(stocks)}只股票) - 完成")
             
             current += timedelta(days=1)
         

@@ -252,5 +252,10 @@ backtest:
   max_stocks_per_cycle: 10      # 每个周期最多选10只股票
   min_stocks_per_cycle: 3       # 最少选3只（保证分散）
   
+  # === 数据源配置（2026-05-04新增）===
+  use_local_data: true          # 是否使用本地通达信数据（默认true，提升性能）
+  data_consistency_check: true  # 是否启用数据一致性验证（首次使用时建议开启）
+  max_data_age_days: 7          # 数据最大允许年龄（交易日），超过则警告
+  
   # 综合评分最小值（兼容旧配置，已废弃，使用min_score）
   backtest_minscore: 60         # run_backtest.py还在读取，并没有实质作用，主要使用min_score
