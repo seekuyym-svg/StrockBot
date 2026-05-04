@@ -2,15 +2,108 @@
 
 **适用场景**：开启新对话后，快速继续回测策略优化工作
 
-**最后更新**：2026-05-04 23:15
+**最后更新**：2026-05-05 01:00
 
 ---
 
-## 📋 当前状态（2026-05-04最新修复）
+## 📋 当前状态（2026-05-05最新修复）
 
 ### ✅ **已完成的工作**
 
-#### 1. 评分工具性能优化 - 本地数据源切换 ⭐⭐⭐⭐⭐ 【NEWEST】
+#### 1. 回测引擎交易周期跳转逻辑修复 - 实现资金无缝衔接 ⭐⭐⭐⭐⭐ 【NEWEST】
+- **更新时间**：2026-05-05 01:00
+- **文件**：[backtest/backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py)
+- **问题**：回测工具在交易周期之间存在一个交易日的空档期
+  - **错误逻辑**：卖出日后跳过一个交易日才进行下一轮选股
+  - **正确设计**：卖出日应该同时作为下一周期的选股日
+  - **影响**：资金闲置一个交易日，利用率降低，收益率失真
+- **时间线对比**：
+  ```
+  修复前（错误）：
+  周期1: T0(选股) → T1(买入) → T2 → T3(卖出)
+         ↓ 跳过T3
+  周期2: T4(选股) → T5(买入) → T6 → T7(卖出)
+  
+  修复后（正确）：
+  周期1: T0(选股) → T1(买入) → T2 → T3(卖出+选股)
+                                      ↓
+  周期2: T3(已选股) → T4(买入) → T5 → T6(卖出+选股)
+  ```
+- **解决方案**：
+  - ✅ **修复核心bug** - 修改 `run_backtest()` 方法中的跳转逻辑
+    - 修改前：`i = sell_date_idx + 1`（跳到卖出日的下一个交易日）
+    - 修改后：`i = sell_date_idx`（跳到卖出日，卖出日同时也是下一周期的选股日）
+- **实施效果**：
+  - ✅ 卖出当日立即作为下一周期的选股日
+  - ✅ 资金无缝衔接，提高利用率
+  - ✅ 符合项目规范中的"交易周期执行规范"
+  - ✅ 与设计原则完全一致（注释中已明确说明）
+- **验证要点**：
+  - 查看"交易周期汇总"中的日期连续性
+  - 确认卖出日和下一周期的选股日是否相同
+  - 对比修复前后的交易周期数量和收益率
+- **使用方法**：
+  ```bash
+  # 运行短期回测验证修复效果
+  python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10
+  ```
+- **预期输出示例**：
+  ```
+  周期   选股日        买入日        卖出日        股票数  期初资金         期末资金         周期收益    
+  --------------------------------------------------------------------------------
+  1      2026-04-01   2026-04-02   2026-04-06   10     1,000,000.00   1,015,234.56   +1.52%     
+  2      2026-04-06   2026-04-07   2026-04-10   10     1,015,234.56   1,028,456.78   +1.30%     
+  ```
+  注意：**周期1的卖出日（2026-04-06）= 周期2的选股日（2026-04-06）** ✅
+
+#### 2. 回测引擎资金计算Bug修复 - 正确处理闲置资金 ⭐⭐⭐⭐⭐
+- **更新时间**：2026-05-05 00:30
+- **文件**：[backtest/backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py)、[backtest/run_backtest.py](file://e:\LearnPY\Projects\StockBot\backtest\run_backtest.py)
+- **问题**：回测工具在计算交易周期期初资金和期末资金时存在严重bug
+  - **错误假设**：将期初资金默认当作全部投入资金
+  - **实际情况**：由于A股最小交易单位为100股，会有闲置资金未投入
+  - **影响**：期末资金被低估，复利计算错误，收益率失真
+- **四个资金概念的正确关系**：
+  ```
+  期初资金 = 本周期投入资金 + 本周期闲置资金
+  期末资金 = 本周期投入资金 × (1 + 周期收益率) + 本周期闲置资金
+  周期收益率 = (期末市值 - 实际投入) / 实际投入 × 100%
+  ```
+- **解决方案**：
+  - ✅ **方案A：修复核心bug** - 修改 `_calculate_cycle_final_capital()` 方法
+    - 正确计算每只股票的闲置资金：`idle_capital = capital_per_stock - investment`
+    - 期末价值包含闲置资金：`final_value = investment * (1 + return_pct) + idle_capital`
+  - ✅ **方案B：详细资金输出** - 增强 `calculate_cycle_metrics()` 方法
+    - 新增字段：`total_investment`（实际投入）、`total_idle_capital`（闲置资金）
+    - 新增字段：`capital_utilization`（资金利用率）、`skipped_stocks`（跳过股票数）
+    - DEBUG日志输出详细的资金构成信息
+  - ✅ **添加 --debug 参数** - 按需启用DEBUG日志
+    - 默认模式：INFO级别，简洁清晰
+    - DEBUG模式：显示详细的资金明细和调试信息
+- **实施效果**：
+  - ✅ 期末资金计算准确（包含闲置资金）
+  - ✅ 收益率计算正确（基于实际投入资金）
+  - ✅ 复利效应正确传递到下一周期
+  - ✅ 提供详细的资金流水，便于审计和调试
+  - ✅ 符合项目规范中的"资金使用原则"
+- **使用方法**：
+  ```bash
+  # 默认模式（简洁）
+  python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10
+  
+  # DEBUG模式（查看详细资金明细）
+  python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10 --debug
+  ```
+- **验证要点**：
+  - 闲置资金 > 0（除非恰好整除）
+  - 资金利用率 < 100%（通常95%-99%）
+  - 期末资金 ≈ 投入资金×(1+收益率) + 闲置资金
+- **注意事项**：
+  - 日志文件始终是DEBUG级别，无论是否使用--debug参数
+  - --debug参数仅影响控制台输出，不影响日志文件
+  - DEBUG模式会输出更多信息，可能略微降低执行速度（影响很小）
+
+#### 3. 评分工具性能优化 - 本地数据源切换 ⭐⭐⭐⭐⭐
 - **更新时间**：2026-05-04 23:15
 - **文件**：[local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py)、[config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml)
 - **问题**：评分工具每次从腾讯财经API获取数据，批量处理617只股票需要约15分钟，速度慢且依赖网络
@@ -59,7 +152,7 @@
   - 系统会在数据超过7天未更新时发出警告
   - 如需临时切换回腾讯API，设置 `use_local_data: false`
 
-#### 2. 评分工具进度展示优化 ⭐⭐⭐⭐⭐
+#### 4. 评分工具进度展示优化 ⭐⭐⭐⭐⭐
 - **文件**：[score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py)
 - **问题**：批量评分时无法实时看到进度，处理大量股票时需要等待很久才有反馈
 - **解决方案**：添加实时进度展示功能
@@ -79,7 +172,7 @@
   ```
 - **特性**：无额外依赖、保留原有日志、简洁直观
 
-#### 3. 回测引擎非交易日过滤修复 ⭐⭐⭐⭐⭐
+#### 5. 回测引擎非交易日过滤修复 ⭐⭐⭐⭐⭐
 - **文件**：[backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py)
 - **问题**：回测引擎的 `get_trading_days()` 方法仅过滤周末，未处理法定节假日，导致回测时出现日期跳跃
 - **解决方案**：复用 [generate_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\generate_stockpool.py) 中的 akshare 交易日历获取逻辑
@@ -87,14 +180,14 @@
 - **降级机制**：API失败时自动降级为仅过滤周末
 - **测试验证**：2026年4月正确识别21个交易日（跳过清明假期4月4-6日）
 
-#### 4. 股票池生成器非交易日过滤 ⭐⭐⭐⭐⭐
+#### 6. 股票池生成器非交易日过滤 ⭐⭐⭐⭐⭐
 - **文件**：[generate_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\generate_stockpool.py)
 - **问题**：原逻辑仅过滤周末，未处理法定节假日
 - **解决方案**：使用 akshare 获取准确的A股交易日历
 - **效果**：自动识别并过滤所有非交易日（周末+节假日）
 - **降级机制**：API失败时自动降级为仅过滤周末
 
-#### 5. 粗筛参数配置化与优化 ⭐⭐⭐⭐⭐
+#### 7. 粗筛参数配置化与优化 ⭐⭐⭐⭐⭐
 - **文件**：[config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml)、[generate_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\generate_stockpool.py)
 - **新增配置项**：
   ```yaml
@@ -110,7 +203,7 @@
 - **代码改进**：从配置文件读取参数，替代硬编码
 - **实测效果**：选股数量从平均119只减少到91只（**-23%**）
 
-#### 6. 新版100分评分系统 ⭐⭐⭐⭐⭐
+#### 8. 新版100分评分系统 ⭐⭐⭐⭐⭐
 - **文件**：[local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py)
 - **新增函数**：[calculate_trend_score_v2()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L729-L928) - 满分100分的综合评分系统
 - **评分维度**：
@@ -128,7 +221,7 @@
   - 20-39分：⭐⭐ 较差
   - 0-19分：⭐ 很差
 
-#### 7. 回测引擎集成新评分系统 ⭐⭐⭐⭐⭐
+#### 9. 回测引擎集成新评分系统 ⭐⭐⭐⭐⭐
 - **文件**：[score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py)
 - **关键修改**：第208行已调用新版评分系统
   ```python
@@ -137,7 +230,7 @@
   ```
 - **配置读取**：从 [config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml) 读取 `min_score: 60`
 
-#### 8. 实测验证（2026-04-13）⭐⭐⭐⭐⭐
+#### 10. 实测验证（2026-04-13）⭐⭐⭐⭐⭐
 - **筛选流程**：
   ```
   白名单 (5014只) 
@@ -252,8 +345,8 @@ python backtest/test_performance.py
 - `backtest/generate_stockpool.py` - 股票池生成（✅ 已优化：缓存+配置化+非交易日过滤）
 - `backtest/score_stockpool.py` - 评分筛选（✅ 已集成100分评分系统 + 实时进度展示）⭐NEW
 - `local/utils.py` - 技术指标计算（✅ 新增 calculate_trend_score_v2 + 本地数据源支持）⭐NEWEST
-- `backtest/backtest_engine.py` - 回测引擎（✅ 已修复非交易日过滤）
-- `backtest/run_backtest.py` - 回测入口
+- `backtest/backtest_engine.py` - 回测引擎（✅ 已修复非交易日过滤 + 资金计算bug + 交易周期跳转逻辑）⭐NEWEST
+- `backtest/run_backtest.py` - 回测入口（✅ 已添加--debug参数）⭐NEWEST
 
 ### 配置文件
 - `config.yaml` - 全局配置（✅ 已更新粗筛参数、评分阈值、数据源配置）⭐NEWEST
@@ -263,6 +356,7 @@ python backtest/test_performance.py
 - `data/backtest_trades_*.csv` - 交易明细
 - `data/backtest_cumulative_returns_*.png` - 收益曲线图
 - `data/backtest_monthly_returns_*.png` - 月度收益图
+- `data/backtest.log` - 回测日志文件（始终记录DEBUG级别）
 
 ### 工具文件
 - `backtest/view_stockpool.py` - 查看原始股票池
@@ -271,7 +365,7 @@ python backtest/test_performance.py
 - `backtest/test_new_score.py` - 测试评分系统 ⭐新增
 
 ### 文档文件
-- `backtest/NEW_CHAT_QUICKSTART.md` - 本文档
+- `backtest/NEWCHAT_START.md` - 本文档
 - `backtest/PHASE1_IMPLEMENTATION_STATUS.md` - 第一阶段实施状态
 - `backtest/PHASE1_OPTIMIZATION_SUMMARY.md` - 详细总结
 
@@ -306,17 +400,37 @@ python backtest/view_scored_results.py --date 2026-04-13
 python backtest/view_scored_results.py --date 2026-04-13 --top 5
 ```
 
-### 场景4：运行完整回测
-```bash
+### 场景4：运行完整回测 ⭐⭐⭐⭐⭐ 【NEWEST】
+```
 # 生成股票池
 python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04-30
 
 # 评分筛选
 python backtest/score_stockpool.py --start-date 2026-04-01 --end-date 2026-04-30
 
-# 执行回测
+# 执行回测（默认模式 - 简洁）
 python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-30
+
+# 执行回测（DEBUG模式 - 查看详细资金明细）⭐NEW
+python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-30 --debug
 ```
+**功能**：
+- 模拟真实交易过程（次日开盘买入，N个交易日后收盘卖出）
+- 计算各项统计指标并与沪深300对比
+- 生成详细的回测报告和可视化图表
+- **DEBUG模式新增**：显示每个周期的详细资金构成
+  - 实际投入资金、闲置资金、资金利用率
+  - 跳过的股票数量（因不足100股无法买入）
+**特性**：
+- ✅ 严格交易周期隔离（上一周期卖出后才能开始下一周期）
+- ✅ 自动过滤非交易日（周末+法定节假日）
+- ✅ 正确处理闲置资金（100股整数倍限制）
+- ✅ 支持--debug参数按需启用详细日志
+- ✅ 日志文件始终记录DEBUG级别信息
+**验证要点**（DEBUG模式）：
+- 闲置资金 > 0（除非恰好整除）
+- 资金利用率 < 100%（通常95%-99%）
+- 期末资金 ≈ 投入资金×(1+收益率) + 闲置资金
 
 ---
 
@@ -440,7 +554,86 @@ python backtest/test_performance.py
 平均差异: 0.00%
 ```
 
-### Q10: 下一步应该做什么？
+### Q10: 回测引擎的资金计算是如何处理的？⭐⭐⭐⭐⭐ 【NEWEST】
+**答**：回测引擎正确处理了A股100股整数倍限制导致的资金闲置问题。
+
+**四个资金概念的关系**：
+```
+期初资金 = 本周期投入资金 + 本周期闲置资金
+期末资金 = 本周期投入资金 × (1 + 周期收益率) + 本周期闲置资金
+周期收益率 = (期末市值 - 实际投入) / 实际投入 × 100%
+```
+
+**核心修复**（2026-05-05）：
+- ✅ 修改 `_calculate_cycle_final_capital()` 方法，正确计算包含闲置资金的期末资金
+- ✅ 增强 `calculate_cycle_metrics()` 方法，输出详细的资金构成
+- ✅ 添加 `--debug` 参数，按需启用DEBUG日志查看详细资金明细
+
+**验证方法**：
+```bash
+# 使用DEBUG模式查看详细的资金明细
+python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10 --debug
+```
+
+**正常表现**：
+- 闲置资金 > 0（除非恰好整除）
+- 资金利用率 < 100%（通常95%-99%）
+- 期末资金 ≈ 投入资金×(1+收益率) + 闲置资金
+
+### Q11: 如何启用DEBUG日志查看详细资金明细？⭐⭐⭐⭐⭐ 【NEWEST】
+**答**：有两种方式：
+
+**方式1：使用 --debug 参数（推荐）**
+```bash
+# 默认模式（INFO级别，简洁清晰）
+python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10
+
+# DEBUG模式（显示详细资金明细）
+python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10 --debug
+```
+
+**方式2：修改代码（不推荐）**
+在 `backtest/run_backtest.py` 中将控制台日志级别从 `"INFO"` 改为 `"DEBUG"`
+
+**注意事项**：
+- 日志文件（`data/backtest.log`）始终记录DEBUG级别信息，无论是否使用--debug参数
+- --debug参数仅影响控制台输出，不影响日志文件
+- DEBUG模式会输出更多信息，可能略微降低执行速度（影响很小）
+
+### Q12: 回测引擎的交易周期是如何衔接的？⭐⭐⭐⭐⭐ 【NEWEST】
+**答**：回测引擎采用"卖出日 = 下一周期选股日"的无缝衔接机制。
+
+**时间线示例**（hold_days = 3）：
+```
+周期1: T0(选股) → T1(买入) → T2 → T3(卖出+选股)
+                                ↓
+周期2: T3(已选股) → T4(买入) → T5 → T6(卖出+选股)
+```
+
+**核心原则**：
+- ✅ 选股日 = 卖出日（同一天完成卖出和选股）
+- ✅ 买入日 = 选股日 + 1个交易日
+- ✅ 卖出日 = 买入日 + (hold_days - 1)个交易日
+- ✅ 下一个周期的选股日 = 当前周期的卖出日
+- ✅ 周期之间绝不重叠
+
+**修复历史**（2026-05-05）：
+- **问题**：之前代码在卖出后跳过一个交易日才选股，导致资金闲置
+- **修复**：将跳转逻辑从 `i = sell_date_idx + 1` 改为 `i = sell_date_idx`
+- **效果**：实现资金无缝衔接，提高利用率
+
+**验证方法**：
+```bash
+# 运行短期回测，查看交易周期汇总
+python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10
+```
+
+**正常表现**：
+- 周期N的卖出日 = 周期N+1的选股日
+- 交易周期连续，无空档期
+- 资金利用率高，收益率准确
+
+### Q13: 下一步应该做什么？
 **答**：建议按以下顺序进行：
 1. **短期验证**：运行1个月回测（2026-04-01至2026-04-30），验证新评分系统效果
 2. **参数调优**：根据回测结果调整评分阈值、持仓天数等参数
@@ -501,6 +694,8 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 
 ### 高优先级（建议立即执行）
 - [x] ✅ 评分工具性能优化 - 切换到本地数据源（2026-05-04完成）
+- [x] ✅ 回测引擎资金计算Bug修复 - 正确处理闲置资金（2026-05-05完成）⭐NEWEST
+- [x] ✅ 回测引擎交易周期跳转逻辑修复 - 实现资金无缝衔接（2026-05-05完成）⭐NEWEST
 - [ ] 运行1个月回测，验证新评分系统效果
 - [ ] 分析回测结果，评估胜率、收益率、最大回撤
 - [ ] 根据结果调整评分阈值和持仓天数
@@ -530,6 +725,9 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 5. **本地数据源大幅提升性能**：从15分钟降至3分钟，提升5-10倍 ⭐⭐⭐⭐⭐ 【NEWEST】
 6. **数据一致性验证很重要**：首次使用时必须验证，建立信任 ⭐⭐⭐⭐⭐ 【NEWEST】
 7. **降级机制提高系统健壮性**：本地失败时自动切换到腾讯API ⭐⭐⭐⭐⭐ 【NEWEST】
+8. **正确处理闲置资金至关重要**：回测引擎必须区分期初资金、投入资金、闲置资金和期末资金 ⭐⭐⭐⭐⭐ 【NEWEST】
+9. **灵活的日志控制提升调试效率**：通过--debug参数按需启用详细日志，平衡简洁性和可观测性 ⭐⭐⭐⭐⭐ 【NEWEST】
+10. **交易周期无缝衔接提高资金效率**：卖出日应同时作为下一周期的选股日，避免资金闲置 ⭐⭐⭐⭐⭐ 【NEWEST】
 
 ### 需要避免的陷阱
 1. **评分阈值要与评分系统匹配**：旧版6.5分制不能用60分阈值
@@ -539,6 +737,8 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 5. **不要忽视数据复权问题**：必须使用前复权数据，否则技术指标失真 ⚠️ 【重要教训】
 6. **第三方库功能需先验证**：mootdx的to_adjust函数有bug，不能直接使用 ⚠️ 【重要教训】
 7. **本地数据需定期更新**：过期的本地数据会导致评分不准确 ⚠️ 【重要提醒】
+8. **严禁将期初资金等同于投入资金**：必须考虑100股整数倍限制导致的资金闲置 ⚠️ 【重要教训 - 2026-05-05修复】
+9. **严禁在卖出后跳过交易日才选股**：卖出日必须同时作为下一周期的选股日 ⚠️ 【重要教训 - 2026-05-05修复】
 
 ### 性能优化最佳实践 ⭐⭐⭐⭐⭐ 【NEWEST】
 1. **优先使用本地数据源**：避免对每只股票发起独立的网络API请求
@@ -547,6 +747,8 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 4. **实时进度反馈**：长时间操作显示百分比和预计剩余时间
 5. **自动降级方案**：主数据源失败时自动切换到备用方案
 6. **数据质量监控**：定期检查数据新鲜度和一致性
+7. **正确的资金管理**：准确计算投入资金、闲置资金和期末资金，确保复利效应正确传递 ⭐⭐⭐⭐⭐ 【NEWEST】
+8. **无缝的交易周期衔接**：卖出日同时作为下一周期的选股日，最大化资金利用率 ⭐⭐⭐⭐⭐ 【NEWEST】
 
 ---
 
@@ -561,6 +763,8 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 ### 核心代码文件
 - [local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py) - 数据源切换逻辑（_get_historical_klines等函数）
 - [backtest/score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py) - 评分工具主程序
+- [backtest/backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py) - 回测引擎（✅ 已修复资金计算bug + 交易周期跳转逻辑）⭐NEWEST
+- [backtest/run_backtest.py](file://e:\LearnPY\Projects\StockBot\backtest\run_backtest.py) - 回测入口（✅ 已添加--debug参数）⭐NEWEST
 - [config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml) - 全局配置文件
 
 ### 测试工具

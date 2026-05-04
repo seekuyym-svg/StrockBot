@@ -50,6 +50,9 @@ def main():
 2. 基于股票池进行回测
   python backtest/run_backtest.py --start-date 2024-01-01 --end-date 2026-01-01
 
+3. 启用DEBUG模式查看详细资金明细
+  python backtest/run_backtest.py --start-date 2024-01-01 --end-date 2024-01-10 --debug
+
 自定义参数:
   python backtest/run_backtest.py --volume-period 5 --hold-days 3 --min-score 0.6
         """
@@ -71,14 +74,17 @@ def main():
                        help='输出目录，默认: 项目根目录/data')
     parser.add_argument('--min-score', type=float, default=None,
                        help='最小评分阈值（覆盖配置文件中的backtest.backtest_minscore）')
+    parser.add_argument('--debug', action='store_true',
+                       help='启用DEBUG日志级别，显示详细的资金明细和调试信息')
     
     args = parser.parse_args()
     
-    # 配置日志 - 使用简洁格式（不显示模块名和行号）
+    # 配置日志 - 根据 --debug 参数动态设置日志级别
+    log_level = "DEBUG" if args.debug else "INFO"
     logger.remove()
     logger.add(
         sys.stderr, 
-        level="INFO",
+        level=log_level,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
     )
     logger.add(
@@ -88,6 +94,9 @@ def main():
         retention="7 days",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{line} | {message}"  # 日志文件保留详细信息
     )
+    
+    if args.debug:
+        logger.info("[DEBUG] DEBUG日志模式已启用")
     
     # 打印欢迎信息
     print("=" * 80)
