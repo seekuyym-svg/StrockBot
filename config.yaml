@@ -150,15 +150,16 @@ stock_news_monitor:
   enabled: true
   # 股票池配置（代码格式：sh.600000 或 sz.000001）
   stock_pool:
-    - code: "sz.000792"
-      name: "盐湖股份"
+    - code: "sz.002126"
+      name: "银轮股份"
       index: "一"
     - code: "sz.002706"
       name: "良信股份"
       index: "二"
-    - code: "sz.002126"
-      name: "银轮股份"
+    - code: "sz.000792"
+      name: "盐湖股份"
       index: "三"
+    
    
   # 资讯来源配置
   news_sources:
@@ -257,5 +258,5 @@ backtest:
   data_consistency_check: true  # 是否启用数据一致性验证（首次使用时建议开启）
   max_data_age_days: 7          # 数据最大允许年龄（交易日），超过则警告
   
-  # 综合评分最小值（兼容旧配置，已废弃，使用min_score）
-  backtest_minscore: 60         # run_backtest.py还在读取，并没有实质作用，主要使用min_score
+  # 综合评分最小值（兼容旧配置）
+  backtest_minscore: 60         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score

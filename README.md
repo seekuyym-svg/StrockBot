@@ -1,3 +1,30 @@
+# StockBot - 智能股票交易与资讯监控系统
+
+<div align="center">
+
+![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+![Version](https://img.shields.io/badge/Version-3.2.0-orange.svg)
+
+**基于马丁格尔策略的ETF T+0交易系统 | 持续放量选股 | 智能资讯监控 | 飞书实时通知**
+
+[快速开始](#-快速开始) • [功能特性](#-核心功能) • [配置指南](#️-配置指南) • [API文档](#-api接口)
+
+</div>
+
+---
+
+## 🌟 项目简介
+
+StockBot 是一个功能强大的智能股票交易与资讯监控系统，集成了以下核心能力：
+
+- **🎯 ETF T+0 马丁格尔交易** - 自动化加仓止盈策略，降低持仓成本
+- **📊 持续放量选股** - 基于通达信本地数据筛选强势股票
+- **📰 智能资讯监控** - 实时抓取个股资讯、公告、研报
+- **🔔 飞书实时通知** - 交易信号、选股结果、资讯日报一键推送
+- **📈 百分制评分系统** - 多维度技术分析，0-100分量化评估
+- **⚙️ 统一调度管理** - APScheduler定时任务，全自动运行
+
 ---
 
 ## 🚀 快速开始
@@ -258,7 +285,7 @@ python src/utils/buy_order_scheduler.py
 
 ### 数据流转
 
-```mermaid
+```
 graph LR
     A[选股脚本] -->|生成| B[stockpool文件]
     B -->|读取| C[买入计算]
@@ -278,7 +305,7 @@ graph LR
 
 ### 完整配置示例
 
-```yaml
+```
 # ==================== 基础配置 ====================
 initial_capital: 300000  # 初始资金（元）
 

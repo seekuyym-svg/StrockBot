@@ -9,6 +9,7 @@ import pandas as pd
 from loguru import logger
 import requests
 import re
+import akshare as ak
 
 # 添加项目根目录到路径
 project_root = Path(__file__).parent.parent.parent
@@ -16,7 +17,7 @@ sys.path.insert(0, str(project_root))
 
 from src.utils.config import get_config
 from src.utils.news_crawler import get_eastmoney_crawler
-from src.utils.notification import send_news_notification
+from src.utils.notification import send_news_notification, get_feishu_notifier
 
 
 class NewsMonitorScheduler:
@@ -77,13 +78,14 @@ class NewsMonitorScheduler:
             name: 股票名称
             
         Returns:
-            包含涨跌幅和市值的字典
+            包含涨跌幅、市值和收盘价的字典
         """
         metrics = {
             'daily_change_pct': None,  # 最近一日涨跌幅
             'weekly_change_pct': None,  # 最近一周涨跌幅
             'monthly_change_pct': None,  # 最近一月涨跌幅
-            'circulating_market_cap': None  # 流通市值（亿元）
+            'circulating_market_cap': None,  # 流通市值（亿元）
+            'close_price': None  # 最新收盘价
         }
         
         try:
@@ -119,13 +121,16 @@ class NewsMonitorScheduler:
                     parts_data = data_str.split('~')
                     
                     if len(parts_data) >= 80:
+                        # 提取当前价格（parts[3]是最新价）
+                        current_price = float(parts_data[3]) if parts_data[3] else 0
+                        metrics['close_price'] = round(current_price, 2)
+                        
                         # 提取日涨跌幅（parts[32]是涨跌幅百分比）
                         change_pct = float(parts_data[32]) if parts_data[32] else 0
                         metrics['daily_change_pct'] = round(change_pct, 2)
                         
                         # 提取流通市值
                         # 字段[72]或[76]是流通股本（股数），需要乘以当前价格得到市值
-                        current_price = float(parts_data[3]) if parts_data[3] else 0
                         circulating_shares = 0
                         
                         for idx in [72, 76]:
@@ -142,13 +147,17 @@ class NewsMonitorScheduler:
                             market_cap_yuan = circulating_shares * current_price
                             metrics['circulating_market_cap'] = round(market_cap_yuan / 1e8, 2)  # 转换为亿元
                         
-                        logger.debug(f"   ✅ 腾讯实时行情: 日{metrics['daily_change_pct']:+.2f}% | 市值{metrics['circulating_market_cap']}亿")
+                        logger.debug(f"   ✅ 腾讯实时行情: 现价{metrics['close_price']:.2f} | 日{metrics['daily_change_pct']:+.2f}% | 市值{metrics['circulating_market_cap']}亿")
             
             # 2. 从腾讯财经获取历史K线数据计算周/月涨跌幅
             klines = self._get_historical_klines_from_tencent(market.lower(), code, days=120)
             
             if not klines.empty and len(klines) >= 21:
                 latest_close = klines['收盘'].iloc[-1]
+                
+                # 如果实时行情未获取到收盘价，使用K线数据的收盘价
+                if metrics['close_price'] is None or metrics['close_price'] == 0:
+                    metrics['close_price'] = round(latest_close, 2)
                 
                 # 计算周涨幅（5个交易日前，索引-6）
                 if len(klines) >= 6:
@@ -171,8 +180,9 @@ class NewsMonitorScheduler:
             weekly_str = f"{metrics['weekly_change_pct']:+.2f}%" if metrics['weekly_change_pct'] is not None else "N/A"
             monthly_str = f"{metrics['monthly_change_pct']:+.2f}%" if metrics['monthly_change_pct'] is not None else "N/A"
             cap_str = f"{metrics['circulating_market_cap']}亿" if metrics['circulating_market_cap'] is not None else "N/A"
+            close_str = f"{metrics['close_price']:.2f}" if metrics['close_price'] is not None else "N/A"
             
-            logger.info(f"   ✅ 行情指标: 日{daily_str} | 周{weekly_str} | 月{monthly_str} | 市值{cap_str}")
+            logger.info(f"   ✅ 行情指标: 现价{close_str} | 日{daily_str} | 周{weekly_str} | 月{monthly_str} | 市值{cap_str}")
             
         except Exception as e:
             logger.warning(f"   ⚠️ 获取 {name} 行情指标失败: {e}")
@@ -300,9 +310,64 @@ class NewsMonitorScheduler:
                 # 获取股票行情数据（涨跌幅、市值等）
                 stock_metrics = self._fetch_stock_metrics(symbol, name)
                 
-                # 获取趋势分析结果
+                # 获取趋势分析结果（使用新版100分评分系统）
                 logger.info(f"   📈 正在进行多空信号分析...")
-                trend_analysis = trend_analyzer.analyze_stock(symbol, name)
+                
+                # 解析股票代码
+                parts = symbol.split('.')
+                trend_analysis = None
+                
+                if len(parts) == 2:
+                    market = parts[0].lower()  # 'sh' 或 'sz'
+                    code = parts[1]            # '000792'
+                    
+                    try:
+                        # 调用新版评分函数
+                        from local.utils import calculate_trend_score_v2
+                        score = calculate_trend_score_v2(market, code, days=300)
+                        
+                        if score is not None:
+                            # 根据百分制评分确定趋势类型和描述
+                            if score >= 80:
+                                trend_type = 'BULLISH'
+                                conclusion = "🟢 强势多头"
+                            elif score >= 60:
+                                trend_type = 'SLIGHTLY_BULLISH'
+                                conclusion = "🟡 温和上涨"
+                            elif score >= 40:
+                                trend_type = 'NEUTRAL'
+                                conclusion = "⚪ 震荡整理"
+                            elif score >= 20:
+                                trend_type = 'SLIGHTLY_BEARISH'
+                                conclusion = "🟠 弱势下跌"
+                            else:
+                                trend_type = 'BEARISH'
+                                conclusion = "🔴 极弱空头"
+                            
+                            # 获取收盘价
+                            close_price = stock_metrics.get('close_price', 0)
+                            
+                            # 构建趋势分析结果（保持与原格式兼容）
+                            trend_analysis = {
+                                'symbol': symbol,
+                                'name': name,
+                                'date': datetime.now().strftime('%Y-%m-%d'),
+                                'close': close_price,
+                                'trend': trend_type,
+                                'score': score,
+                                'conclusion': conclusion,
+                                'previous_score': None  # 暂时不实现前一日对比
+                            }
+                            
+                            logger.info(f"   ✅ 评分完成: {score:.1f}分 | {conclusion}")
+                        else:
+                            logger.warning(f"   ⚠️ 评分计算失败，跳过该股票的趋势分析")
+                            trend_analysis = None
+                    except Exception as e:
+                        logger.warning(f"   ⚠️ 评分计算异常: {e}")
+                        trend_analysis = None
+                else:
+                    logger.warning(f"   ⚠️ 股票代码格式错误，跳过趋势分析")
                 
                 stock_news = {
                     'code': symbol,
@@ -362,8 +427,296 @@ class NewsMonitorScheduler:
             
             logger.info(f"✅ 本轮资讯监控完成\n")
             
+            # 发送选股结果通知
+            self._send_stockpool_notification()
+            
         except Exception as e:
             logger.error(f"❌ 资讯监控执行异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    def _get_latest_trading_date(self) -> str:
+        """
+        获取最近的交易日（使用akshare获取交易日历）
+        
+        Returns:
+            str: 交易日期字符串 (格式: YYYYMMDD)，失败则返回当日日期
+        """
+        try:
+            # 获取A股交易日历
+            trade_cal = ak.tool_trade_date_hist_sina()
+            
+            if trade_cal is not None and not trade_cal.empty:
+                # 转换为datetime列表
+                trade_dates = pd.to_datetime(trade_cal['trade_date']).tolist()
+                
+                # 获取当前日期
+                today = pd.Timestamp(datetime.now().date())
+                
+                # 找到最近的一个交易日（小于等于今天）
+                trading_dates = [d for d in trade_dates if d <= today]
+                
+                if trading_dates:
+                    latest_date = max(trading_dates)
+                    date_str = latest_date.strftime('%Y%m%d')
+                    logger.info(f"✅ 最近交易日: {latest_date.strftime('%Y-%m-%d')}")
+                    return date_str
+            
+            # 降级方案：如果akshare失败，手动判断
+            logger.warning("⚠️ 无法获取交易日历，使用降级方案")
+            today = datetime.now()
+            
+            # 如果是周末，追溯到周五
+            if today.weekday() == 5:  # 周六
+                today -= timedelta(days=1)
+            elif today.weekday() == 6:  # 周日
+                today -= timedelta(days=2)
+            
+            return today.strftime('%Y%m%d')
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 获取交易日历失败: {e}，使用降级方案")
+            # 降级方案
+            today = datetime.now()
+            if today.weekday() == 5:  # 周六
+                today -= timedelta(days=1)
+            elif today.weekday() == 6:  # 周日
+                today -= timedelta(days=2)
+            return today.strftime('%Y%m%d')
+    
+    def _get_stock_pe_ttm(self, symbol: str):
+        """
+        获取股票的PE-TTM（滚动市盈率）- 使用腾讯财经API
+        
+        Args:
+            symbol: 股票代码 (如 sz.002706 或 sh.600519)
+            
+        Returns:
+            float: PE-TTM值，获取失败返回None
+        """
+        try:
+            # 解析股票代码
+            parts = symbol.split('.')
+            if len(parts) != 2:
+                return None
+            
+            market = parts[0].upper()  # SZ 或 SH
+            code = parts[1]
+            
+            # 调用腾讯财经API
+            url = f"http://qt.gtimg.cn/q={market.lower()}{code}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=5)
+            response.raise_for_status()
+            response.encoding = 'gbk'
+            
+            content = response.text
+            
+            # 解析数据
+            if '~' in content and '=' in content:
+                match = re.search(r'="([^"]+)"', content)
+                if match:
+                    data_str = match.group(1)
+                    parts_data = data_str.split('~')
+                    
+                    if len(parts_data) >= 40:
+                        # parts[39] 是 PE-TTM（滚动市盈率）
+                        pe_ttm_str = parts_data[39]
+                        if pe_ttm_str and pe_ttm_str.strip():
+                            pe_ttm = float(pe_ttm_str)
+                            if pe_ttm > 0:
+                                return round(pe_ttm, 2)
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"获取 {symbol} PE-TTM失败: {e}")
+            return None
+    
+    def _send_stockpool_notification(self):
+        """
+        发送选股结果飞书通知
+        """
+        try:
+            logger.info("\n" + "="*80)
+            logger.info("📊 【选股结果通知】开始执行...")
+            logger.info("="*80)
+            
+            # 1. 获取最近的交易日
+            trading_date = self._get_latest_trading_date()
+            logger.info(f"📅 目标日期: {trading_date}")
+            
+            # 2. 构建文件路径
+            filename = f"stockpool_{trading_date}.txt"
+            filepath = project_root / "data" / filename
+            
+            if not filepath.exists():
+                logger.warning(f"⚠️ 选股结果文件不存在: {filepath}")
+                logger.info("ℹ️ 跳过选股结果通知")
+                return
+            
+            logger.info(f"✅ 找到选股结果文件: {filepath}")
+            
+            # 3. 读取文件内容
+            stocks = []
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    # 跳过注释行、分隔线和空行
+                    if not line or line.startswith('#') or line.startswith('-'):
+                        continue
+                    
+                    # 解析股票代码和评分
+                    if ',' in line:
+                        parts = line.split(',')
+                        if len(parts) >= 2:
+                            code = parts[0].strip()
+                            try:
+                                score = float(parts[1].strip())
+                            except ValueError:
+                                logger.warning(f"⚠️ 评分解析失败: {line}")
+                                continue
+                            
+                            # 添加市场前缀
+                            if not code.startswith(('sh.', 'sz.', 'bj.')):
+                                if code.startswith('6'):
+                                    code = f'sh.{code}'
+                                elif code.startswith(('0', '3')):
+                                    code = f'sz.{code}'
+                                elif code.startswith(('8', '4')):
+                                    code = f'bj.{code}'
+                                else:
+                                    continue
+                            
+                            stocks.append({
+                                'code': code,
+                                'score': score
+                            })
+            
+            if not stocks:
+                logger.info("ℹ️ 选股结果为空，跳过通知")
+                return
+            
+            logger.info(f"📈 读取到 {len(stocks)} 只股票")
+            
+            # 4. 获取股票详细信息（名称、PE-TTM）
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            stock_details = []
+            
+            for i, stock in enumerate(stocks, 1):
+                code = stock['code']
+                score = stock['score']
+                
+                logger.info(f"   [{i}/{len(stocks)}] 处理 {code}...")
+                
+                # 获取股票名称
+                from src.utils.buy_order_scheduler import get_stock_name
+                code_without_prefix = code.split('.')[1] if '.' in code else code
+                name = get_stock_name(code_without_prefix)
+                
+                # 获取PE-TTM
+                pe_ttm = self._get_stock_pe_ttm(code)
+                
+                stock_details.append({
+                    'code': code_without_prefix,
+                    'full_code': code,
+                    'name': name,
+                    'score': score,
+                    'pe_ttm': pe_ttm
+                })
+                
+                # 避免请求过快
+                import time
+                time.sleep(0.5)
+            
+            # 5. 构建飞书消息
+            content = f"**今日选股结果**\n"
+            content += f"**时间**: {current_time}\n"
+            content += f"**数量**: {len(stock_details)} 只股票\n\n"
+            content += f"**━━━━━━━━━━━━━━━**\n\n"
+            
+            for i, stock in enumerate(stock_details, 1):
+                pe_str = f"{stock['pe_ttm']:.2f}" if stock['pe_ttm'] is not None else "N/A"
+                
+                content += f"**{i}. {stock['name']} ({stock['code']})**\n"
+                content += f"   评分: {stock['score']:.1f}分\n"
+                content += f"   PE-TTM: {pe_str}\n\n"
+            
+            content += f"**━━━━━━━━━━━━━━━**\n"
+            
+            # 6. 发送飞书通知
+            notifier = get_feishu_notifier()
+            
+            if not notifier.enabled:
+                logger.warning("⚠️ 飞书通知未启用，跳过发送")
+                return
+            
+            # 构建飞书消息体
+            message = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {
+                        "wide_screen_mode": True
+                    },
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": "今日选股结果"
+                        },
+                        "template": "blue"
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": content
+                            }
+                        },
+                        {
+                            "tag": "hr"
+                        },
+                        {
+                            "tag": "note",
+                            "elements": [
+                                {
+                                    "tag": "plain_text",
+                                    "content": f"ETF马丁格尔量化交易系统 | {current_time}"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+            
+            # 发送请求
+            import json
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(
+                notifier.webhook_url,
+                headers=headers,
+                data=json.dumps(message, ensure_ascii=False).encode('utf-8'),
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('StatusCode') == 0 or result.get('code') == 0:
+                    logger.success(f"📱 选股结果飞书通知发送成功: {len(stock_details)} 只股票")
+                else:
+                    error_code = result.get('code', 'unknown')
+                    error_msg = result.get('msg', '未知错误')
+                    logger.error(f"❌ 飞书API返回错误 (code: {error_code}): {error_msg}")
+            else:
+                logger.error(f"❌ 飞书通知发送失败，HTTP状态码: {response.status_code}")
+            
+            logger.info("✅ 选股结果通知完成\n")
+            
+        except Exception as e:
+            logger.error(f"❌ 选股结果通知执行异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
 

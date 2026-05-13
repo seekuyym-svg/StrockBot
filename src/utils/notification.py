@@ -541,23 +541,35 @@ class FeishuNotifier:
                 conclusion = trend_analysis.get('conclusion', '')
                 previous_score = trend_analysis.get('previous_score')  # 获取前一日评分
                 
-                # 根据趋势类型选择emoji
-                if trend_type in ['BULLISH', 'SLIGHTLY_BULLISH']:
+                # 根据趋势类型选择emoji（新版百分制映射）
+                if trend_type in ['BULLISH']:
                     trend_emoji = "🟢"
-                elif trend_type in ['BEARISH', 'SLIGHTLY_BEARISH']:
+                elif trend_type in ['SLIGHTLY_BULLISH']:
+                    trend_emoji = "🟡"
+                elif trend_type in ['NEUTRAL']:
+                    trend_emoji = "⚪"
+                elif trend_type in ['SLIGHTLY_BEARISH']:
+                    trend_emoji = "🟠"
+                elif trend_type in ['BEARISH']:
                     trend_emoji = "🔴"
                 else:
                     trend_emoji = "⚪"
                 
-                # 提取简洁的趋势描述（去掉emoji和括号内容）
-                trend_desc_map = {
-                    'BULLISH': '多头排列',
-                    'SLIGHTLY_BULLISH': '偏多震荡',
-                    'NEUTRAL': '中性观望',
-                    'SLIGHTLY_BEARISH': '偏空震荡',
-                    'BEARISH': '空头排列'
-                }
-                trend_desc = trend_desc_map.get(trend_type, '未知')
+                # 提取简洁的趋势描述（使用conclusion字段，已包含emoji）
+                # 如果conclusion为空，则使用默认映射
+                if conclusion:
+                    # 移除conclusion中的emoji，只保留文字描述
+                    trend_desc = conclusion.replace("🟢", "").replace("🟡", "").replace("⚪", "").replace("🟠", "").replace("🔴", "").strip()
+                else:
+                    # 备用映射（兼容旧数据）
+                    trend_desc_map = {
+                        'BULLISH': '强势多头',
+                        'SLIGHTLY_BULLISH': '温和上涨',
+                        'NEUTRAL': '震荡整理',
+                        'SLIGHTLY_BEARISH': '弱势下跌',
+                        'BEARISH': '极弱空头'
+                    }
+                    trend_desc = trend_desc_map.get(trend_type, '未知')
                 
                 # 格式化多空信号行（包含前一日评分对比）
                 if close_price > 0:

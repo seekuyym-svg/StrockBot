@@ -13,7 +13,7 @@
     python backtest/run_backtest.py
     
     # 自定义回测周期
-    python backtest/run_backtest.py --start-date 2024-01-01 --end-date 2026-01-01
+    python backtest/run_backtest.py --start-date 2021-07-01 --end-date 2021-09-30
     
     # 自定义参数
     python backtest/run_backtest.py --volume-period 5 --hold-days 3

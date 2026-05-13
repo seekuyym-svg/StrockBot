@@ -221,7 +221,7 @@ class HistoricalStockScorer:
         """
         # 转换日期格式为 YYYYMMDD
         formatted_date = date_str.replace("-", "")
-        filename = f"stockpool_{formatted_date}.txt"
+        filename = f"stockpool_{formatted_date}_my.txt"
         filepath = Path(__file__).parent.parent / "data" / filename
         
         if not filepath.exists():
@@ -271,13 +271,14 @@ class HistoricalStockScorer:
         """
         # 转换日期格式为 YYYYMMDD
         formatted_date = date_str.replace("-", "")
-        filename = f"stockpool_{formatted_date}.txt"
+        filename = f"stockpool_{formatted_date}_my.txt"
         filepath = Path(__file__).parent.parent / "data" / filename
         
         if not filepath.exists():
             return
         
         # === 第一步：按评分筛选 ===
+        min_score = 10.0
         filtered_results = [(symbol, score) for symbol, score in scored_results if score >= min_score]
         
         original_count = len(scored_results)
