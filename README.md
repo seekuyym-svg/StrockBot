@@ -4,9 +4,9 @@
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
-![Version](https://img.shields.io/badge/Version-3.2.0-orange.svg)
+![Version](https://img.shields.io/badge/Version-3.3.0-orange.svg)
 
-**基于马丁格尔策略的ETF T+0交易系统 | 持续放量选股 | 智能资讯监控 | 飞书实时通知**
+**基于马丁格尔策略的ETF T+0交易系统 | 持续放量选股 | 智能资讯监控 | 飞书实时通知 | 100分制评分系统**
 
 [快速开始](#-快速开始) • [功能特性](#-核心功能) • [配置指南](#️-配置指南) • [API文档](#-api接口)
 
@@ -54,9 +54,38 @@ pip install -r requirements.txt
 
 编辑 `config.yaml` 文件，配置以下关键信息：
 
+#### ⚠️ 重要更新：评分系统升级至100分制（v3.3.0）
+
+**变更说明**：
+- **旧版评分**：-6.0 ~ +6.0 分（已弃用）
+- **新版评分**：0 ~ 100 分（推荐使用）
+- **优势**：更精细的量化评估，支持区间筛选（min_score/max_score）
+
+**配置调整**：
+```yaml
+# 回测配置（新版）
+backtest:
+  min_score: 60      # 最低评分阈值（60分以上为良好）
+  max_score: 90      # 最高评分阈值（排除极端高分，默认100不限制）
+  max_stocks_per_cycle: 10
+
+# 买入委托配置（需同步调整）
+buy_order_scheduler:
+  min_score: 60.0    # 从1.0调整为60.0（适配100分制）
+```
+
+**趋势映射**：
+- 🟢 80-100分：强势多头
+- 🟡 60-79分：温和上涨
+- ⚪ 40-59分：震荡整理
+- 🟠 20-39分：弱势下跌
+- 🔴 0-19分：极弱空头
+
+---
+
 #### 1. 飞书通知配置
 
-```yaml
+```
 notification:
   feishu:
     enabled: true  # 启用飞书通知
@@ -70,7 +99,7 @@ notification:
 
 #### 2. ETF T+0 交易配置
 
-```yaml
+```
 symbols:
   - code: "sh.513120"
     name: "港股创新药ETF"
@@ -97,7 +126,7 @@ strategy:
 
 #### 3. 股票资讯监控配置
 
-```yaml
+```
 stock_news_monitor:
   enabled: true  # 启用资讯监控
   
@@ -115,7 +144,7 @@ stock_news_monitor:
 
 #### 4. 买入委托定时任务配置
 
-```yaml
+```
 buy_order_scheduler:
   enabled: true      # 启用买入委托定时任务
   hour: 9            # 执行时间：9点
@@ -125,7 +154,7 @@ buy_order_scheduler:
 
 #### 5. 通达信数据目录配置（选股功能需要）
 
-```yaml
+```
 TDX_DIR: "D:\\Install\\zd_zxzq_gm"  # 通达信安装目录
 ```
 
@@ -133,7 +162,7 @@ TDX_DIR: "D:\\Install\\zd_zxzq_gm"  # 通达信安装目录
 
 #### 方式1：启动完整监控系统（推荐）⭐
 
-```bash
+```
 python main.py
 ```
 
@@ -366,7 +395,13 @@ buy_order_scheduler:
   enabled: true
   hour: 9
   minute: 26
-  min_score: 1.0
+  min_score: 60.0  # 最低评分要求（新版100分制，建议60以上）
+
+# ==================== 回测配置 ====================
+backtest:
+  min_score: 60      # 股票池评分筛选最低分（100分制）
+  max_score: 90      # 股票池评分筛选最高分（100分制，默认100不限制）
+  max_stocks_per_cycle: 10  # 每个周期最多选10只股票
 
 # ==================== 飞书通知配置 ====================
 notification:
@@ -434,14 +469,29 @@ python local/select_stocks_volume.py
 ================================================================================
 ```
 
-**综合评分维度**：
-- 均线排列（MA5/10/20/60）
-- MACD金叉/死叉及位置
-- RSI强弱区域
-- 布林带突破情况
-- 成交量变化
+**综合评分维度（新版100分制）**：
 
-评分范围：-6.0（极弱）~ +6.0（极强）
+| 维度 | 权重 | 关键指标 |
+|------|------|----------|
+| 量能因子 | 30分 | 成交量递增、量比、换手率 |
+| 趋势因子 | 25分 | 均线排列、均线斜率 |
+| 动量因子 | 20分 | 5日/10日涨幅、相对强度 |
+| 形态因子 | 15分 | MACD金叉、布林带位置 |
+| 风险因子 | 10分 | RSI超买超卖、波动率控制 |
+
+**评分区间筛选**：
+- 配置 `backtest.min_score`（默认60）和 `backtest.max_score`（默认100）
+- 只保留评分在 `[min_score, max_score]` 区间内的股票
+- 若超过最大数量限制，按评分降序取Top N
+
+**趋势映射规则**：
+| 分数区间 | 趋势类型 | Emoji | 描述 |
+|---------|---------|-------|------|
+| 80-100 | BULLISH | 🟢 | 强势多头 |
+| 60-79 | SLIGHTLY_BULLISH | 🟡 | 温和上涨 |
+| 40-59 | NEUTRAL | ⚪ | 震荡整理 |
+| 20-39 | SLIGHTLY_BEARISH | 🟠 | 弱势下跌 |
+| 0-19 | BEARISH | 🔴 | 极弱空头 |
 
 ### 2. ETF T+0 马丁格尔交易
 
@@ -504,10 +554,12 @@ symbols:
 - 文件不存在则跳过，避免无效执行
 
 **委托计算规则**：
-- 过滤综合评分 < 1.0的股票
+- 过滤综合评分 < `buy_order_scheduler.min_score`（默认1.0）的股票
 - 每只股票分配相等资金
 - 股数必须是100的倍数（A股最小交易单位）
 - 计算公式：`股数 = int((总资金 / 股票数量) / 开盘价 / 100) * 100`
+
+**注意**：新版评分系统采用100分制，建议将 `min_score` 调整为60以上以筛选优质股票。
 
 **通知内容**：
 - 股票名称和代码

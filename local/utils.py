@@ -136,7 +136,8 @@ def calculate_trend_score(market: str, code: str, days: int = 300) -> Optional[f
         return None
 
 
-def _get_historical_klines(market: str, code: str, days: int = 300) -> pd.DataFrame:
+def _get_historical_klines(market: str, code: str, days: int = 300, 
+                           end_date: str = None) -> pd.DataFrame:
     """
     获取历史K线数据（支持本地数据和网络API双模式）
     
@@ -144,6 +145,7 @@ def _get_historical_klines(market: str, code: str, days: int = 300) -> pd.DataFr
         market: 市场代码 (sh 或 sz)
         code: 股票代码
         days: 获取天数
+        end_date: 截止日期 (格式: YYYY-MM-DD)，如果提供则只返回此日期之前的数据
         
     Returns:
         DataFrame包含日期、开盘、收盘、最高、最低、成交量等字段（前复权）
@@ -161,13 +163,14 @@ def _get_historical_klines(market: str, code: str, days: int = 300) -> pd.DataFr
         consistency_check = False
     
     if use_local:
-        return _get_klines_from_local(market, code, days, tdx_dir, consistency_check)
+        return _get_klines_from_local(market, code, days, tdx_dir, consistency_check, end_date)
     else:
-        return _get_klines_from_tencent(market, code, days)
+        return _get_klines_from_tencent(market, code, days, end_date)
 
 
 def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str, 
-                           consistency_check: bool = False) -> pd.DataFrame:
+                           consistency_check: bool = False,
+                           end_date: str = None) -> pd.DataFrame:
     """
     从本地通达信数据获取K线（前复权）
     
@@ -247,7 +250,14 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         if len(df) > days:
             df = df.iloc[-days:]
         
-        # 8. 数据一致性验证（可选）
+        # 8. 【新增】如果指定了截止日期，截断数据到该日期之前
+        if end_date:
+            end_dt = pd.to_datetime(end_date)
+            df = df[df.index <= end_dt]
+            if len(df) < 60:  # 数据不足则返回空
+                return pd.DataFrame()
+        
+        # 9. 数据一致性验证（可选）
         if consistency_check and len(df) > 0:
             _verify_data_consistency(full_code, df, tdx_dir)
         
@@ -258,7 +268,7 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         import traceback
         traceback.print_exc()
         # 降级到网络API
-        return _get_klines_from_tencent(market, code, days)
+        return _get_klines_from_tencent(market, code, days, end_date)
 
 
 def _verify_data_consistency(full_code: str, local_df: pd.DataFrame, tdx_dir: str):
@@ -327,7 +337,7 @@ def _verify_data_consistency(full_code: str, local_df: pd.DataFrame, tdx_dir: st
         pass
 
 
-def _get_klines_from_tencent(market: str, code: str, days: int) -> pd.DataFrame:
+def _get_klines_from_tencent(market: str, code: str, days: int, end_date: str = None) -> pd.DataFrame:
     """
     从腾讯财经API获取历史K线数据（降级方案）
     
@@ -335,6 +345,7 @@ def _get_klines_from_tencent(market: str, code: str, days: int) -> pd.DataFrame:
         market: 市场代码 (sh 或 sz)
         code: 股票代码
         days: 获取天数
+        end_date: 截止日期 (格式: YYYY-MM-DD)，如果提供则只返回此日期之前的数据
         
     Returns:
         DataFrame包含日期、开盘、收盘、最高、最低、成交量等字段
@@ -384,6 +395,14 @@ def _get_klines_from_tencent(market: str, code: str, days: int) -> pd.DataFrame:
                 if not df.empty:
                     df = df.sort_values('date').reset_index(drop=True)
                     df.set_index('date', inplace=True)
+                    
+                    # 【新增】如果指定了截止日期，截断数据到该日期之前
+                    if end_date:
+                        end_dt = pd.to_datetime(end_date)
+                        df = df[df.index <= end_dt]
+                        if len(df) < 60:  # 数据不足则返回空
+                            return pd.DataFrame()
+                    
                     return df
         
         return pd.DataFrame()
@@ -918,7 +937,8 @@ def load_blacklist(date_str=None):
         return {}
 
 
-def calculate_trend_score_v2(market: str, code: str, days: int = 300) -> Optional[float]:
+def calculate_trend_score_v2(market: str, code: str, days: int = 300,
+                             end_date: str = None) -> Optional[float]:
     """
     计算股票综合趋势评分（新版，满分100分）
     
@@ -948,13 +968,14 @@ def calculate_trend_score_v2(market: str, code: str, days: int = 300) -> Optiona
         market: 市场代码 ('sh' 或 'sz')
         code: 股票代码
         days: 获取历史数据天数，默认300天
-    
+        end_date: 截止日期 (格式: YYYY-MM-DD)，用于回测场景
+        
     Returns:
         float: 综合评分（0-100分），失败返回None
     """
     try:
-        # 1. 获取K线数据
-        df = _get_historical_klines(market, code, days)
+        # 1. 获取K线数据（支持历史日期）
+        df = _get_historical_klines(market, code, days, end_date=end_date)
         if df.empty or len(df) < 60:
             return None
         

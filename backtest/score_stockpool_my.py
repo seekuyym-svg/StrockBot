@@ -199,9 +199,9 @@ class HistoricalStockScorer:
             market = parts[0].lower()
             code = parts[1]
             
-            # 使用新版100分评分系统
+            # 使用新版100分评分系统（传入历史日期）
             from local.utils import calculate_trend_score_v2
-            score = calculate_trend_score_v2(market, code, days=300)
+            score = calculate_trend_score_v2(market, code, days=300, end_date=analysis_date)
             
             return score
                 

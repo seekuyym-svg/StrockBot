@@ -35,7 +35,7 @@ symbols:
     buy_rebound_pct: 0.5         # 买入监控反弹幅度阈值（%）
 
 # 初始资金
-initial_capital: 500000  # 30万
+initial_capital: 500000  # 50万
 
 # 马丁格尔策略参数（针对T+0优化）
 strategy:
@@ -186,7 +186,7 @@ buy_order_scheduler:
   hour: 9
   minute: 26
   # 最低综合评分阈值
-  min_score: 0.5
+  min_score: 60
 
 # 成交量选股策略配置
 volume_strategy:
@@ -249,7 +249,8 @@ backtest:
   max_volume_ratio: 8.0         # 最大量比（保持不变）
   
   # === 第二阶段评分配置 ===
-  min_score: 60                 # 最低评分阈值（满分100分，建议设置为60-70分）
+  min_score: 70                 # 最低评分阈值（满分100分，建议设置为60-70分）
+  max_score: 90                 # 最高评分阈值（满分100分）
   max_stocks_per_cycle: 10      # 每个周期最多选10只股票
   min_stocks_per_cycle: 3       # 最少选3只（保证分散）
   
@@ -259,4 +260,5 @@ backtest:
   max_data_age_days: 7          # 数据最大允许年龄（交易日），超过则警告
   
   # 综合评分最小值（兼容旧配置）
-  backtest_minscore: 60         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score
+  backtest_minscore: 70         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score
+       

@@ -322,9 +322,9 @@ class NewsMonitorScheduler:
                     code = parts[1]            # '000792'
                     
                     try:
-                        # 调用新版评分函数
+                        # 调用新版评分函数（支持历史日期）
                         from local.utils import calculate_trend_score_v2
-                        score = calculate_trend_score_v2(market, code, days=300)
+                        score = calculate_trend_score_v2(market, code, days=300, end_date=target_date)
                         
                         if score is not None:
                             # 根据百分制评分确定趋势类型和描述
