@@ -158,6 +158,24 @@ buy_order_scheduler:
 TDX_DIR: "D:\\Install\\zd_zxzq_gm"  # 通达信安装目录
 ```
 
+**⚠️ 服务器部署重要提示**：
+
+如果部署在服务器上（无通达信客户端），请在 `config.yaml` 中设置：
+
+```yaml
+backtest:
+  use_local_data: false          # 禁用本地数据，使用网络API
+  data_consistency_check: false  # 关闭数据一致性检查
+```
+
+这样可以：
+- ✅ 避免 `ModuleNotFoundError: No module named 'mootdx'` 错误
+- ✅ 无需安装通达信客户端
+- ✅ 直接使用腾讯财经API获取数据
+- ✅ 开箱即用，零配置
+
+详细说明请参考：[docs/SERVER_DEPLOYMENT_GUIDE.md](docs/SERVER_DEPLOYMENT_GUIDE.md)
+
 ### 第三步：运行系统
 
 #### 方式1：启动完整监控系统（推荐）⭐

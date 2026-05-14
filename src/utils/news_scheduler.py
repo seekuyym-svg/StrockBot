@@ -409,7 +409,10 @@ class NewsMonitorScheduler:
             
             logger.info(f"\n✅ 资讯获取完成，共 {total_count} 条")
             
-            # 发送飞书通知
+            # 先发送选股结果通知（优先级更高）
+            self._send_stockpool_notification()
+            
+            # 再发送资讯日报通知
             if total_count > 0:
                 news_data = {
                     'stock_pool': all_news,
@@ -426,9 +429,6 @@ class NewsMonitorScheduler:
                 logger.info(f"ℹ️ 今日暂无新资讯，跳过通知")
             
             logger.info(f"✅ 本轮资讯监控完成\n")
-            
-            # 发送选股结果通知
-            self._send_stockpool_notification()
             
         except Exception as e:
             logger.error(f"❌ 资讯监控执行异常: {e}")

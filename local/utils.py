@@ -152,19 +152,44 @@ def _get_historical_klines(market: str, code: str, days: int = 300,
     """
     # 尝试从配置读取数据源设置
     try:
-        from src.utils.config import get_config
-        config = get_config()
-        use_local = config.get('backtest', {}).get('use_local_data', True)
-        tdx_dir = config.get('TDX_DIR', 'D:\\Install\\zd_zxzq_gm')
-        consistency_check = config.get('backtest', {}).get('data_consistency_check', False)
-    except:
-        use_local = True  # 默认使用本地数据
+        import yaml
+        import os
+        
+        # 直接读取 YAML 配置文件（绕过 Pydantic 模型）
+        # 假设 config.yaml 在项目根目录，即当前文件向上两级
+        config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config.yaml')
+        
+        if not os.path.exists(config_path):
+            # 尝试其他可能的路径，例如当前工作目录
+            config_path = 'config.yaml'
+        
+        with open(config_path, 'r', encoding='utf-8') as f:
+            full_config = yaml.safe_load(f)
+        
+        # 读取 backtest 配置
+        backtest_config = full_config.get('backtest', {})
+        use_local = backtest_config.get('use_local_data', True)
+        consistency_check = backtest_config.get('data_consistency_check', False)
+        
+        # 读取 TDX_DIR（在根级别）
+        tdx_dir = full_config.get('TDX_DIR', 'D:\\Install\\zd_zxzq_gm')
+        
+        # 调试日志：输出配置值
+        print(f"[DEBUG] use_local_data={use_local}, tdx_dir={tdx_dir}")
+        
+    except Exception as e:
+        # 配置读取失败时的降级方案
+        print(f"⚠️  配置读取失败: {e}，使用默认配置（本地数据模式）")
+        use_local = True
         tdx_dir = 'D:\\Install\\zd_zxzq_gm'
         consistency_check = False
     
+    # 根据配置选择数据源
     if use_local:
         return _get_klines_from_local(market, code, days, tdx_dir, consistency_check, end_date)
     else:
+        # 直接使用腾讯财经API，不尝试加载 mootdx
+        print(f"[INFO] 使用腾讯财经API获取 {market}{code} 的K线数据")
         return _get_klines_from_tencent(market, code, days, end_date)
 
 
@@ -184,11 +209,17 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
     Returns:
         DataFrame包含前复权K线数据
     """
+    # 首先检查 tdx_dir 是否存在，如果不存在直接降级到网络API
+    import os
+    if not tdx_dir or not os.path.exists(tdx_dir):
+        print(f"⚠️  TDX_DIR 目录不存在: {tdx_dir}，降级到腾讯财经API")
+        return _get_klines_from_tencent(market, code, days, end_date)
+    
     try:
+        # 动态导入 mootdx，如果模块不存在则抛出异常并降级
         from mootdx.reader import Reader
         from mootdx.utils.adjust import to_adjust
         from datetime import datetime, timedelta
-        import os
         
         # 构建完整代码（如 sh600000）
         full_code = f"{market}{code}"
@@ -207,9 +238,17 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
             
             # 获取配置的交易日阈值
             try:
-                from src.utils.config import get_config
-                config = get_config()
-                max_age = config.get('backtest', {}).get('max_data_age_days', 7)
+                import yaml
+                import os
+                
+                config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config.yaml')
+                if not os.path.exists(config_path):
+                    config_path = 'config.yaml'
+                
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    full_config = yaml.safe_load(f)
+                
+                max_age = full_config.get('backtest', {}).get('max_data_age_days', 7)
             except:
                 max_age = 7
             
@@ -226,7 +265,7 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         if raw_data is None or raw_data.empty:
             print(f"⚠️  本地数据不存在: {full_code}")
             # 降级到网络API
-            return _get_klines_from_tencent(market, code, days)
+            return _get_klines_from_tencent(market, code, days, end_date)
         
         # 4. 转换为前复权数据
         # 注意：通达信本地数据文件(.day)本身已经是前复权数据
@@ -264,7 +303,7 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         return df
         
     except Exception as e:
-        print(f"❌ 本地数据读取失败 ({market}{code}): {e}")
+        print(f"❌本地数据读取失败 ({market}{code}): {e}")
         import traceback
         traceback.print_exc()
         # 降级到网络API
