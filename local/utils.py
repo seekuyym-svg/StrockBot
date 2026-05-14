@@ -153,15 +153,15 @@ def _get_historical_klines(market: str, code: str, days: int = 300,
     # 尝试从配置读取数据源设置
     try:
         import yaml
-        import os
+        from pathlib import Path
         
-        # 直接读取 YAML 配置文件（绕过 Pydantic 模型）
-        # 假设 config.yaml 在项目根目录，即当前文件向上两级
-        config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config.yaml')
+        # 使用基于 __file__ 的绝对路径定位 config.yaml
+        # local/utils.py -> local/ -> 项目根目录
+        project_root = Path(__file__).parent.parent
+        config_path = project_root / 'config.yaml'
         
-        if not os.path.exists(config_path):
-            # 尝试其他可能的路径，例如当前工作目录
-            config_path = 'config.yaml'
+        if not config_path.exists():
+            raise FileNotFoundError(f"配置文件不存在: {config_path}")
         
         with open(config_path, 'r', encoding='utf-8') as f:
             full_config = yaml.safe_load(f)
@@ -173,9 +173,6 @@ def _get_historical_klines(market: str, code: str, days: int = 300,
         
         # 读取 TDX_DIR（在根级别）
         tdx_dir = full_config.get('TDX_DIR', 'D:\\Install\\zd_zxzq_gm')
-        
-        # 调试日志：输出配置值
-        print(f"[DEBUG] use_local_data={use_local}, tdx_dir={tdx_dir}")
         
     except Exception as e:
         # 配置读取失败时的降级方案
@@ -189,7 +186,6 @@ def _get_historical_klines(market: str, code: str, days: int = 300,
         return _get_klines_from_local(market, code, days, tdx_dir, consistency_check, end_date)
     else:
         # 直接使用腾讯财经API，不尝试加载 mootdx
-        print(f"[INFO] 使用腾讯财经API获取 {market}{code} 的K线数据")
         return _get_klines_from_tencent(market, code, days, end_date)
 
 
@@ -212,7 +208,6 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
     # 首先检查 tdx_dir 是否存在，如果不存在直接降级到网络API
     import os
     if not tdx_dir or not os.path.exists(tdx_dir):
-        print(f"⚠️  TDX_DIR 目录不存在: {tdx_dir}，降级到腾讯财经API")
         return _get_klines_from_tencent(market, code, days, end_date)
     
     try:
@@ -252,9 +247,7 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
             except:
                 max_age = 7
             
-            if days_since_update > max_age:
-                print(f"⚠️  警告: {full_code} 的本地数据已超过{max_age}天未更新 "
-                      f"(最后更新: {file_mtime.strftime('%Y-%m-%d')})")
+            # Data age check skipped to reduce log noise
         
         # 2. 初始化Reader
         reader = Reader.factory(market='std', tdxdir=tdx_dir)
@@ -263,7 +256,6 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         raw_data = reader.daily(symbol=full_code)
         
         if raw_data is None or raw_data.empty:
-            print(f"⚠️  本地数据不存在: {full_code}")
             # 降级到网络API
             return _get_klines_from_tencent(market, code, days, end_date)
         
@@ -282,7 +274,6 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         # 检查必要列是否存在
         required_cols = ['open', 'close', 'high', 'low', 'volume']
         if not all(col in df.columns for col in required_cols):
-            print(f"⚠️  数据列不完整: {full_code}, 现有列: {df.columns.tolist()}")
             return pd.DataFrame()
         
         # 7. 截取最近N天数据
@@ -363,13 +354,13 @@ def _verify_data_consistency(full_code: str, local_df: pd.DataFrame, tdx_dir: st
                         
                         # 如果差异超过1%，给出警告
                         if diff_pct > 1.0:
-                            print(f"⚠️  数据一致性警告: {full_code}")
-                            print(f"   日期: {local_date} | {tencent_date}")
-                            print(f"   本地收盘价: {local_close:.2f}")
-                            print(f"   腾讯收盘价: {tencent_close:.2f}")
-                            print(f"   差异: {diff_pct:.2f}%")
+                            pass  # print(f"⚠️  数据一致性警告: {full_code}")
+                            # print(f"   日期: {local_date} | {tencent_date}")
+                            # print(f"   本地收盘价: {local_close:.2f}")
+                            # print(f"   腾讯收盘价: {tencent_close:.2f}")
+                            # print(f"   差异: {diff_pct:.2f}%")
                         else:
-                            print(f"✅ {full_code} 数据一致性验证通过 (差异: {diff_pct:.2f}%)")
+                            pass  # print(f"✅ {full_code} 数据一致性验证通过 (差异: {diff_pct:.2f}%)")
     
     except Exception as e:
         # 静默失败，不影响主流程

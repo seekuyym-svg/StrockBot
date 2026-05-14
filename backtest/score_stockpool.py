@@ -63,8 +63,10 @@ class HistoricalStockScorer:
             try:
                 from src.utils.config import get_config
                 config = get_config()
-                tdx_dir = config.get('tdx_dir', 'D:\\Install\\zd_zxzq_gm')
-            except:
+                # Pydantic模型使用属性访问，而非 .get() 方法
+                tdx_dir = getattr(config, 'tdx_dir', 'D:\\Install\\zd_zxzq_gm')
+            except Exception as e:
+                logger.debug(f"⚠️ 读取配置失败: {e}，使用默认通达信目录")
                 tdx_dir = 'D:\\Install\\zd_zxzq_gm'
         
         self.reader = Reader.factory(market='std', tdxdir=tdx_dir)
@@ -358,7 +360,19 @@ class HistoricalStockScorer:
         # 从 config.yaml 读取评分配置（命令行参数优先）
         try:
             import yaml
+            # 使用绝对路径，基于当前文件位置定位项目根目录
             config_path = Path(__file__).parent.parent / 'config.yaml'
+            
+            if not config_path.exists():
+                logger.warning(f"[WARN] 配置文件不存在: {config_path}，使用默认值")
+                if min_score is None:
+                    min_score = 60.0
+                if max_score is None:
+                    max_score = 100.0
+                if max_stocks is None:
+                    max_stocks = 10
+                return
+            
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
             
@@ -437,8 +451,8 @@ class HistoricalStockScorer:
             
             current += timedelta(days=1)
         
-        # 打印最终汇总
-        print(f"\n✅ 批量评分完成！处理了 {processed_count} 个交易日，共 {total_stocks} 只股票，成功评分 {scored_count} 只")
+        # 打印最终汇总（移除emoji以兼容Windows GBK编码）
+        print(f"\n[SUCCESS] 批量评分完成！处理了 {processed_count} 个交易日，共 {total_stocks} 只股票，成功评分 {scored_count} 只")
 
 
 def main():

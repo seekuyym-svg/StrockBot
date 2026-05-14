@@ -55,8 +55,10 @@ class HistoricalStockScorer:
             try:
                 from src.utils.config import get_config
                 config = get_config()
-                tdx_dir = config.get('tdx_dir', 'D:\\Install\\zd_zxzq_gm')
-            except:
+                # Pydantic模型使用属性访问，而非 .get() 方法
+                tdx_dir = getattr(config, 'tdx_dir', 'D:\\Install\\zd_zxzq_gm')
+            except Exception as e:
+                logger.debug(f"⚠️ 读取配置失败: {e}，使用默认通达信目录")
                 tdx_dir = 'D:\\Install\\zd_zxzq_gm'
         
         self.reader = Reader.factory(market='std', tdxdir=tdx_dir)
@@ -330,7 +332,8 @@ class HistoricalStockScorer:
                 code_without_prefix = symbol.split('.')[1] if '.' in symbol else symbol
                 f.write(f"{code_without_prefix},{score:.1f}\n")
     
-    def batch_process(self, start_date: str, end_date: str, backup: bool = False):
+    def batch_process(self, start_date: str, end_date: str, backup: bool = False, 
+                     min_score: float = None, max_score: float = None, max_stocks: int = None):
         """
         批量处理日期范围内的所有股票池
         
@@ -338,23 +341,49 @@ class HistoricalStockScorer:
             start_date: 开始日期 (格式: YYYY-MM-DD)
             end_date: 结束日期 (格式: YYYY-MM-DD)
             backup: 是否创建备份文件（默认False）
+            min_score: 最低评分阈值（None则从配置文件读取）
+            max_score: 最高评分阈值（None则从配置文件读取）
+            max_stocks: 最多保留的股票数量（None则从配置文件读取）
         """
-        # 从 config.yaml 读取评分配置
+        # 从 config.yaml 读取评分配置（命令行参数优先）
         try:
             import yaml
+            # 使用绝对路径，基于当前文件位置定位项目根目录
             config_path = Path(__file__).parent.parent / 'config.yaml'
+            
+            if not config_path.exists():
+                logger.warning(f"[WARN] 配置文件不存在: {config_path}，使用默认值")
+                if min_score is None:
+                    min_score = 60.0
+                if max_score is None:
+                    max_score = 100.0
+                if max_stocks is None:
+                    max_stocks = 10
+                return
+            
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
             
             backtest_config = config.get('backtest', {})
-            min_score = backtest_config.get('min_score', 60.0)
-            max_stocks = backtest_config.get('max_stocks_per_cycle', 10)
             
-            logger.info(f"[CONFIG] 评分阈值: {min_score}, 最大选股数: {max_stocks}")
+            # 优先级：命令行参数 > 配置文件 > 默认值
+            if min_score is None:
+                min_score = backtest_config.get('min_score', 60.0)
+            if max_score is None:
+                max_score = backtest_config.get('max_score', 100.0)
+            if max_stocks is None:
+                max_stocks = backtest_config.get('max_stocks_per_cycle', 10)
+            
+            logger.info(f"[CONFIG] 评分区间: [{min_score}-{max_score}], 最大选股数: {max_stocks}")
         except Exception as e:
             logger.warning(f"[WARN] 读取配置文件失败: {e}，使用默认值")
-            min_score = 60.0
-            max_stocks = 10
+            # 如果配置文件读取失败，使用硬编码默认值
+            if min_score is None:
+                min_score = 60.0
+            if max_score is None:
+                max_score = 100.0
+            if max_stocks is None:
+                max_stocks = 10
         
         current = datetime.strptime(start_date, '%Y-%m-%d')
         end = datetime.strptime(end_date, '%Y-%m-%d')
@@ -410,8 +439,8 @@ class HistoricalStockScorer:
             
             current += timedelta(days=1)
         
-        # 打印最终汇总
-        print(f"\n✅ 批量评分完成！处理了 {processed_count} 个交易日，共 {total_stocks} 只股票，成功评分 {scored_count} 只")
+        # 打印最终汇总（移除emoji以兼容Windows GBK编码）
+        print(f"\n[SUCCESS] 批量评分完成！处理了 {processed_count} 个交易日，共 {total_stocks} 只股票，成功评分 {scored_count} 只")
 
 
 def main():
@@ -422,6 +451,14 @@ def main():
     parser.add_argument('--end-date', type=str, help='结束日期 (格式: YYYY-MM-DD)')
     parser.add_argument('--tdx-dir', type=str, help='通达信安装目录（可选）')
     parser.add_argument('--backup', action='store_true', help='是否创建备份文件（默认不创建）')
+    
+    # 新增：评分筛选参数（优先级高于配置文件）
+    parser.add_argument('--min-score', type=float, default=None, 
+                       help='最低评分阈值（100分制，默认从配置文件读取）')
+    parser.add_argument('--max-score', type=float, default=None, 
+                       help='最高评分阈值（100分制，默认从配置文件读取）')
+    parser.add_argument('--max-stocks', type=int, default=None, 
+                       help='最多保留的股票数量（默认从配置文件读取）')
     
     args = parser.parse_args()
     
@@ -442,8 +479,10 @@ def main():
     # 创建评分器
     scorer = HistoricalStockScorer(tdx_dir=args.tdx_dir)
     
-    # 执行批量评分
-    scorer.batch_process(start_date, end_date, backup=args.backup)
+    # 执行批量评分（传递命令行参数，None表示使用配置文件值）
+    scorer.batch_process(start_date, end_date, backup=args.backup,
+                        min_score=args.min_score, max_score=args.max_score, 
+                        max_stocks=args.max_stocks)
 
 
 if __name__ == "__main__":

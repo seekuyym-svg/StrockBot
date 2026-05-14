@@ -484,21 +484,21 @@ class NewsMonitorScheduler:
                 today -= timedelta(days=2)
             return today.strftime('%Y%m%d')
     
-    def _get_stock_pe_ttm(self, symbol: str):
+    def _get_stock_fundamentals(self, symbol: str):
         """
-        获取股票的PE-TTM（滚动市盈率）- 使用腾讯财经API
+        获取股票基本面指标（PE-TTM、换手率等）- 使用腾讯财经API
         
         Args:
             symbol: 股票代码 (如 sz.002706 或 sh.600519)
             
         Returns:
-            float: PE-TTM值，获取失败返回None
+            dict: 包含 pe_ttm 和 turnover_rate 的字典，获取失败返回None
         """
         try:
             # 解析股票代码
             parts = symbol.split('.')
             if len(parts) != 2:
-                return None
+                return {'pe_ttm': None, 'turnover_rate': None}
             
             market = parts[0].upper()  # SZ 或 SH
             code = parts[1]
@@ -522,20 +522,37 @@ class NewsMonitorScheduler:
                     data_str = match.group(1)
                     parts_data = data_str.split('~')
                     
+                    result = {'pe_ttm': None, 'turnover_rate': None}
+                    
                     if len(parts_data) >= 40:
                         # parts[39] 是 PE-TTM（滚动市盈率）
                         pe_ttm_str = parts_data[39]
                         if pe_ttm_str and pe_ttm_str.strip():
-                            pe_ttm = float(pe_ttm_str)
-                            if pe_ttm > 0:
-                                return round(pe_ttm, 2)
+                            try:
+                                pe_ttm = float(pe_ttm_str)
+                                if pe_ttm > 0:
+                                    result['pe_ttm'] = round(pe_ttm, 2)
+                            except ValueError:
+                                pass
+                        
+                        # parts[38] 是换手率（%）
+                        turnover_str = parts_data[38]
+                        if turnover_str and turnover_str.strip():
+                            try:
+                                turnover_rate = float(turnover_str)
+                                if turnover_rate >= 0:
+                                    result['turnover_rate'] = round(turnover_rate, 2)
+                            except ValueError:
+                                pass
+                    
+                    return result
             
-            return None
+            return {'pe_ttm': None, 'turnover_rate': None}
             
         except Exception as e:
-            logger.debug(f"获取 {symbol} PE-TTM失败: {e}")
-            return None
-    
+            logger.debug(f"获取 {symbol} 基本面指标失败: {e}")
+            return {'pe_ttm': None, 'turnover_rate': None}
+
     def _send_stockpool_notification(self):
         """
         发送选股结果飞书通知
@@ -602,7 +619,7 @@ class NewsMonitorScheduler:
             
             logger.info(f"📈 读取到 {len(stocks)} 只股票")
             
-            # 4. 获取股票详细信息（名称、PE-TTM）
+            # 4. 获取股票详细信息（名称、PE-TTM、换手率）
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             stock_details = []
             
@@ -617,15 +634,18 @@ class NewsMonitorScheduler:
                 code_without_prefix = code.split('.')[1] if '.' in code else code
                 name = get_stock_name(code_without_prefix)
                 
-                # 获取PE-TTM
-                pe_ttm = self._get_stock_pe_ttm(code)
+                # 获取基本面指标（PE-TTM、换手率）
+                fundamentals = self._get_stock_fundamentals(code)
+                pe_ttm = fundamentals.get('pe_ttm')
+                turnover_rate = fundamentals.get('turnover_rate')
                 
                 stock_details.append({
                     'code': code_without_prefix,
                     'full_code': code,
                     'name': name,
                     'score': score,
-                    'pe_ttm': pe_ttm
+                    'pe_ttm': pe_ttm,
+                    'turnover_rate': turnover_rate
                 })
                 
                 # 避免请求过快
@@ -640,10 +660,12 @@ class NewsMonitorScheduler:
             
             for i, stock in enumerate(stock_details, 1):
                 pe_str = f"{stock['pe_ttm']:.2f}" if stock['pe_ttm'] is not None else "N/A"
+                turnover_str = f"{stock['turnover_rate']:.2f}%" if stock['turnover_rate'] is not None else "N/A"
                 
                 content += f"**{i}. {stock['name']} ({stock['code']})**\n"
                 content += f"   评分: {stock['score']:.1f}分\n"
-                content += f"   PE-TTM: {pe_str}\n\n"
+                content += f"   PE-TTM: {pe_str}\n"
+                content += f"   换手率: {turnover_str}\n\n"
             
             content += f"**━━━━━━━━━━━━━━━**\n"
             
