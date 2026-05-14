@@ -9,6 +9,9 @@ uvicorn[standard]>=0.24.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0  # HTML解析库
 
+# 金融数据接口
+akshare>=1.12.0  # A股交易日历、股票数据等
+
 # 数据处理
 pandas>=2.0.0
 numpy>=1.24.0
