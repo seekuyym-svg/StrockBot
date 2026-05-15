@@ -30,9 +30,15 @@ class NewsMonitorScheduler:
         self.monitor_config = self.config.stock_news_monitor
         self.crawler = get_eastmoney_crawler()
         
+        # ✨ 新增：交易日历缓存
+        self.trading_days_cache = None
+        
         if not self.monitor_config.enabled:
             logger.info("ℹ️ 股票资讯监控未启用")
             return
+        
+        # ✨ 新增：加载交易日历
+        self._load_trading_calendar()
         
         # 获取股票池
         self.stock_pool = [
@@ -68,6 +74,61 @@ class NewsMonitorScheduler:
             name='股票资讯监控任务',
             replace_existing=True
         )
+    
+    def _load_trading_calendar(self):
+        """
+        加载交易日历（带缓存）
+        
+        使用 akshare 获取A股交易日历，支持周末和法定节假日过滤
+        失败时降级为仅过滤周末的方案
+        """
+        try:
+            import akshare as ak
+            
+            logger.info("[INFO] 正在从 akshare 获取A股交易日历...")
+            
+            # 获取中国A股交易日历
+            trade_dates_df = ak.tool_trade_date_hist_sina()
+            
+            if trade_dates_df is None or trade_dates_df.empty:
+                logger.warning("[WARN] 无法从 akshare 获取交易日历，降级为仅过滤周末")
+                self.trading_days_cache = None
+                return
+            
+            # 转换为 datetime 对象并缓存
+            self.trading_days_cache = pd.to_datetime(trade_dates_df['trade_date']).tolist()
+            logger.info(f"[OK] 成功加载 {len(self.trading_days_cache)} 个交易日至缓存")
+            
+        except Exception as e:
+            logger.warning(f"[WARN] 获取交易日历失败: {e}，降级为仅过滤周末")
+            self.trading_days_cache = None
+    
+    def _is_trading_day(self, check_date=None):
+        """
+        判断指定日期是否为交易日
+        
+        Args:
+            check_date: 要检查的日期，默认为当前日期
+            
+        Returns:
+            bool: True表示交易日，False表示非交易日
+        """
+        if check_date is None:
+            check_date = datetime.now()
+        
+        # 如果有缓存的交易日历
+        if self.trading_days_cache:
+            # 只比较日期部分（去除时分秒）
+            check_date_only = check_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            is_trading = check_date_only in self.trading_days_cache
+            return is_trading
+        
+        # 降级方案：仅过滤周末
+        weekday = check_date.weekday()
+        if weekday < 5:  # 周一到周五
+            return True
+        else:
+            return False
     
     def _fetch_stock_metrics(self, symbol: str, name: str) -> dict:
         """
@@ -268,6 +329,17 @@ class NewsMonitorScheduler:
             target_date: 目标日期（格式：YYYY-MM-DD），用于测试。默认为None表示使用当天日期
         """
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # ✨ 新增：检查是否为交易日
+        if not self._is_trading_day():
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            weekday_map = {0: '周一', 1: '周二', 2: '周三', 3: '周四', 
+                          4: '周五', 5: '周六', 6: '周日'}
+            weekday_str = weekday_map[datetime.now().weekday()]
+            logger.info(f"\n{'='*60}")
+            logger.info(f"⏭️ [{today_str}] {weekday_str} 非交易日，跳过资讯推送")
+            logger.info(f"{'='*60}\n")
+            return
         
         # 如果指定了目标日期，在日志中显示
         date_info = f" (测试日期: {target_date})" if target_date else ""
