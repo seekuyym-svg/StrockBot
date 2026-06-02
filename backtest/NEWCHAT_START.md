@@ -2,15 +2,106 @@
 
 **适用场景**：开启新对话后，快速继续回测策略优化工作
 
-**最后更新**：2026-05-05 01:00
+**最后更新**：2026-06-02 18:30
 
 ---
 
-## 📋 当前状态（2026-05-05最新修复）
+## 📋 当前状态（2026-06-02最新修复）
 
 ### ✅ **已完成的工作**
 
-#### 1. 回测引擎交易周期跳转逻辑修复 - 实现资金无缝衔接 ⭐⭐⭐⭐⭐ 【NEWEST】
+#### 1. 换手率评分规则优化 - 新版双重条件评分系统 ⭐⭐⭐⭐⭐ 【NEWEST】
+- **更新时间**：2026-06-02 18:30
+- **文件**：[local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py)
+- **问题**：旧版换手率评分仅基于累计值，无法识别每日波动过大的风险股票
+- **解决方案**：实现新版双重条件评分规则，强调稳定性和合理性
+- **核心改进**：
+  - ✅ **去除负分机制**：最低得分为0分，避免过度惩罚
+  - ✅ **双重条件控制**：同时要求"每日换手率稳定"和"累计换手率合理"
+  - ✅ **排除极端情况**：单日>25%（过度活跃）或<2%（过于冷清）直接0分
+  - ✅ **配置化支持**：天数从 [config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml) 的 `backtest.volume_period` 读取
+  - ✅ **可配置最小数据长度**：新增 `min_data_length` 参数，解决历史日期截断导致的数据不足问题
+- **新版评分规则**：
+  | 得分 | 条件 | 说明 |
+  |------|------|------|
+  | **5分** | 每日换手率均在 5%~15% 且 3日累计 15%~45% | 优质活跃度 |
+  | **3分** | 每日换手率均在 3%~20% 且 3日累计 12%~50% | 一般活跃度 |
+  | **0分** | 任一日换手率 >25% 或 <2%，或其他不满足条件的情况 | 不活跃或异常 |
+- **判断优先级**：
+  ```python
+  # 1. 检查排除条件：任一日换手率 >25% 或 <2%
+  if any(t > 25 or t < 2 for t in daily_turnovers):
+      return 0
+  
+  # 2. 判断5分条件：每日均在 5%~15% 且 累计 15%~45%
+  if all(5 <= t <= 15 for t in daily_turnovers) and 15 <= cumulative_turnover <= 45:
+      return 5
+  
+  # 3. 判断3分条件：每日均在 3%~20% 且 累计 12%~50%
+  if all(3 <= t <= 20 for t in daily_turnovers) and 12 <= cumulative_turnover <= 50:
+      return 3
+  
+  # 4. 其他情况
+  return 0
+  ```
+- **关键技术实现**：
+  - **真实换手率计算**：`换手率 = 成交量 / 流通股本 × 100%`
+  - **流通股本获取**：通过腾讯财经API字段[72]或[76]获取
+  - **容错处理**：API失败时返回0分并输出警告，不中断主流程
+  - **边界包含**：恰好等于阈值时按更高档位计分（如正好5%计为满足条件）
+- **测试验证结果**：
+  | 股票 | 每日换手率 | 累计换手率 | 评分 | 原因 |
+  |------|-----------|-----------|------|------|
+  | **良信股份** (sz002706) | [8.69%, 6.78%, 10.81%] | 26.28% | **5分** | ✅ 每日5%~15%，累计15%~45% |
+  | **贵州茅台** (sh600519) | [0.61%, 0.35%, 0.29%] | 1.25% | **0分** | ❌ 单日<2%，触发排除条件 |
+  | **金螳螂** (sz002081) | [13.75%, 23.96%, 26.71%] | 64.42% | **0分** | ❌ 单日>25%，触发排除条件 |
+- **实施效果**：
+  - ✅ 更精准选股：不仅关注活跃度，还要求稳定性
+  - ✅ 降低风险：排除单日过度活跃或过于冷清的股票
+  - ✅ 简化调优：3个等级比7个等级更容易理解和调整
+  - ✅ 符合策略理念："宽粗筛，严评分"
+- **使用方法**：
+  ```bash
+  # 运行股票池评分（自动应用新规则）
+  python backtest/score_stockpool.py --date 2026-06-02
+  
+  # 批量评分
+  python backtest/score_stockpool.py --start-date 2026-06-01 --end-date 2026-06-02
+  ```
+- **注意事项**：
+  - 每只股票评分时需要调用一次腾讯API获取流通股本
+  - 由于选股后股票数量不多，性能影响可接受
+  - 如需调整累计换手率的天数，修改 [config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml) 中的 `backtest.volume_period` 值
+
+#### 2. K线数据获取函数增强 - 支持可配置的最小数据长度 ⭐⭐⭐⭐⭐ 【NEWEST】
+- **更新时间**：2026-06-02 18:20
+- **文件**：[local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py)
+- **问题**：[_get_historical_klines()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L265-L318) 函数硬编码最小数据长度为60条，导致在回测历史日期时，如果截断后数据不足60条就返回空DataFrame
+- **解决方案**：添加 `min_data_length` 参数，默认为60，但可以自定义
+- **核心改进**：
+  - ✅ **参数化最小数据长度**：所有K线获取函数支持 `min_data_length` 参数
+  - ✅ **向后兼容**：默认值为60，不影响现有调用方
+  - ✅ **灵活可控**：不同场景可以设置不同的最小数据量要求
+  - ✅ **代码清晰**：参数命名明确，易于理解和维护
+- **修改的函数**：
+  - [_get_historical_klines()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L265-L318)：添加 `min_data_length: int = 60` 参数
+  - [_get_klines_from_local()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L320-L431)：添加 `min_data_length: int = 60` 参数
+  - [_get_klines_from_tencent()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L498-L570)：添加 `min_data_length: int = 60` 参数
+  - [calculate_cumulative_turnover_score()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L109-L195)：从配置文件读取 `volume_period` 作为 `min_data_length`
+- **使用示例**：
+  ```python
+  # 默认使用60条最小长度
+  df = _get_historical_klines('sz', '002706', days=300)
+  
+  # 自定义最小长度为3条（用于换手率评分）
+  df = _get_historical_klines('sz', '002706', days=10, min_data_length=3)
+  ```
+- **实施效果**：
+  - ✅ 解决了回测历史日期时"K线数据不足（仅0条）"的问题
+  - ✅ 提高了函数的灵活性和复用性
+  - ✅ 符合项目规范中的"历史数据分析日期一致性规范"
+
+#### 3. 回测引擎交易周期跳转逻辑修复 - 实现资金无缝衔接 ⭐⭐⭐⭐⭐
 - **更新时间**：2026-05-05 01:00
 - **文件**：[backtest/backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py)
 - **问题**：回测工具在交易周期之间存在一个交易日的空档期
@@ -56,7 +147,7 @@
   ```
   注意：**周期1的卖出日（2026-04-06）= 周期2的选股日（2026-04-06）** ✅
 
-#### 2. 回测引擎资金计算Bug修复 - 正确处理闲置资金 ⭐⭐⭐⭐⭐
+#### 4. 回测引擎资金计算Bug修复 - 正确处理闲置资金 ⭐⭐⭐⭐⭐
 - **更新时间**：2026-05-05 00:30
 - **文件**：[backtest/backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py)、[backtest/run_backtest.py](file://e:\LearnPY\Projects\StockBot\backtest\run_backtest.py)
 - **问题**：回测工具在计算交易周期期初资金和期末资金时存在严重bug
@@ -103,7 +194,7 @@
   - --debug参数仅影响控制台输出，不影响日志文件
   - DEBUG模式会输出更多信息，可能略微降低执行速度（影响很小）
 
-#### 3. 评分工具性能优化 - 本地数据源切换 ⭐⭐⭐⭐⭐
+#### 5. 评分工具性能优化 - 本地数据源切换 ⭐⭐⭐⭐⭐
 - **更新时间**：2026-05-04 23:15
 - **文件**：[local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py)、[config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml)
 - **问题**：评分工具每次从腾讯财经API获取数据，批量处理617只股票需要约15分钟，速度慢且依赖网络
@@ -152,7 +243,7 @@
   - 系统会在数据超过7天未更新时发出警告
   - 如需临时切换回腾讯API，设置 `use_local_data: false`
 
-#### 4. 评分工具进度展示优化 ⭐⭐⭐⭐⭐
+#### 6. 评分工具进度展示优化 ⭐⭐⭐⭐⭐
 - **文件**：[score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py)
 - **问题**：批量评分时无法实时看到进度，处理大量股票时需要等待很久才有反馈
 - **解决方案**：添加实时进度展示功能
@@ -172,7 +263,7 @@
   ```
 - **特性**：无额外依赖、保留原有日志、简洁直观
 
-#### 5. 回测引擎非交易日过滤修复 ⭐⭐⭐⭐⭐
+#### 7. 回测引擎非交易日过滤修复 ⭐⭐⭐⭐⭐
 - **文件**：[backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py)
 - **问题**：回测引擎的 `get_trading_days()` 方法仅过滤周末，未处理法定节假日，导致回测时出现日期跳跃
 - **解决方案**：复用 [generate_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\generate_stockpool.py) 中的 akshare 交易日历获取逻辑
@@ -180,14 +271,14 @@
 - **降级机制**：API失败时自动降级为仅过滤周末
 - **测试验证**：2026年4月正确识别21个交易日（跳过清明假期4月4-6日）
 
-#### 6. 股票池生成器非交易日过滤 ⭐⭐⭐⭐⭐
+#### 8. 股票池生成器非交易日过滤 ⭐⭐⭐⭐⭐
 - **文件**：[generate_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\generate_stockpool.py)
 - **问题**：原逻辑仅过滤周末，未处理法定节假日
 - **解决方案**：使用 akshare 获取准确的A股交易日历
 - **效果**：自动识别并过滤所有非交易日（周末+节假日）
 - **降级机制**：API失败时自动降级为仅过滤周末
 
-#### 7. 粗筛参数配置化与优化 ⭐⭐⭐⭐⭐
+#### 9. 粗筛参数配置化与优化 ⭐⭐⭐⭐⭐
 - **文件**：[config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml)、[generate_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\generate_stockpool.py)
 - **新增配置项**：
   ```yaml
@@ -203,7 +294,7 @@
 - **代码改进**：从配置文件读取参数，替代硬编码
 - **实测效果**：选股数量从平均119只减少到91只（**-23%**）
 
-#### 8. 新版100分评分系统 ⭐⭐⭐⭐⭐
+#### 10. 新版100分评分系统 ⭐⭐⭐⭐⭐
 - **文件**：[local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py)
 - **新增函数**：[calculate_trend_score_v2()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L729-L928) - 满分100分的综合评分系统
 - **评分维度**：
@@ -221,7 +312,7 @@
   - 20-39分：⭐⭐ 较差
   - 0-19分：⭐ 很差
 
-#### 9. 回测引擎集成新评分系统 ⭐⭐⭐⭐⭐
+#### 11. 回测引擎集成新评分系统 ⭐⭐⭐⭐⭐
 - **文件**：[score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py)
 - **关键修改**：第208行已调用新版评分系统
   ```python
@@ -230,7 +321,7 @@
   ```
 - **配置读取**：从 [config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml) 读取 `min_score: 60`
 
-#### 10. 实测验证（2026-04-13）⭐⭐⭐⭐⭐
+#### 12. 实测验证（2026-04-13）⭐⭐⭐⭐⭐
 - **筛选流程**：
   ```
   白名单 (5014只) 
@@ -318,7 +409,25 @@ python backtest/test_new_score.py --code 600707 --market sh
 ```
 **功能**：对比新旧评分系统，显示详细评分结果
 
-### 6. 测试数据源一致性 ⭐⭐⭐⭐⭐ 【NEWEST】
+### 6. 测试换手率评分规则 ⭐⭐⭐⭐⭐ 【NEWEST】
+```bash
+# 测试新版换手率评分规则
+python tests/test_new_turnover_rules.py
+
+# 详细验证换手率计算过程
+python tests/verify_turnover_scoring.py
+```
+**功能**：
+- 验证新版双重条件评分规则的正确性
+- 展示每日换手率和累计换手率的详细计算过程
+- 显示评分判断的完整逻辑
+**特性**：
+- ✅ 自动获取流通股本
+- ✅ 计算最近3天（或配置的volume_period天）的每日换手率
+- ✅ 根据新规则判断评分（5分/3分/0分）
+- ✅ 输出详细的判断依据
+
+### 7. 测试数据源一致性 ⭐⭐⭐⭐⭐ 【NEWEST】
 ```bash
 # 测试单只股票的数据一致性
 python backtest/test_data_source.py --code 600519 --market sh
@@ -507,14 +616,32 @@ backtest:
 ### Q5: 非交易日过滤是如何实现的？
 **答**：使用 akshare 库获取中国A股官方交易日历，准确识别所有非交易日（包括周末和法定节假日）。如果API失败，会自动降级为仅过滤周末的简化方案。
 
-### Q6: 评分工具的进度展示如何工作？⭐NEW
+### Q6: 新版换手率评分规则是什么？⭐⭐⭐⭐⭐ 【NEWEST】
+**答**：新版换手率评分采用双重条件判断，强调稳定性和合理性。
+
+**评分规则**：
+- **5分**：每日换手率均在 5%~15% 且 3日累计 15%~45%（优质活跃度）
+- **3分**：每日换手率均在 3%~20% 且 3日累计 12%~50%（一般活跃度）
+- **0分**：任一日换手率 >25% 或 <2%，或其他不满足条件的情况
+
+**核心特点**：
+- ✅ 去除负分机制，最低得分为0分
+- ✅ 双重条件控制（每日范围+累计范围）
+- ✅ 排除极端情况（单日过度活跃或过于冷清）
+- ✅ 边界包含（恰好等于阈值时按更高档位计分）
+
+**如何调整**：
+- 修改累计天数：编辑 [config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml) 中的 `backtest.volume_period`
+- 调整阈值：修改 [local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py) 中 [calculate_cumulative_turnover_score()](file://e:\LearnPY\Projects\StockBot\local\utils.py#L109-L195) 函数的阈值参数
+
+### Q7: 评分工具的进度展示如何工作？⭐NEW
 **答**：[score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py) 已添加实时进度展示功能：
 - **显示内容**：`[日期进度] 日期 | 股票 X/N (XX%) | 已耗时: X秒`
 - **更新频率**：每处理25只股票更新一次进度
 - **技术实现**：使用 `\r` 实现单行动态刷新，不会刷屏
 - **优势**：清晰了解处理进度，无需等待很久才有反馈
 
-### Q7: 本地数据源和腾讯API有什么区别？⭐⭐⭐⭐⭐ 【NEWEST】
+### Q8: 本地数据源和腾讯API有什么区别？⭐⭐⭐⭐⭐ 【NEWEST】
 **答**：
 - **本地数据源（推荐）**：
   - ✅ 速度快：性能提升5-10倍（3分钟 vs 15分钟）
@@ -531,14 +658,14 @@ backtest:
   
 - **降级机制**：本地数据失败时自动切换到腾讯API，确保系统健壮性
 
-### Q8: 如何知道本地数据是否过期？
+### Q9: 如何知道本地数据是否过期？
 **答**：系统会自动检查，如果数据超过配置的天数（默认7天）未更新，会显示警告：
 ```
 ⚠️  警告: sh.600519 的本地数据已超过7天未更新 (最后更新: 2026-04-25)
 ```
 **解决方法**：打开通达信软件，执行"盘后数据下载"。
 
-### Q9: 如何验证本地数据的准确性？
+### Q10: 如何验证本地数据的准确性？
 **答**：使用测试工具进行验证：
 ```bash
 # 测试单只股票
@@ -554,7 +681,7 @@ python backtest/test_performance.py
 平均差异: 0.00%
 ```
 
-### Q10: 回测引擎的资金计算是如何处理的？⭐⭐⭐⭐⭐ 【NEWEST】
+### Q11: 回测引擎的资金计算是如何处理的？⭐⭐⭐⭐⭐ 【NEWEST】
 **答**：回测引擎正确处理了A股100股整数倍限制导致的资金闲置问题。
 
 **四个资金概念的关系**：
@@ -580,7 +707,7 @@ python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10 --
 - 资金利用率 < 100%（通常95%-99%）
 - 期末资金 ≈ 投入资金×(1+收益率) + 闲置资金
 
-### Q11: 如何启用DEBUG日志查看详细资金明细？⭐⭐⭐⭐⭐ 【NEWEST】
+### Q12: 如何启用DEBUG日志查看详细资金明细？⭐⭐⭐⭐⭐ 【NEWEST】
 **答**：有两种方式：
 
 **方式1：使用 --debug 参数（推荐）**
@@ -600,7 +727,7 @@ python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10 --
 - --debug参数仅影响控制台输出，不影响日志文件
 - DEBUG模式会输出更多信息，可能略微降低执行速度（影响很小）
 
-### Q12: 回测引擎的交易周期是如何衔接的？⭐⭐⭐⭐⭐ 【NEWEST】
+### Q13: 回测引擎的交易周期是如何衔接的？⭐⭐⭐⭐⭐ 【NEWEST】
 **答**：回测引擎采用"卖出日 = 下一周期选股日"的无缝衔接机制。
 
 **时间线示例**（hold_days = 3）：
@@ -633,7 +760,7 @@ python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10
 - 交易周期连续，无空档期
 - 资金利用率高，收益率准确
 
-### Q13: 下一步应该做什么？
+### Q14: 下一步应该做什么？
 **答**：建议按以下顺序进行：
 1. **短期验证**：运行1个月回测（2026-04-01至2026-04-30），验证新评分系统效果
 2. **参数调优**：根据回测结果调整评分阈值、持仓天数等参数
@@ -644,8 +771,27 @@ python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-10
 
 ## 🚀 **立即行动建议**
 
-### 选项A：快速验证新评分系统（推荐）⭐
+### 选项A：快速验证新版换手率评分系统（推荐）⭐⭐⭐⭐⭐ 【NEWEST】
 ```bash
+# 1. 测试新版换手率评分规则
+python tests/test_new_turnover_rules.py
+python tests/verify_turnover_scoring.py
+
+# 2. 生成股票池
+python backtest/generate_stockpool.py --start-date 2026-06-01 --end-date 2026-06-02
+
+# 3. 对所有股票池进行评分（自动应用新换手率评分规则）
+python backtest/score_stockpool.py --start-date 2026-06-01 --end-date 2026-06-02
+
+# 4. 查看评分结果
+python backtest/view_scored_results.py --date 2026-06-02
+
+# 5. 运行回测
+python backtest/run_backtest.py --start-date 2026-06-01 --end-date 2026-06-02
+```
+
+### 选项B：快速验证新评分系统（原有100分系统）⭐
+```
 # 1. 生成1个月的股票池
 python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04-30
 
@@ -659,7 +805,7 @@ python backtest/run_backtest.py --start-date 2026-04-01 --end-date 2026-04-30
 # 回测报告会保存在 data/ 目录下
 ```
 
-### 选项B：先验证数据源一致性（首次使用推荐）⭐⭐⭐⭐⭐ 【NEWEST】
+### 选项C：先验证数据源一致性（首次使用推荐）⭐⭐⭐⭐⭐ 【NEWEST】
 ```bash
 # 1. 测试单只股票的数据一致性
 python backtest/test_data_source.py --code 600519 --market sh
@@ -672,7 +818,7 @@ python backtest/test_performance.py
 python backtest/score_stockpool.py --date 2026-01-13
 ```
 
-### 选项C：先手动审查选股质量
+### 选项D：先手动审查选股质量
 ```bash
 # 查看几个典型日期的选股结果
 python backtest/view_scored_results.py --date 2026-04-13
@@ -680,7 +826,7 @@ python backtest/view_scored_results.py --date 2026-04-16
 python backtest/view_scored_results.py --date 2026-04-24
 ```
 
-### 选项D：调整参数后再测试
+### 选项E：调整参数后再测试
 ```bash
 # 1. 修改 config.yaml 中的参数
 # 2. 重新生成股票池
@@ -696,6 +842,8 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 - [x] ✅ 评分工具性能优化 - 切换到本地数据源（2026-05-04完成）
 - [x] ✅ 回测引擎资金计算Bug修复 - 正确处理闲置资金（2026-05-05完成）⭐NEWEST
 - [x] ✅ 回测引擎交易周期跳转逻辑修复 - 实现资金无缝衔接（2026-05-05完成）⭐NEWEST
+- [x] ✅ 换手率评分规则优化 - 新版双重条件评分系统（2026-06-02完成）⭐NEWEST
+- [x] ✅ K线数据获取函数增强 - 支持可配置的最小数据长度（2026-06-02完成）⭐NEWEST
 - [ ] 运行1个月回测，验证新评分系统效果
 - [ ] 分析回测结果，评估胜率、收益率、最大回撤
 - [ ] 根据结果调整评分阈值和持仓天数
@@ -728,6 +876,8 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 8. **正确处理闲置资金至关重要**：回测引擎必须区分期初资金、投入资金、闲置资金和期末资金 ⭐⭐⭐⭐⭐ 【NEWEST】
 9. **灵活的日志控制提升调试效率**：通过--debug参数按需启用详细日志，平衡简洁性和可观测性 ⭐⭐⭐⭐⭐ 【NEWEST】
 10. **交易周期无缝衔接提高资金效率**：卖出日应同时作为下一周期的选股日，避免资金闲置 ⭐⭐⭐⭐⭐ 【NEWEST】
+11. **双重条件评分提升质量**：换手率评分同时要求每日稳定性和累计合理性，有效排除极端波动股票 ⭐⭐⭐⭐⭐ 【NEWEST - 2026-06-02】
+12. **可配置的最小数据长度**：K线获取函数支持 `min_data_length` 参数，解决历史日期截断导致的数据不足问题 ⭐⭐⭐⭐⭐ 【NEWEST - 2026-06-02】
 
 ### 需要避免的陷阱
 1. **评分阈值要与评分系统匹配**：旧版6.5分制不能用60分阈值
@@ -739,6 +889,7 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 7. **本地数据需定期更新**：过期的本地数据会导致评分不准确 ⚠️ 【重要提醒】
 8. **严禁将期初资金等同于投入资金**：必须考虑100股整数倍限制导致的资金闲置 ⚠️ 【重要教训 - 2026-05-05修复】
 9. **严禁在卖出后跳过交易日才选股**：卖出日必须同时作为下一周期的选股日 ⚠️ 【重要教训 - 2026-05-05修复】
+10. **换手率评分需注意边界条件**：恰好等于阈值时应按更高档位计分，确保逻辑一致性 ⚠️ 【重要提醒 - 2026-06-02】
 
 ### 性能优化最佳实践 ⭐⭐⭐⭐⭐ 【NEWEST】
 1. **优先使用本地数据源**：避免对每只股票发起独立的网络API请求
@@ -761,13 +912,15 @@ python backtest/generate_stockpool.py --start-date 2026-04-01 --end-date 2026-04
 - [backtest/PHASE1_OPTIMIZATION_SUMMARY.md](file://e:\LearnPY\Projects\StockBot\backtest\PHASE1_OPTIMIZATION_SUMMARY.md) - 详细总结
 
 ### 核心代码文件
-- [local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py) - 数据源切换逻辑（_get_historical_klines等函数）
-- [backtest/score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py) - 评分工具主程序
+- [local/utils.py](file://e:\LearnPY\Projects\StockBot\local\utils.py) - 技术指标计算（✅ 新增新版换手率评分规则 + K线获取函数增强）⭐⭐⭐⭐⭐ 【NEWEST - 2026-06-02】
+- [backtest/score_stockpool.py](file://e:\LearnPY\Projects\StockBot\backtest\score_stockpool.py) - 评分工具主程序（✅ 已集成100分评分系统 + 实时进度展示）⭐NEW
 - [backtest/backtest_engine.py](file://e:\LearnPY\Projects\StockBot\backtest\backtest_engine.py) - 回测引擎（✅ 已修复资金计算bug + 交易周期跳转逻辑）⭐NEWEST
 - [backtest/run_backtest.py](file://e:\LearnPY\Projects\StockBot\backtest\run_backtest.py) - 回测入口（✅ 已添加--debug参数）⭐NEWEST
 - [config.yaml](file://e:\LearnPY\Projects\StockBot\config.yaml) - 全局配置文件
 
 ### 测试工具
+- [tests/test_new_turnover_rules.py](file://e:\LearnPY\Projects\StockBot\tests\test_new_turnover_rules.py) - 新版换手率评分规则测试工具 ⭐⭐⭐⭐⭐ 【NEWEST - 2026-06-02】
+- [tests/verify_turnover_scoring.py](file://e:\LearnPY\Projects\StockBot\tests\verify_turnover_scoring.py) - 换手率评分详细验证工具 ⭐⭐⭐⭐⭐ 【NEWEST - 2026-06-02】
 - [backtest/test_data_source.py](file://e:\LearnPY\Projects\StockBot\backtest\test_data_source.py) - 数据一致性测试工具
 - [backtest/test_performance.py](file://e:\LearnPY\Projects\StockBot\backtest\test_performance.py) - 性能对比测试工具
 

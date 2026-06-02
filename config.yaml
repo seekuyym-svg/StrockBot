@@ -241,15 +241,15 @@ backtest:
   
   # === 第一阶段粗筛参数配置（2026-05-03优化）===
   # 涨跌幅过滤区间（%）
-  min_price_change_pct: -5.0    # 最小允许涨跌幅（收紧：从-10%改为-5%）
-  max_price_change_pct: 25.0    # 最大允许涨跌幅（收紧：从+30%改为+25%）
+  min_price_change_pct: 0.0    # 最小允许涨跌幅（收紧：从-10%改为-5%）
+  max_price_change_pct: 20.0    # 最大允许涨跌幅（收紧：从+30%改为+25%）
   
   # 成交量放大倍数范围
-  min_volume_ratio: 1.3         # 最小量比（提高：从1.1x改为1.3x，过滤温和放量）
-  max_volume_ratio: 8.0         # 最大量比（保持不变）
+  min_volume_ratio: 1.1         # 最小量比（提高：从1.1x改为1.3x，过滤温和放量）
+  max_volume_ratio: 5.0         # 最大量比（8.0x降至5.0x）
   
   # === 第二阶段评分配置 ===
-  min_score: 70                 # 最低评分阈值（满分100分，建议设置为60-70分）
+  min_score: 60                 # 最低评分阈值（满分100分，建议设置为60-70分）
   max_score: 100                # 最高评分阈值（满分100分）
   max_stocks_per_cycle: 10      # 每个周期最多选10只股票
   min_stocks_per_cycle: 3       # 最少选3只（保证分散）
@@ -260,5 +260,5 @@ backtest:
   max_data_age_days: 7          # 数据最大允许年龄（交易日），超过则警告
   
   # 综合评分最小值（兼容旧配置）
-  backtest_minscore: 70         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score
+  backtest_minscore: 60         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score
        

@@ -439,9 +439,9 @@ def main():
                 yaml_config = yaml.safe_load(f)
                 backtest_config = yaml_config.get('backtest', {})
                 
-                # 配置文件中的默认值
-                default_start_date = backtest_config.get('start_date', '2024-01-01')
-                default_end_date = backtest_config.get('end_date', '2026-01-01')
+                # 配置文件中的默认值（仅当命令行未指定时使用）
+                default_start_date = args.start_date if args.start_date else backtest_config.get('start_date', '2026-01-01')
+                default_end_date = args.end_date if args.end_date else backtest_config.get('end_date', '2026-01-01')
                 default_hold_days = backtest_config.get('hold_days', 3)
                 default_volume_period = backtest_config.get('volume_period', 3)
                 
@@ -462,7 +462,7 @@ def main():
             tdx_dir_from_config = yaml_config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")
         else:
             logger.warning("[WARN] 配置文件不存在，使用硬编码默认值")
-            default_start_date = '2024-01-01'
+            default_start_date = '2026-01-01'
             default_end_date = '2026-01-01'
             default_hold_days = 3
             default_volume_period = 3
@@ -473,7 +473,7 @@ def main():
             tdx_dir_from_config = r"D:\Install\zd_zxzq_gm"
     except Exception as e:
         logger.warning(f"[WARN] 读取配置文件失败: {e}，使用硬编码默认值")
-        default_start_date = '2024-01-01'
+        default_start_date = '2026-01-01'
         default_end_date = '2026-01-01'
         default_hold_days = 3
         default_volume_period = 3

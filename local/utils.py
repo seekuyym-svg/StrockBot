@@ -58,6 +58,146 @@ def get_stock_name(symbol: str) -> str:
         return symbol
 
 
+def get_circulating_shares_from_tencent(market: str, code: str) -> Optional[float]:
+    """
+    从腾讯财经API获取流通股本
+    
+    Args:
+        market: 市场代码 ('sh' 或 'sz')
+        code: 股票代码 (如 '002706')
+        
+    Returns:
+        float: 流通股本（股），失败返回None
+    """
+    try:
+        # 构建腾讯财经实时行情URL
+        url = f"http://qt.gtimg.cn/q={market}{code}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
+        response.encoding = 'gbk'
+        
+        content = response.text
+        
+        # 解析数据
+        if '~' in content and '=' in content:
+            import re
+            match = re.search(r'="([^"]+)"', content)
+            if match:
+                data_str = match.group(1)
+                parts_data = data_str.split('~')
+                
+                # 尝试从多个可能的字段位置获取流通股本
+                circulating_shares = 0
+                
+                # 字段[72]和[76]通常是流通股本（股数）
+                for idx in [72, 76]:
+                    if len(parts_data) > idx and parts_data[idx]:
+                        try:
+                            shares = float(parts_data[idx])
+                            if shares > 0:
+                                circulating_shares = shares
+                                break
+                        except ValueError:
+                            continue
+                
+                if circulating_shares > 0:
+                    return circulating_shares
+        
+        return None
+        
+    except Exception as e:
+        print(f"⚠️  获取 {market}{code} 流通股本失败: {e}")
+        return None
+
+
+def calculate_cumulative_turnover_score(market: str, code: str, analysis_date: str = None) -> int:
+    """
+    计算3天累计换手率评分（新版规则）
+    
+    评分规则：
+    - 5分：每日换手率均在 5%~15% 且 3日累计 15%~45%（优质活跃度）
+    - 3分：每日换手率均在 3%~20% 且 3日累计 12%~50%（一般活跃度）
+    - 0分：任一日换手率 >25% 或 <2%，或其他情况（不活跃或异常）
+    
+    注意：去掉了负分机制，最低得分为0分
+    
+    Args:
+        market: 市场代码 ('sh' 或 'sz')
+        code: 股票代码
+        analysis_date: 分析日期 (格式: YYYY-MM-DD)，用于回测场景。None表示使用最新数据
+        
+    Returns:
+        int: 评分 (0、3或5分)，API调用失败或数据不足时返回0并输出警告
+    """
+    try:
+        # 1. 获取流通股本
+        circulating_shares = get_circulating_shares_from_tencent(market, code)
+        
+        if circulating_shares is None or circulating_shares <= 0:
+            print(f"⚠️  {market}{code} 无法获取流通股本，换手率评分计0分")
+            return 0
+        
+        # 2. 从配置文件读取volume_period作为最小数据长度要求
+        try:
+            import yaml
+            from pathlib import Path
+            
+            project_root = Path(__file__).parent.parent
+            config_path = project_root / 'config.yaml'
+            
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            volume_period = config.get('backtest', {}).get('volume_period', 3)
+        except Exception as e:
+            print(f"⚠️  读取配置文件失败: {e}，使用默认值3")
+            volume_period = 3
+        
+        # 3. 获取最近N个交易日的K线数据（N = volume_period）
+        df = _get_historical_klines(market, code, days=10, end_date=analysis_date, min_data_length=volume_period)
+        
+        if df.empty or len(df) < volume_period:
+            print(f"⚠️  {market}{code} K线数据不足（仅{len(df)}条），换手率评分计0分")
+            return 0
+        
+        # 取最近volume_period天
+        last_n_days = df.iloc[-volume_period:]
+        
+        # 4. 计算每日换手率列表
+        daily_turnovers = []
+        for _, row in last_n_days.iterrows():
+            volume_lots = row['volume']  # 手
+            volume_shares = volume_lots * 100  # 转换为股
+            turnover_rate = (volume_shares / circulating_shares) * 100
+            daily_turnovers.append(turnover_rate)
+        
+        cumulative_turnover = sum(daily_turnovers)
+        
+        # 5. 根据新规则评分
+        # 检查排除条件：任一日换手率 >25% 或 <2%
+        if any(t > 25 or t < 2 for t in daily_turnovers):
+            return 0
+        
+        # 判断5分条件：每日均在 5%~15% 且 累计 15%~45%
+        if all(5 <= t <= 15 for t in daily_turnovers) and 15 <= cumulative_turnover <= 45:
+            return 5
+        
+        # 判断3分条件：每日均在 3%~20% 且 累计 12%~50%
+        if all(3 <= t <= 20 for t in daily_turnovers) and 12 <= cumulative_turnover <= 50:
+            return 3
+        
+        # 其他情况
+        return 0
+        
+    except Exception as e:
+        print(f"⚠️  计算 {market}{code} 换手率评分失败: {e}，计0分")
+        return 0
+
+
 def calculate_trend_score(market: str, code: str, days: int = 300) -> Optional[float]:
     """
     计算股票综合趋势评分（-5到+5分）
@@ -137,7 +277,7 @@ def calculate_trend_score(market: str, code: str, days: int = 300) -> Optional[f
 
 
 def _get_historical_klines(market: str, code: str, days: int = 300, 
-                           end_date: str = None) -> pd.DataFrame:
+                           end_date: str = None, min_data_length: int = 60) -> pd.DataFrame:
     """
     获取历史K线数据（支持本地数据和网络API双模式）
     
@@ -146,6 +286,7 @@ def _get_historical_klines(market: str, code: str, days: int = 300,
         code: 股票代码
         days: 获取天数
         end_date: 截止日期 (格式: YYYY-MM-DD)，如果提供则只返回此日期之前的数据
+        min_data_length: 最小数据长度要求，默认60条
         
     Returns:
         DataFrame包含日期、开盘、收盘、最高、最低、成交量等字段（前复权）
@@ -183,15 +324,15 @@ def _get_historical_klines(market: str, code: str, days: int = 300,
     
     # 根据配置选择数据源
     if use_local:
-        return _get_klines_from_local(market, code, days, tdx_dir, consistency_check, end_date)
+        return _get_klines_from_local(market, code, days, tdx_dir, consistency_check, end_date, min_data_length)
     else:
         # 直接使用腾讯财经API，不尝试加载 mootdx
-        return _get_klines_from_tencent(market, code, days, end_date)
+        return _get_klines_from_tencent(market, code, days, end_date, min_data_length)
 
 
 def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str, 
                            consistency_check: bool = False,
-                           end_date: str = None) -> pd.DataFrame:
+                           end_date: str = None, min_data_length: int = 60) -> pd.DataFrame:
     """
     从本地通达信数据获取K线（前复权）
     
@@ -201,6 +342,8 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         days: 获取天数
         tdx_dir: 通达信安装目录
         consistency_check: 是否进行数据一致性验证
+        end_date: 截止日期
+        min_data_length: 最小数据长度要求，默认60条
         
     Returns:
         DataFrame包含前复权K线数据
@@ -208,7 +351,7 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
     # 首先检查 tdx_dir 是否存在，如果不存在直接降级到网络API
     import os
     if not tdx_dir or not os.path.exists(tdx_dir):
-        return _get_klines_from_tencent(market, code, days, end_date)
+        return _get_klines_from_tencent(market, code, days, end_date, min_data_length)
     
     try:
         # 动态导入 mootdx，如果模块不存在则抛出异常并降级
@@ -257,7 +400,7 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         
         if raw_data is None or raw_data.empty:
             # 降级到网络API
-            return _get_klines_from_tencent(market, code, days, end_date)
+            return _get_klines_from_tencent(market, code, days, end_date, min_data_length)
         
         # 4. 转换为前复权数据
         # 注意：通达信本地数据文件(.day)本身已经是前复权数据
@@ -284,7 +427,7 @@ def _get_klines_from_local(market: str, code: str, days: int, tdx_dir: str,
         if end_date:
             end_dt = pd.to_datetime(end_date)
             df = df[df.index <= end_dt]
-            if len(df) < 60:  # 数据不足则返回空
+            if len(df) < min_data_length:  # 使用可配置的最小长度
                 return pd.DataFrame()
         
         # 9. 数据一致性验证（可选）
@@ -367,7 +510,7 @@ def _verify_data_consistency(full_code: str, local_df: pd.DataFrame, tdx_dir: st
         pass
 
 
-def _get_klines_from_tencent(market: str, code: str, days: int, end_date: str = None) -> pd.DataFrame:
+def _get_klines_from_tencent(market: str, code: str, days: int, end_date: str = None, min_data_length: int = 60) -> pd.DataFrame:
     """
     从腾讯财经API获取历史K线数据（降级方案）
     
@@ -376,6 +519,7 @@ def _get_klines_from_tencent(market: str, code: str, days: int, end_date: str = 
         code: 股票代码
         days: 获取天数
         end_date: 截止日期 (格式: YYYY-MM-DD)，如果提供则只返回此日期之前的数据
+        min_data_length: 最小数据长度要求，默认60条
         
     Returns:
         DataFrame包含日期、开盘、收盘、最高、最低、成交量等字段
@@ -430,7 +574,7 @@ def _get_klines_from_tencent(market: str, code: str, days: int, end_date: str = 
                     if end_date:
                         end_dt = pd.to_datetime(end_date)
                         df = df[df.index <= end_dt]
-                        if len(df) < 60:  # 数据不足则返回空
+                        if len(df) < min_data_length:  # 使用可配置的最小长度
                             return pd.DataFrame()
                     
                     return df
@@ -1048,14 +1192,9 @@ def calculate_trend_score_v2(market: str, code: str, days: int = 300,
         elif vol_ratio >= 1.0:
             total_score += 2   # 正常水平
         
-        # 1.3 换手率活跃度（5分）- 简化版，用成交量绝对值替代
-        # 注意：真实场景需要流通股本数据
-        if vol_ratio > 2.0:
-            total_score += 5   # 高活跃度
-        elif vol_ratio > 1.5:
-            total_score += 3   # 中等活跃度
-        elif vol_ratio > 1.0:
-            total_score += 1   # 低活跃度
+        # 1.3 换手率活跃度（-5到+5分）- 基于真实换手率计算
+        turnover_score = calculate_cumulative_turnover_score(market, code, end_date)
+        total_score += turnover_score
         
         # ========== 2. 趋势因子（25分）==========
         ma5 = df['MA5'].iloc[-1]

@@ -558,19 +558,19 @@ class NewsMonitorScheduler:
     
     def _get_stock_fundamentals(self, symbol: str):
         """
-        获取股票基本面指标（PE-TTM、换手率等）- 使用腾讯财经API
+        获取股票基本面指标（PE-TTM、换手率、最高价、收盘价等）- 使用腾讯财经API
         
         Args:
             symbol: 股票代码 (如 sz.002706 或 sh.600519)
             
         Returns:
-            dict: 包含 pe_ttm 和 turnover_rate 的字典，获取失败返回None
+            dict: 包含 pe_ttm、turnover_rate、high_price、close_price 的字典，获取失败返回None
         """
         try:
             # 解析股票代码
             parts = symbol.split('.')
             if len(parts) != 2:
-                return {'pe_ttm': None, 'turnover_rate': None}
+                return {'pe_ttm': None, 'turnover_rate': None, 'high_price': None, 'close_price': None}
             
             market = parts[0].upper()  # SZ 或 SH
             code = parts[1]
@@ -594,7 +594,12 @@ class NewsMonitorScheduler:
                     data_str = match.group(1)
                     parts_data = data_str.split('~')
                     
-                    result = {'pe_ttm': None, 'turnover_rate': None}
+                    result = {
+                        'pe_ttm': None, 
+                        'turnover_rate': None,
+                        'high_price': None,
+                        'close_price': None
+                    }
                     
                     if len(parts_data) >= 40:
                         # parts[39] 是 PE-TTM（滚动市盈率）
@@ -616,14 +621,32 @@ class NewsMonitorScheduler:
                                     result['turnover_rate'] = round(turnover_rate, 2)
                             except ValueError:
                                 pass
+                        
+                        # parts[33] 是最高价
+                        if len(parts_data) > 33 and parts_data[33]:
+                            try:
+                                high_price = float(parts_data[33])
+                                if high_price > 0:
+                                    result['high_price'] = round(high_price, 2)
+                            except ValueError:
+                                pass
+                        
+                        # parts[3] 是当前价格（即收盘价）
+                        if len(parts_data) > 3 and parts_data[3]:
+                            try:
+                                close_price = float(parts_data[3])
+                                if close_price > 0:
+                                    result['close_price'] = round(close_price, 2)
+                            except ValueError:
+                                pass
                     
                     return result
             
-            return {'pe_ttm': None, 'turnover_rate': None}
+            return {'pe_ttm': None, 'turnover_rate': None, 'high_price': None, 'close_price': None}
             
         except Exception as e:
             logger.debug(f"获取 {symbol} 基本面指标失败: {e}")
-            return {'pe_ttm': None, 'turnover_rate': None}
+            return {'pe_ttm': None, 'turnover_rate': None, 'high_price': None, 'close_price': None}
 
     def _send_stockpool_notification(self):
         """
@@ -706,10 +729,12 @@ class NewsMonitorScheduler:
                 code_without_prefix = code.split('.')[1] if '.' in code else code
                 name = get_stock_name(code_without_prefix)
                 
-                # 获取基本面指标（PE-TTM、换手率）
+                # 获取基本面指标（PE-TTM、换手率、最高价、收盘价）
                 fundamentals = self._get_stock_fundamentals(code)
                 pe_ttm = fundamentals.get('pe_ttm')
                 turnover_rate = fundamentals.get('turnover_rate')
+                high_price = fundamentals.get('high_price')
+                close_price = fundamentals.get('close_price')
                 
                 stock_details.append({
                     'code': code_without_prefix,
@@ -717,7 +742,9 @@ class NewsMonitorScheduler:
                     'name': name,
                     'score': score,
                     'pe_ttm': pe_ttm,
-                    'turnover_rate': turnover_rate
+                    'turnover_rate': turnover_rate,
+                    'high_price': high_price,
+                    'close_price': close_price
                 })
                 
                 # 避免请求过快
@@ -734,11 +761,26 @@ class NewsMonitorScheduler:
                 pe_str = f"{stock['pe_ttm']:.2f}" if stock['pe_ttm'] is not None else "N/A"
                 turnover_str = f"{stock['turnover_rate']:.2f}%" if stock['turnover_rate'] is not None else "N/A"
                 
+                # 计算当日回撤
+                intraday_drawdown = None
+                if stock['high_price'] is not None and stock['close_price'] is not None and stock['close_price'] > 0:
+                    intraday_drawdown = (stock['high_price'] - stock['close_price']) / stock['close_price'] * 100
+                
                 content += f"**{i}. {stock['name']} ({stock['code']})**\n"
                 content += f"   评分: {stock['score']:.1f}分\n"
                 content += f"   PE-TTM: {pe_str}\n"
-                content += f"   换手率: {turnover_str}\n\n"
-            
+                content += f"   换手率: {turnover_str}\n"
+                
+                # 如果当日回撤 >= 5%，显示回撤信息
+                if intraday_drawdown is not None and intraday_drawdown >= 5:
+                    drawdown_str = f"{intraday_drawdown:.2f}%"
+                    # 如果 >= 8%，使用红色标记
+                    if intraday_drawdown >= 8:
+                        content += f"   <font color='red'>当日回撤: -{drawdown_str}</font>\n"
+                    else:
+                        content += f"   当日回撤: -{drawdown_str}\n"
+                
+                content += f"\n"
             content += f"**━━━━━━━━━━━━━━━**\n"
             
             # 6. 发送飞书通知
