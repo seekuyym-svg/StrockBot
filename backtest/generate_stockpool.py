@@ -120,7 +120,7 @@ class StockPoolGenerator:
     
     def _load_hs300_data(self) -> Optional[pd.DataFrame]:
         """
-        加载本地沪深300数据（从 data/hs300_eastmoney.csv）
+        加载本地沪深300数据（从 data/index_hs300.csv）
         
         Returns:
             带日期索引的DataFrame（含 open/close/high/low/volume），失败返回 None
@@ -128,7 +128,7 @@ class StockPoolGenerator:
         if self.hs300_cache is not None:
             return self.hs300_cache
         
-        hs300_file = self.data_dir / "hs300_eastmoney.csv"
+        hs300_file = self.data_dir / "index_hs300.csv"
         if not hs300_file.exists():
             logger.warning("[HS300] 本地沪深300数据文件不存在，跳过相对强度检查")
             self.hs300_cache = None

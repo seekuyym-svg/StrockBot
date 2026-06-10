@@ -1123,7 +1123,7 @@ def _get_hs300_period_return(end_date: str, period: int = 5) -> Optional[float]:
     """
     获取沪深300在指定日期前period天的涨跌幅
     
-    优先使用本地数据文件（data/hs300_eastmoney.csv），
+    优先使用本地数据文件（data/index_hs300.csv），
     数据不足时通过腾讯财经API补充获取
     
     Args:
@@ -1135,7 +1135,7 @@ def _get_hs300_period_return(end_date: str, period: int = 5) -> Optional[float]:
     """
     # 1. 尝试从本地数据文件读取
     try:
-        hs300_file = Path(__file__).parent.parent / "data" / "hs300_eastmoney.csv"
+        hs300_file = Path(__file__).parent.parent / "data" / "index_hs300.csv"
         if hs300_file.exists():
             df = pd.read_csv(hs300_file, parse_dates=['date'])
             df = df.set_index('date').sort_index()

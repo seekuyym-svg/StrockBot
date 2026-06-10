@@ -591,7 +591,7 @@ class BacktestEngine:
         获取沪深300指数数据作为基准
         
         优先级：
-        1. 本地CSV文件（data/hs300_eastmoney.csv）- 最完整的历史数据
+        1. 本地CSV文件（data/index_hs300.csv）- 最完整的历史数据
         2. 腾讯财经API - 实时数据（最多320天）
         
         Returns:
@@ -650,7 +650,7 @@ class BacktestEngine:
         
         # 使用项目根目录的 data 文件夹
         project_root = Path(__file__).parent.parent
-        csv_file = project_root / "data" / "hs300_eastmoney.csv"
+        csv_file = project_root / "data" / "index_hs300.csv"
         
         if not csv_file.exists():
             raise FileNotFoundError(f"CSV文件不存在: {csv_file}")

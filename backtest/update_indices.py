@@ -13,11 +13,11 @@
       indices:
         - name: "沪深300"
           code: "1.000300"
-          data_file: "data/hs300_eastmoney.csv"
+          data_file: "data/index_hs300.csv"
           enabled: true
         - name: "科创综指"
           code: "1.000680"
-          data_file: "data/kc_index.csv"
+          data_file: "data/index_kc.csv"
           enabled: true
 """
 

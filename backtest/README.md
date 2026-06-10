@@ -166,12 +166,12 @@ python backtest/update_index_data.py --name kc_index --secid 1.000680 --start 20
 - [`backtest_engine.py`](backtest_engine.py)
 - [`update_hs300_data.py`](update_hs300_data.py)
 
-**问题**：原代码使用相对路径 `Path("data/hs300_eastmoney.csv")`，导致从当前工作目录查找文件
+**问题**：原代码使用相对路径 `Path("data/index_hs300.csv")`，导致从当前工作目录查找文件
 
 **修复**：改为使用项目根目录的绝对路径
 ```python
 project_root = Path(__file__).parent.parent
-csv_file = project_root / "data" / "hs300_eastmoney.csv"
+csv_file = project_root / "data" / "index_hs300.csv"
 ```
 
 **优势**：无论从哪个目录运行脚本，都能正确定位到数据文件

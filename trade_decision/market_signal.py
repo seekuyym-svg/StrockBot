@@ -6,8 +6,8 @@
 判断当前大盘是否适合买入，输出清晰明确的信号。
 
 参考指数（可配置，默认双指数联合）：
-  - 沪深300（大蓝筹环境，使用本地 data/hs300_eastmoney.csv）
-  - 科创综指（科技成长环境，使用本地 data/kc_index.csv）
+  - 沪深300（大蓝筹环境，使用本地 data/index_hs300.csv）
+  - 科创综指（科技成长环境，使用本地 data/index_kc.csv）
 全市场成交额：通过东方财富API获取（上证+深证）
 
 信号逻辑（双指数共识模式）：
@@ -42,11 +42,11 @@
     indices:                    # 参考指数列表
       - name: "沪深300"
         code: "1.000300"
-        data_file: "data/hs300_eastmoney.csv"
+        data_file: "data/index_hs300.csv"
         enabled: true
       - name: "科创综指"
         code: "1.000680"
-        data_file: "data/kc_index.csv"
+        data_file: "data/index_kc.csv"
         enabled: true
 """
 
@@ -85,7 +85,7 @@ def load_index_data(data_file: str) -> Optional[pd.DataFrame]:
     从本地CSV加载指数数据
 
     Args:
-        data_file: 相对于项目根目录的路径，如 "data/hs300_eastmoney.csv"
+        data_file: 相对于项目根目录的路径，如 "data/index_hs300.csv"
 
     Returns:
         DataFrame 含 date(索引), close/open/high/low/volume，或 None
