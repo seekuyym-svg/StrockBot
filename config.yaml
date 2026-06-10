@@ -241,18 +241,32 @@ backtest:
   
   # === 第一阶段粗筛参数配置（2026-05-03优化）===
   # 涨跌幅过滤区间（%）
-  min_price_change_pct: 0.0    # 最小允许涨跌幅（收紧：从-10%改为-5%）
+  min_price_change_pct: 0.0     # 最小允许涨跌幅（收紧：从-10%改为-5%）
   max_price_change_pct: 20.0    # 最大允许涨跌幅（收紧：从+30%改为+25%）
+  # 放量期内最大允许回撤（%），负值表示允许下跌的幅度
+  # 目的：排除"深V骗线"——整体上涨但中间暴跌的股票
+  max_retracement_pct: -5.0    # 放量期内最低收盘 >= 启动价×(1-5%)，默认-5%
+  # 日内冲高回落最大允许幅度（%），超过此值视为出货形态
+  # 检查放量期内每天：(最高价 - 收盘价) / 最高价 * 100，超过则淘汰
+  max_intraday_pullback_pct: 6.0  # 放宽：从5%调整为8%，放过小幅冲高回落
+  # 相对大盘的最小超额收益（%），负值表示允许略弱于大盘
+  # 目的：确保选出的股票不显著弱于大盘
+  min_relative_strength: 0.0    # 放宽：从0.0调回-2%，允许略弱于大盘
+  # 日波动率上限（%），超过此值视为高风险股淘汰
+  # 用最近20个交易日计算：日收益率标准差 * 100
+  # 参考：1-2%正常，2-3%偏高，>3%高波动
+  max_volatility_pct: 3.5       # 放宽：从3.0%调至4.5%，放过中等波动股
   
   # 成交量放大倍数范围
   min_volume_ratio: 1.1         # 最小量比（提高：从1.1x改为1.3x，过滤温和放量）
-  max_volume_ratio: 5.0         # 最大量比（8.0x降至5.0x）
+  max_volume_ratio: 6.0         # 最大量比（8.0x降至5.0x）
   
   # === 第二阶段评分配置 ===
   min_score: 60                 # 最低评分阈值（满分100分，建议设置为60-70分）
   max_score: 100                # 最高评分阈值（满分100分）
   max_stocks_per_cycle: 10      # 每个周期最多选10只股票
   min_stocks_per_cycle: 3       # 最少选3只（保证分散）
+  max_stocks_per_industry: 3    # 每个行业最多选几只（行业分散，降低系统性风险）
   
   # === 数据源配置（2026-05-04新增）===
   use_local_data: true          # 是否使用本地通达信数据（服务器环境设置为false，使用网络API）
@@ -261,4 +275,38 @@ backtest:
   
   # 综合评分最小值（兼容旧配置）
   backtest_minscore: 60         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score
+
+# === 大盘环境信号配置 ===
+# 用于 trade_decision/market_signal.py，判断是否允许买入
+trade_decision:
+  ma_short: 20                  # 短期均线（天）
+  ma_long: 60                   # 长期均线（天）
+  min_market_volume: 25000      # 最小全市场成交额（亿元）
+
+  # 参考指数列表（双指数联合信号使用）
+  # 每个指数独立计算 close>MA20 和 MA20>MA60 两个条件
+  indices:
+    - name: "沪深300"
+      code: "1.000300"
+      data_file: "data/hs300_eastmoney.csv"
+      enabled: true
+    - name: "科创综指"
+      code: "1.000680"
+      data_file: "data/kc_index.csv"
+      enabled: true
+
+  # 信号通过模式
+  #   "dual_consensus" — 每个指数各自都健康（close>MA20 AND MA20>MA60）且成交额达标
+  #   "strict" — 全部 (指数数量*2 + 1) 个条件通过
+  #   "flexible" — 至少 N 个条件通过（见 flexible_pass_count）
+  pass_mode: "dual_consensus"
+  flexible_pass_count: 3  # flexible 模式下至少通过几个条件
+
+# === 横盘突破选股配置（2026-06-10新增）===
+# 用于 backtest/generate_breakout.py
+breakout:
+  consolidation_days: 60         # 横盘天数
+  consolidation_range: 15.0      # 横盘波动上限（%）
+  vol_ratio_threshold: 1.5       # 放量倍数
+  pullback_threshold: 5.0        # 冲高回落上限（%）
        

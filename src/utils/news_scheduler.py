@@ -9,6 +9,7 @@ import pandas as pd
 from loguru import logger
 import requests
 import re
+import json
 import akshare as ak
 
 # 添加项目根目录到路径
@@ -481,7 +482,10 @@ class NewsMonitorScheduler:
             
             logger.info(f"\n✅ 资讯获取完成，共 {total_count} 条")
             
-            # 先发送选股结果通知（优先级更高）
+            # 发送大盘环境信号通知
+            self._send_market_signal_notification()
+            
+            # 发送选股结果通知
             self._send_stockpool_notification()
             
             # 再发送资讯日报通知
@@ -647,6 +651,131 @@ class NewsMonitorScheduler:
         except Exception as e:
             logger.debug(f"获取 {symbol} 基本面指标失败: {e}")
             return {'pe_ttm': None, 'turnover_rate': None, 'high_price': None, 'close_price': None}
+
+    # ==================== 大盘环境信号推送 ====================
+
+    def _read_market_signal(self) -> dict:
+        """
+        读取当日大盘环境信号
+
+        从 data/signal_history.json 中获取最新一条记录（按日期），
+        若当日无记录则返回空字典。
+
+        Returns:
+            dict: 包含 passed / indices / reasons / market_volume 等字段，或无数据时返回 {}
+        """
+        signal_file = project_root / "data" / "signal_history.json"
+        if not signal_file.exists():
+            logger.info("ℹ️  signal_history.json 不存在，跳过信号推送")
+            return {}
+
+        try:
+            with open(signal_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if not content:
+                    return {}
+                history = json.loads(content)
+
+            if not isinstance(history, list) or not history:
+                return {}
+
+            # 取最新一条（按日期排序，取最后一条）
+            latest = max(history, key=lambda x: x.get('date', ''))
+            return latest
+
+        except Exception as e:
+            logger.warning(f"⚠️ 读取 signal_history.json 失败: {e}")
+            return {}
+
+    def _send_market_signal_notification(self):
+        """
+        发送大盘环境信号飞书通知
+
+        读取 signal_history.json 获取当日信号结果，
+        格式化为飞书卡片推送，包含各指数状态和成交额。
+        """
+        try:
+            signal = self._read_market_signal()
+            if not signal:
+                return
+
+            signal_date = signal.get('date', '未知')
+            passed = signal.get('passed', False)
+            mode = signal.get('pass_mode', 'dual_consensus')
+            market_volume = signal.get('market_volume')
+            volume_pass = signal.get('volume_pass', True)
+            reasons = signal.get('reasons', [])
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"📡 【大盘环境信号】已获取 - {signal_date}")
+            logger.info(f"{'=' * 60}")
+
+            # 构建信号内容
+            result_icon = "✅ 允许买入" if passed else "❌ 禁止买入"
+
+            content = f"**日期**: {signal_date}\n"
+            content += f"**结果**: {result_icon}\n"
+            content += f"**模式**: {mode}\n"
+
+            # 沪深市场成交额
+            if market_volume is not None:
+                vol_icon = "✅" if volume_pass else "❌"
+                content += f"**沪深市场成交额**: {market_volume:.0f}亿\n\n"
+
+            # 不通过原因
+            if reasons:
+                content += f"**📕 不通过原因**:\n"
+                for r in reasons:
+                    content += f"   • {r}\n"
+
+            # 发送飞书通知
+            notifier = get_feishu_notifier()
+            if not notifier.enabled:
+                logger.warning("⚠️ 飞书通知未启用，跳过大盘信号推送")
+                return
+
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            message = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "📡 大盘环境信号"},
+                        "template": "red" if not passed else "green"
+                    },
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+                        {"tag": "hr"},
+                        {"tag": "note", "elements": [
+                            {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
+                        ]}
+                    ]
+                }
+            }
+
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(
+                notifier.webhook_url,
+                headers=headers,
+                data=json.dumps(message, ensure_ascii=False).encode('utf-8'),
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('StatusCode') == 0 or result.get('code') == 0:
+                    logger.success(f"📱 大盘环境信号飞书通知发送成功")
+                else:
+                    logger.error(f"❌ 飞书API返回错误: {result.get('msg', '未知错误')}")
+            else:
+                logger.error(f"❌ 飞书通知发送失败，HTTP状态码: {response.status_code}")
+
+            logger.info("✅ 大盘环境信号通知完成\n")
+
+        except Exception as e:
+            logger.error(f"❌ 大盘环境信号通知异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _send_stockpool_notification(self):
         """

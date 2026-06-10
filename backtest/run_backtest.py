@@ -54,7 +54,7 @@ def main():
   python backtest/run_backtest.py --start-date 2024-01-01 --end-date 2024-01-10 --debug
 
 自定义参数:
-  python backtest/run_backtest.py --volume-period 5 --hold-days 3 --min-score 0.6
+  python backtest/run_backtest.py --volume-period 5 --hold-days 3
         """
     )
     
@@ -72,8 +72,6 @@ def main():
                        help='通达信安装目录，默认: D:\\Install\\zd_zxzq_gm')
     parser.add_argument('--output-dir', type=str, default=None,
                        help='输出目录，默认: 项目根目录/data')
-    parser.add_argument('--min-score', type=float, default=None,
-                       help='最小评分阈值（覆盖配置文件中的backtest.backtest_minscore）')
     parser.add_argument('--debug', action='store_true',
                        help='启用DEBUG日志级别，显示详细的资金明细和调试信息')
     
@@ -116,25 +114,19 @@ def main():
                 default_hold_days = backtest_config.get('hold_days', 3)
                 default_volume_period = backtest_config.get('volume_period', 5)
                 default_initial_capital = backtest_config.get('initial_capital', 1000000.0)
-                default_min_score = backtest_config.get('backtest_minscore', 0.5)
-                logger.info(f"[CONFIG] 从配置文件读取默认值: hold_days={default_hold_days}, volume_period={default_volume_period}, min_score={default_min_score}")
+                logger.info(f"[CONFIG] 从配置文件读取默认值: hold_days={default_hold_days}, volume_period={default_volume_period}")
             tdx_dir_from_config = yaml_config.get('TDX_DIR', r"D:\Install\zd_zxzq_gm")
         else:
             default_hold_days = 3
             default_volume_period = 5
             default_initial_capital = 1000000.0
-            default_min_score = 0.5
             tdx_dir_from_config = r"D:\Install\zd_zxzq_gm"
     except Exception as e:
         logger.warning(f"[WARN] 读取配置文件失败: {e}，使用硬编码默认值")
         default_hold_days = 3
         default_volume_period = 5
         default_initial_capital = 1000000.0
-        default_min_score = 0.5
         tdx_dir_from_config = r"D:\Install\zd_zxzq_gm"
-    
-    # 确定最小评分（命令行参数优先于配置文件）
-    min_score = args.min_score if args.min_score is not None else default_min_score
     
     # 构建配置（命令行参数优先，否则使用配置文件默认值）
     config = {
@@ -145,7 +137,6 @@ def main():
         'whitelist_file': args.whitelist,
         'tdx_dir': args.tdx_dir if args.tdx_dir != r"D:\Install\zd_zxzq_gm" else tdx_dir_from_config,
         'initial_capital': default_initial_capital,
-        'min_score': min_score
     }
     
     # 确定输出目录

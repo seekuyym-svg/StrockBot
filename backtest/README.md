@@ -109,28 +109,29 @@ python backtest/calc_backtest_rate.py --date 2026-04-20 --pooldate 20260420 --ca
 
 ---
 
-### 3. **沪深300数据增量更新**
-**文件**: [`update_hs300_data.py`](update_hs300_data.py)
+### 3. **指数数据增量更新（通用）**
+**文件**: [`update_index_data.py`](update_index_data.py) / [`update_indices.py`](update_indices.py)
 
-**优化内容**：从全量更新改为增量更新模式
+**优化内容**：支持任意东方财富指数增量更新，可批量一键更新所有参考指数
 
 **使用方式**：
 ```bash
-# 增量更新（自动从本地最新日期+1天到今天）
-python backtest/update_hs300_data.py
+# 一键更新所有参考指数（推荐，从config.yaml自动读取指数列表）
+python backtest/update_indices.py
 
-# 指定日期范围
-python backtest/update_hs300_data.py --start 2026-04-01 --end 2026-04-30
+# 更新指定指数
+python backtest/update_index_data.py --name kc_index --secid 1.000680
+python backtest/update_index_data.py --name hs300_eastmoney --secid 1.000300
 
-# 重新获取完整历史数据
-python backtest/update_hs300_data.py --start 2020-01-01
+# 全量重新获取
+python backtest/update_index_data.py --name kc_index --secid 1.000680 --start 2020-01-01
 ```
 
 **关键特性**：
-- ✅ 智能检测本地最新日期，只下载新增数据
-- ✅ 自动合并新旧数据并去重
-- ✅ 保留备份文件，确保数据安全
-- ✅ 大幅减少网络请求时间（从几分钟降至几秒）
+- ✅ 增量更新：自动检测本地最新日期，只下载缺失数据
+- ✅ 批量更新：一条命令更新所有配置的指数
+- ✅ 通用设计：支持任意东方财富指数（通过 --secid 指定）
+- ✅ 数据格式统一：所有指数CSV格式一致（date,open,close,high,low,volume）
 
 ---
 

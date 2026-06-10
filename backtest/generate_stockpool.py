@@ -15,7 +15,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Set
+from typing import Dict, List, Optional, Set
 import pandas as pd
 from loguru import logger
 
@@ -60,11 +60,16 @@ class StockPoolGenerator:
         self.max_price_change_pct = config.get('max_price_change_pct', 25.0)
         self.min_volume_ratio = config.get('min_volume_ratio', 1.3)
         self.max_volume_ratio = config.get('max_volume_ratio', 8.0)
+        self.max_retracement_pct = config.get('max_retracement_pct', -5.0)  # 放量期内最大回撤
+        self.max_intraday_pullback_pct = config.get('max_intraday_pullback_pct', 5.0)  # 日内冲高回落上限
+        self.min_relative_strength = config.get('min_relative_strength', -2.0)  # 相对大盘最小超额收益
+        self.max_volatility_pct = config.get('max_volatility_pct', 3.0)  # 最大允许日波动率（%）
         
         # 数据缓存
         self.whitelist = set()
         self.data_dir = project_root / "data"
         self.data_cache = {}  # 内存缓存: {stock_code: DataFrame}
+        self.hs300_cache = None  # 沪深300数据缓存
         
         # 初始化Reader
         self.reader = Reader.factory(market='std', tdxdir=self.tdx_dir)
@@ -112,6 +117,57 @@ class StockPoolGenerator:
             logger.debug(f"[CACHE] 读取 {stock_code} 数据失败: {e}")
             self.data_cache[stock_code] = None  # 标记为失败
             return None
+    
+    def _load_hs300_data(self) -> Optional[pd.DataFrame]:
+        """
+        加载本地沪深300数据（从 data/hs300_eastmoney.csv）
+        
+        Returns:
+            带日期索引的DataFrame（含 open/close/high/low/volume），失败返回 None
+        """
+        if self.hs300_cache is not None:
+            return self.hs300_cache
+        
+        hs300_file = self.data_dir / "hs300_eastmoney.csv"
+        if not hs300_file.exists():
+            logger.warning("[HS300] 本地沪深300数据文件不存在，跳过相对强度检查")
+            self.hs300_cache = None
+            return None
+        
+        try:
+            df = pd.read_csv(hs300_file, parse_dates=['date'])
+            df = df.set_index('date').sort_index()
+            self.hs300_cache = df
+            logger.info(f"[HS300] 加载沪深300数据成功 ({len(df)} 条, {df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')})")
+            return df
+        except Exception as e:
+            logger.warning(f"[HS300] 加载沪深300数据失败: {e}")
+            self.hs300_cache = None
+            return None
+    
+    def _get_index_return(self, check_date: datetime, period: int) -> Optional[float]:
+        """
+        获取沪深300在指定日期前 period 天的涨跌幅
+        
+        Args:
+            check_date: 检查日期
+            period: 天数
+        
+        Returns:
+            涨跌幅（%），数据不足或加载失败返回 None
+        """
+        df = self._load_hs300_data()
+        if df is None or df.empty:
+            return None
+        
+        df_before = df[df.index <= check_date]
+        if len(df_before) < period + 1:
+            return None
+        
+        closes = df_before['close'].iloc[-period:].values
+        opens_index = df_before['open'].iloc[-period:].values
+        ret = (closes[-1] - opens_index[0]) / opens_index[0] * 100
+        return ret
     
     def load_whitelist_stocks(self):
         """加载白名单股票（复用backtest_engine的逻辑）"""
@@ -238,7 +294,7 @@ class StockPoolGenerator:
         logger.info(f"[FALLBACK] 使用降级方案，共 {len(trading_days)} 个工作日（未过滤节假日）")
         return trading_days
     
-    def check_volume_condition(self, stock_code: str, check_date: datetime) -> bool:
+    def check_volume_condition(self, stock_code: str, check_date: datetime) -> Optional[dict]:
         """
         检查股票在指定日期是否满足：放量 + 价格上涨 + 均线多头 + 位置合理
         
@@ -247,48 +303,76 @@ class StockPoolGenerator:
             check_date: 检查日期
         
         Returns:
-            bool: 是否满足条件
+            dict: 满足全部条件时返回关键数据 {'close': float, 'ma20': float, 'vol_ratio': float, 'return_pct': float}
+            None: 任一条件不满足
         """
         try:
             # 使用缓存获取数据（首次读取会加载到缓存，后续直接返回）
             df = self.get_stock_data(stock_code)
             
             if df is None or df.empty:
-                return False
+                return None
             
             # 找到check_date之前的数据
             df_before = df[df.index <= check_date]
             
             # 需要更多数据用于均线计算 (至少20天用于MA20)
             if len(df_before) < self.volume_period + 20:
-                return False
+                return None
             
-            # === 条件1：成交量连续递增（核心逻辑）===
-            volumes = df_before['volume'].iloc[-self.volume_period-1:].values
-            for i in range(1, self.volume_period + 1):
-                if volumes[-i] <= volumes[-i-1]:
-                    return False
+            # === 条件1：成交量放量（允许小幅波动，不要求严格递增）===
+            # 基准日：放量期前一天的成交量，放量期每天成交量 > 基准日的 95%
+            # 允许放量过程中有自然波动，只要不缩回启动前水平以下
+            base_volume = df_before['volume'].iloc[-self.volume_period - 1]
+            period_volumes = df_before['volume'].iloc[-self.volume_period:].values
+            threshold = base_volume * 0.95
+            for v in period_volumes:
+                if v <= threshold:
+                    return None
             
-            # === 条件2：价格整体呈上升趋势（优化：从"60%天数上涨"改为"整体上涨"）===
+            # === 条件2：放量期价格稳步上涨（允许第2天小幅回调洗盘）===
             closes = df_before['close'].iloc[-self.volume_period:].values
             opens = df_before['open'].iloc[-self.volume_period:].values
             
-            # 最后一天收盘价 > 第一天开盘价，表示整体上涨
-            if closes[-1] < opens[0]:
-                return False
+            # 条件2a：放量期第1天收盘 > 基准日收盘（突破启动）
+            base_close = df_before['close'].iloc[-self.volume_period - 1]
+            if closes[0] <= base_close:
+                return None
+            
+            # 条件2b：放量期最后1天收盘 > 第1天收盘（最终上涨）
+            if closes[-1] <= closes[0]:
+                return None
+            
+            # 条件2c：放量期第2天收盘 >= 启动开盘价 × (1+max_retracement_pct/100)
+            # 允许第2天小幅回调洗盘，但不低于启动价的95%
+            if len(closes) >= 2:
+                start_price = opens[0]
+                min_allowed = start_price * (1 + self.max_retracement_pct / 100)
+                if closes[1] < min_allowed:
+                    return None
+            
+            # === 条件2d：日内冲高回落幅度检查（排除出货形态）===
+            # 检查放量期内每天：(最高价 - 收盘价) / 最高价 ≥ 阈值，视为冲高回落出货
+            highs = df_before['high'].iloc[-self.volume_period:].values
+            closes_check = df_before['close'].iloc[-self.volume_period:].values
+            for h, c in zip(highs, closes_check):
+                if h > 0:
+                    pullback = (h - c) / h * 100
+                    if pullback >= self.max_intraday_pullback_pct:
+                        return None
             
             # === 条件3：股价站上20日均线（保持不变）===
             ma20 = df_before['close'].rolling(20).mean().iloc[-1]
             latest_close = df_before['close'].iloc[-1]
             if latest_close < ma20:
-                return False
+                return None
             
             # === 条件4：近期涨幅适中，避免追高（使用配置化参数）===
             recent_return = (closes[-1] - closes[0]) / closes[0] * 100
             if recent_return > self.max_price_change_pct:
-                return False
+                return None
             if recent_return < self.min_price_change_pct:
-                return False
+                return None
             
             # === 条件5：成交量放大倍数合理（使用配置化参数）===
             vol_ma20 = df_before['volume'].rolling(20).mean().iloc[-1]
@@ -296,22 +380,42 @@ class StockPoolGenerator:
             vol_ratio = latest_vol / vol_ma20 if vol_ma20 > 0 else 1
             
             if vol_ratio < self.min_volume_ratio:
-                return False
+                return None
             if vol_ratio > self.max_volume_ratio:
-                return False
+                return None
             
-            return True
+            # === 条件6（新增）：相对强度 — 不弱于大盘 ===
+            index_ret = self._get_index_return(check_date, self.volume_period)
+            if index_ret is not None:
+                relative_strength = recent_return - index_ret
+                if relative_strength < self.min_relative_strength:
+                    return None
+            
+            # === 条件7（新增）：波动率风险过滤 ===
+            # 用最近20个交易日计算日收益率波动率，超过阈值视为高风险
+            daily_returns = df_before['close'].iloc[-21:].pct_change().dropna()
+            volatility = float(daily_returns.std() * 100)
+            if volatility > self.max_volatility_pct:
+                return None
+            
+            # 全部条件通过，返回关键数据供保存
+            return {
+                'close': round(float(latest_close), 2),
+                'ma20': round(float(ma20), 2),
+                'vol_ratio': round(float(vol_ratio), 2),
+                'return_pct': round(float(recent_return), 2),
+            }
             
         except Exception as e:
-            return False
+            return None
     
-    def save_stockpool(self, date: datetime, selected_stocks: Set[str]):
+    def save_stockpool(self, date: datetime, selected_stocks: Dict[str, dict]):
         """
-        保存股票池到文件
+        保存股票池到文件（CSV格式，含关键数据方便复盘）
         
         Args:
             date: 日期
-            selected_stocks: 选中的股票代码集合
+            selected_stocks: {股票代码: {'close': float, 'ma20': float, 'vol_ratio': float, 'return_pct': float}}
         """
         if not selected_stocks:
             logger.debug(f"[SKIP] {date.strftime('%Y-%m-%d')}: 无选中股票，跳过保存")
@@ -323,15 +427,17 @@ class StockPoolGenerator:
         
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
-                # 写入表头注释
+                # 写入文件头注释
                 f.write(f"# 选股结果 - {date.strftime('%Y-%m-%d')}\n")
-                f.write(f"# 格式: 股票代码\n")
                 f.write(f"# 总数: {len(selected_stocks)} 只\n")
-                f.write("-" * 30 + "\n")
+                f.write(f"# 格式: 股票代码,收盘价,MA20,量比,放量期涨幅%\n")
+                f.write("-" * 60 + "\n")
+                f.write("code,close,ma20,vol_ratio,return_pct\n")
                 
-                # 写入股票代码（排序）
-                for code in sorted(selected_stocks):
-                    f.write(f"{code}\n")
+                # 写入股票数据（按代码排序）
+                for code in sorted(selected_stocks.keys()):
+                    info = selected_stocks[code]
+                    f.write(f"{code},{info['close']},{info['ma20']},{info['vol_ratio']},{info['return_pct']}\n")
             
             logger.info(f"[SAVE] {date.strftime('%Y-%m-%d')}: 保存 {len(selected_stocks)} 只股票 -> {filename}")
             
@@ -378,10 +484,11 @@ class StockPoolGenerator:
                 logger.info(f"[PROGRESS] 进度: {idx + 1}/{len(trading_days)} ({progress:.1f}%) - 已选股 {selection_count + 1} 次")
             
             # 检查每只股票是否满足放量条件
-            selected_stocks = set()
+            selected_stocks = {}
             for stock_code in self.whitelist:
-                if self.check_volume_condition(stock_code, current_date):
-                    selected_stocks.add(stock_code)
+                result = self.check_volume_condition(stock_code, current_date)
+                if result is not None:
+                    selected_stocks[stock_code] = result
             
             # 保存股票池（不做数量限制，留给评分阶段处理）
             self.save_stockpool(current_date, selected_stocks)
@@ -450,6 +557,10 @@ def main():
                 default_max_price_change = backtest_config.get('max_price_change_pct', 25.0)
                 default_min_volume_ratio = backtest_config.get('min_volume_ratio', 1.3)
                 default_max_volume_ratio = backtest_config.get('max_volume_ratio', 8.0)
+                default_max_retracement_pct = backtest_config.get('max_retracement_pct', -5.0)
+                default_max_intraday_pullback_pct = backtest_config.get('max_intraday_pullback_pct', 5.0)
+                default_min_relative_strength = backtest_config.get('min_relative_strength', -2.0)
+                default_max_volatility_pct = backtest_config.get('max_volatility_pct', 3.0)
                 
                 logger.info(f"[CONFIG] 从配置文件读取默认值:")
                 logger.info(f"  - start_date: {default_start_date}")
@@ -470,6 +581,10 @@ def main():
             default_max_price_change = 25.0
             default_min_volume_ratio = 1.3
             default_max_volume_ratio = 8.0
+            default_max_retracement_pct = -5.0
+            default_max_intraday_pullback_pct = 5.0
+            default_min_relative_strength = -2.0
+            default_max_volatility_pct = 3.0
             tdx_dir_from_config = r"D:\Install\zd_zxzq_gm"
     except Exception as e:
         logger.warning(f"[WARN] 读取配置文件失败: {e}，使用硬编码默认值")
@@ -481,6 +596,10 @@ def main():
         default_max_price_change = 25.0
         default_min_volume_ratio = 1.3
         default_max_volume_ratio = 8.0
+        default_max_retracement_pct = -5.0
+        default_max_intraday_pullback_pct = 5.0
+        default_min_relative_strength = -2.0
+        default_max_volatility_pct = 3.0
         tdx_dir_from_config = r"D:\Install\zd_zxzq_gm"
     
     # 构建配置（命令行参数优先，否则使用配置文件默认值）
@@ -495,7 +614,11 @@ def main():
         'min_price_change_pct': default_min_price_change,
         'max_price_change_pct': default_max_price_change,
         'min_volume_ratio': default_min_volume_ratio,
-        'max_volume_ratio': default_max_volume_ratio
+        'max_volume_ratio': default_max_volume_ratio,
+        'max_retracement_pct': default_max_retracement_pct,
+        'max_intraday_pullback_pct': default_max_intraday_pullback_pct,
+        'min_relative_strength': default_min_relative_strength,
+        'max_volatility_pct': default_max_volatility_pct
     }
     
     generator = StockPoolGenerator(config)

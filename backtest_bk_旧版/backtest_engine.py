@@ -549,14 +549,15 @@ class BacktestEngine:
     
     def _calculate_cycle_final_capital(self, cycle: TradingCycle) -> float:
         """
-        计算交易周期的期末资金
+        计算交易周期的期末资金（修复版 - 正确处理闲置资金）
         
         规则：
         1. 统计有效股票数量（能买入至少100股的）
         2. 期初资金 / 有效股票数 = 每股分配资金
         3. 每只股票：实际投入 = 股数 × 买入价
-        4. 每只股票：期末价值 = 实际投入 × (1 + 收益率)
-        5. 周期期末资金 = 所有股票期末价值之和
+        4. 每只股票：闲置资金 = 分配资金 - 实际投入
+        5. 每只股票：期末价值 = 实际投入 × (1 + 收益率) + 闲置资金
+        6. 周期期末资金 = 所有股票期末价值之和
         
         Args:
             cycle: 交易周期对象
@@ -579,7 +580,8 @@ class BacktestEngine:
             
             if actual_shares >= 100:
                 investment = actual_shares * trade.buy_price
-                final_value = investment * (1 + trade.return_pct / 100)
+                idle_capital = capital_per_stock - investment  # 闲置资金
+                final_value = investment * (1 + trade.return_pct / 100) + idle_capital  # 期末价值包含闲置资金
                 cycle_final_capital += final_value
         
         return cycle_final_capital
@@ -906,8 +908,8 @@ class BacktestEngine:
             cycles.append(cycle)
             cycle_index += 1
             
-            # 跳到卖出日的下一个交易日（准备新周期）
-            i = sell_date_idx + 1
+            # 跳到卖出日（卖出日同时也是下一周期的选股日）
+            i = sell_date_idx
         
         # 保存所有交易周期
         self.trading_cycles = cycles
@@ -1043,6 +1045,35 @@ class BacktestEngine:
         logger.info("-"*80)
         
         for cycle in self.trading_cycles:
+            # ========== 计算详细的资金构成 ==========
+            num_stocks = len(cycle.stocks)
+            if num_stocks > 0:
+                capital_per_stock = cycle.initial_capital / num_stocks
+                
+                total_investment = 0.0  # 实际投入总额
+                total_idle_capital = 0.0  # 闲置资金总额
+                skipped_stocks = 0  # 跳过的股票数量
+                
+                for trade in cycle.stocks:
+                    raw_shares = int(capital_per_stock / trade.buy_price)
+                    actual_shares = (raw_shares // 100) * 100
+                    
+                    if actual_shares >= 100:
+                        investment = actual_shares * trade.buy_price
+                        idle_capital = capital_per_stock - investment
+                        total_investment += investment
+                        total_idle_capital += idle_capital
+                    else:
+                        skipped_stocks += 1
+                
+                # 资金利用率
+                capital_utilization = (total_investment / cycle.initial_capital * 100) if cycle.initial_capital > 0 else 0
+            else:
+                total_investment = 0.0
+                total_idle_capital = cycle.initial_capital
+                skipped_stocks = 0
+                capital_utilization = 0.0
+            
             # 记录周期指标
             cycle_info = {
                 'cycle_index': cycle.cycle_index,
@@ -1053,7 +1084,12 @@ class BacktestEngine:
                 'final_capital': cycle.final_capital,
                 'cycle_return': cycle.return_pct,
                 'cumulative_return': (cycle.final_capital - self.initial_capital) / self.initial_capital * 100,
-                'trades': [t.to_dict() for t in cycle.stocks]
+                'trades': [t.to_dict() for t in cycle.stocks],
+                # 新增：详细资金信息
+                'total_investment': total_investment,
+                'total_idle_capital': total_idle_capital,
+                'capital_utilization': capital_utilization,
+                'skipped_stocks': skipped_stocks
             }
             
             cycle_metrics.append(cycle_info)
@@ -1069,6 +1105,15 @@ class BacktestEngine:
                 f"{cycle.final_capital:<15,.2f} "
                 f"{cycle.return_pct:<10.2f}%"
             )
+            
+            # 输出详细的资金构成（调试模式）
+            if num_stocks > 0:
+                logger.debug(
+                    f"       [资金明细] 投入: {total_investment:,.2f} | "
+                    f"闲置: {total_idle_capital:,.2f} | "
+                    f"利用率: {capital_utilization:.1f}% | "
+                    f"跳过: {skipped_stocks}只"
+                )
         
         logger.info("="*80)
         logger.info(f"✅ 共完成 {len(cycle_metrics)} 个交易周期")
