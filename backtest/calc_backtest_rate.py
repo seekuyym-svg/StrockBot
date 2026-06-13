@@ -70,7 +70,8 @@ def load_stock_pool(pooldate: str) -> List[Dict[str, str]]:
         FileNotFoundError: 股票池文件不存在
     """
     stockpool_file = DATA_DIR / f"stockpool_{pooldate}.txt"
-    
+    if not stockpool_file.exists():
+        stockpool_file = DATA_DIR / f"stockpool_{pooldate}"
     if not stockpool_file.exists():
         raise FileNotFoundError(f"❌ 股票池文件不存在: {stockpool_file}")
     
@@ -180,6 +181,79 @@ def save_report_to_file(content: str, filename: str):
     except Exception as e:
         print(f"❌ 保存报告失败: {e}")
         return False
+
+
+def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, end_date: str):
+    """
+    将回测区间收益率写回到股票池文件中
+    
+    在评分数据行的末尾追加 backtest_return 列：
+        code,score,pref,backtest_return
+        002353,79,8.0,+2.35
+    
+    如果已经存在该列（再次运行回测），只更新值不追加新列。
+    
+    Args:
+        pooldate: 股票池日期 (YYYYMMDD)
+        results: 区间收益率计算结果列表
+        start_date: 回测起始日期
+        end_date: 回测结束日期
+    """
+    stockpool_file = DATA_DIR / f"stockpool_{pooldate}.txt"
+    if not stockpool_file.exists():
+        stockpool_file = DATA_DIR / f"stockpool_{pooldate}"
+    if not stockpool_file.exists():
+        print(f"\u26a0\ufe0f  股票池文件不存在，跳过回写: {stockpool_file}")
+        return
+    
+    # 构建 code -> return_rate 映射
+    return_map = {r['code']: r['return_rate'] for r in results}
+    
+    with open(stockpool_file, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    
+    new_lines = []
+    has_return_col = False
+    in_scored_section = False
+    updated_count = 0
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        if stripped.startswith('# === 技术评分数据'):
+            in_scored_section = True
+        
+        if in_scored_section and stripped.startswith('# 格式:'):
+            if '回测收益率%' in stripped:
+                has_return_col = True
+            else:
+                line = line.rstrip('\n') + ',回测收益率%\n'
+            new_lines.append(line)
+            continue
+        
+        if in_scored_section and not stripped.startswith('#') and stripped:
+            parts = stripped.split(',')
+            if len(parts) >= 3 and parts[0].isdigit() and len(parts[0]) == 6:
+                code = parts[0]
+                if code in return_map:
+                    return_rate = return_map[code]
+                    if has_return_col:
+                        if len(parts) >= 4:
+                            parts[3] = f'{return_rate:+.2f}'
+                        else:
+                            parts.append(f'{return_rate:+.2f}')
+                        line = ','.join(parts) + '\n'
+                    else:
+                        line = line.rstrip('\n') + f',{return_rate:+.2f}\n'
+                    updated_count += 1
+        
+        new_lines.append(line)
+    
+    with open(stockpool_file, 'w', encoding='utf-8') as f:
+        f.writelines(new_lines)
+    
+    print(f"\U0001f4be 已将 {updated_count} 只股票的回测收益率写回 {stockpool_file.name}")
+    print(f"   \U0001f4c5 区间: {start_date} ~ {end_date}")
 
 
 def fetch_klines_from_tencent(code: str) -> Optional[pd.DataFrame]:
@@ -571,7 +645,7 @@ def calculate_single_day_returns(target_date: str, watchlist: list, initial_capi
 
 
 def calculate_period_returns(start_date: str, end_date: str, watchlist: list, initial_capital: float,
-                               source: str = 'local'):
+                               source: str = 'local', pooldate: str = None):
     """
     计算指定区间的累计收益率
     
@@ -719,6 +793,10 @@ def calculate_period_returns(start_date: str, end_date: str, watchlist: list, in
         end_str = end_date.replace('-', '')
         filename = f"report_{start_str}_{end_str}.txt"
         save_report_to_file(report_content, filename)
+        
+        # 将个股收益率写回到股票池文件
+        if pooldate:
+            write_returns_to_stockpool(pooldate, results, start_date, end_date)
     else:
         print("\n" + "=" * 80)
         print("✅ 计算完成！(无有效数据)")
@@ -825,7 +903,7 @@ def main():
     if args.start and args.end:
         if args.date:
             print("\n\n")
-        calculate_period_returns(args.start, args.end, watchlist, initial_capital, source=args.source)
+        calculate_period_returns(args.start, args.end, watchlist, initial_capital, source=args.source, pooldate=args.pooldate)
 
 
 if __name__ == "__main__":
