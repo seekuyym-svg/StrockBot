@@ -148,71 +148,110 @@ def check_single_index(df: pd.DataFrame, check_dt, ma_short: int, ma_long: int, 
     }
 
 
-# ==================== 市场成交额 ====================
+# ==================== 沪深市场成交额分析 ====================
 
-def fetch_market_volume(check_date: str) -> Optional[float]:
+def fetch_market_volume(check_date: str) -> Optional[dict]:
     """
-    从东方财富获取全市场成交额（亿元）= 上证成交额 + 深证成交额
+    从东方财富获取沪深市场成交额分析
+
+    同时获取上证（000001）和深证（399106）的日K线成交额，
+    逐日相加得到沪深合计成交额（亿元），计算5日均量及放缩量判断。
 
     数据覆盖：
     - 上证指数(000001)：沪市全部，含科创板
     - 深证综指(399106)：深市全部，含创业板
+
+    Returns:
+        dict: { current, avg_5, ratio, trend }
+        - current: 当日沪深成交额（亿元）
+        - avg_5: 过去5个交易日均量（亿元）
+        - ratio: 当日 / 5日均量 比值
+        - trend: "明显放量" | "温和放量" | "正常" | "温和缩量" | "明显缩量"
+        失败时返回 None
     """
-    start_dt = pd.to_datetime(check_date) - timedelta(days=5)
+    start_dt = pd.to_datetime(check_date) - timedelta(days=15)
     start_date = start_dt.strftime('%Y-%m-%d')
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
-    total_amount = 0
+    def _fetch_index_klines(secid: str) -> dict:
+        """获取单个指数的日K线 { date: amount(元) }"""
+        try:
+            resp = requests.get(
+                "http://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params={
+                    "secid": secid,
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    "klt": "101", "fqt": "1",
+                    "beg": start_date.replace('-', ''),
+                    "end": check_date.replace('-', ''),
+                    "lmt": "20"
+                },
+                headers=headers, timeout=10
+            )
+            data = resp.json()
+            result = {}
+            if data.get('data') and data['data'].get('klines'):
+                for line in data['data']['klines']:
+                    parts = line.split(',')
+                    if len(parts) >= 7:
+                        result[parts[0]] = float(parts[6])  # date -> 成交额(元)
+            return result
+        except Exception:
+            return {}
 
-    # 上证成交额
-    try:
-        resp = requests.get(
-            "http://push2his.eastmoney.com/api/qt/stock/kline/get",
-            params={
-                "secid": "1.000001",
-                "fields1": "f1,f2,f3,f4,f5,f6",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                "klt": "101", "fqt": "1",
-                "beg": start_date.replace('-', ''),
-                "end": check_date.replace('-', ''),
-                "lmt": "10"
-            },
-            headers=headers, timeout=10
-        )
-        data = resp.json()
-        if data.get('data') and data['data'].get('klines'):
-            last_line = data['data']['klines'][-1]
-            total_amount += float(last_line.split(',')[6])  # 成交额（元）
-    except Exception:
-        pass
+    # 获取上证+深证成交额
+    sh_amounts = _fetch_index_klines("1.000001")
+    sz_amounts = _fetch_index_klines("0.399106")
 
-    # 深证成交额
-    try:
-        resp = requests.get(
-            "http://push2his.eastmoney.com/api/qt/stock/kline/get",
-            params={
-                "secid": "0.399106",  # 深证综指，覆盖深市全部含创业板
-                "fields1": "f1,f2,f3,f4,f5,f6",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                "klt": "101", "fqt": "1",
-                "beg": start_date.replace('-', ''),
-                "end": check_date.replace('-', ''),
-                "lmt": "10"
-            },
-            headers=headers, timeout=10
-        )
-        data = resp.json()
-        if data.get('data') and data['data'].get('klines'):
-            last_line = data['data']['klines'][-1]
-            total_amount += float(last_line.split(',')[6])  # 成交额（元）
-    except Exception:
-        pass
+    if not sh_amounts or not sz_amounts:
+        return None
 
-    if total_amount > 0:
-        return round(total_amount / 1e8, 0)  # 元→亿元
-    return None
+    # 按日期逐日相加
+    all_dates = sorted(set(sh_amounts.keys()) & set(sz_amounts.keys()))
+    if not all_dates:
+        return None
+
+    daily_totals = []
+    for d in all_dates:
+        total_yuan = sh_amounts[d] + sz_amounts[d]
+        daily_totals.append({
+            'date': d,
+            'total': round(total_yuan / 1e8, 0),  # 元→亿元
+        })
+
+    if not daily_totals:
+        return None
+
+    # 当日成交额
+    current = daily_totals[-1]['total']
+
+    # 过去5个交易日均量
+    recent = daily_totals[-5:] if len(daily_totals) >= 5 else daily_totals
+    avg_5 = round(sum(d['total'] for d in recent) / len(recent), 0)
+
+    # 放缩量判断
+    ratio = round(current / avg_5, 2) if avg_5 > 0 else 1.0
+
+    if ratio >= 1.20:
+        trend = "明显放量"
+    elif ratio >= 1.05:
+        trend = "温和放量"
+    elif ratio <= 0.80:
+        trend = "明显缩量"
+    elif ratio <= 0.95:
+        trend = "温和缩量"
+    else:
+        trend = "正常"
+
+    return {
+        'current': current,
+        'avg_5': avg_5,
+        'ratio': ratio,
+        'trend': trend,
+    }
 
 
 # ==================== 核心信号判断 ====================
@@ -280,8 +319,9 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
     market_volume = fetch_market_volume(check_date)
 
     if market_volume is not None:
-        cond_vol_pass = market_volume >= min_volume
-        cond_vol_desc = f"全市场成交额 {market_volume:.0f}亿 >= {min_volume}亿?"
+        vol_current = market_volume['current']
+        cond_vol_pass = vol_current >= min_volume
+        cond_vol_desc = f"全市场成交额 {vol_current:.0f}亿 >= {min_volume}亿?"
     else:
         cond_vol_pass = True  # 获取失败时不阻挡
         cond_vol_desc = "全市场成交额 获取失败（跳过此条件）"
@@ -317,7 +357,7 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
                         unhealthy_parts.append(f"{ma_short}日线({ir[f'ma{ma_short}']:.0f}) < {ma_long}日线({ir[f'ma{ma_long}']:.0f})")
                     reasons.append(f"{ir['name']}不健康: {'; '.join(unhealthy_parts)}")
         if not cond_vol_pass and market_volume is not None:
-            reasons.append(f"成交额({market_volume:.0f}亿) < {min_volume}亿，市场活跃度不足")
+            reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume}亿，市场活跃度不足")
 
     elif mode == 'strict':
         passed = passed_count == total_count
@@ -328,7 +368,7 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
             if not ir['cond2'][0]:
                 reasons.append(f"{ir['name']}{ma_short}日线({ir[f'ma{ma_short}']:.0f}) < {ma_long}日线({ir[f'ma{ma_long}']:.0f})")
         if not cond_vol_pass and market_volume is not None:
-            reasons.append(f"成交额({market_volume:.0f}亿) < {min_volume}亿，市场活跃度不足")
+            reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume}亿，市场活跃度不足")
 
     else:  # 'flexible'
         passed = passed_count >= flex_count
@@ -340,7 +380,7 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
                 if not ir['cond2'][0]:
                     reasons.append(f"{ir['name']}{ma_short}日线({ir[f'ma{ma_short}']:.0f}) < {ma_long}日线({ir[f'ma{ma_long}']:.0f})")
             if not cond_vol_pass and market_volume is not None:
-                reasons.append(f"成交额({market_volume:.0f}亿) < {min_volume}亿，市场活跃度不足")
+                reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume}亿，市场活跃度不足")
 
     # ========== 构建结果 ==========
     # 扁平化条件编号（cond1 ~ condN）用于输出
@@ -353,6 +393,11 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
         cond_idx += 1
     flat_conds[f'cond{cond_idx}'] = (cond_vol_pass, cond_vol_desc)
 
+    # 量能趋势（从 market_volume dict 中提取）
+    vol_avg_5 = market_volume['avg_5'] if market_volume is not None else None
+    vol_ratio = market_volume['ratio'] if market_volume is not None else None
+    vol_trend = market_volume['trend'] if market_volume is not None else None
+
     result = {
         'date': check_date,
         'pass_mode': mode,
@@ -361,6 +406,9 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
         'min_volume': min_volume,
         'indices': index_results,
         'market_volume': market_volume,
+        'volume_avg_5': vol_avg_5,
+        'volume_ratio': vol_ratio,
+        'volume_trend': vol_trend,
         'cond_volume': (cond_vol_pass, cond_vol_desc),
         'passed': passed,
         'reasons': reasons,
@@ -406,9 +454,12 @@ def format_output(result: Dict):
     # ========== 成交额 ==========
     vol = result.get('market_volume')
     if vol is not None:
-        print(f"\n  {'✅' if result['cond_volume'][0] else '❌'} 全市场成交额: {vol:.0f}亿 (阈值: {result['min_volume']}亿)")
+        trend = result.get('volume_trend', '')
+        avg = result.get('volume_avg_5', 0)
+        vol_str = f"{vol['current']:.0f}亿 (5日均量: {avg:.0f}亿, {trend})"
+        print(f"\n  {'✅' if result['cond_volume'][0] else '❌'} 沪深市场成交额: {vol_str}  (阈值: {result['min_volume']}亿)")
     else:
-        print(f"\n  ⚠️  全市场成交额: 获取失败（跳过此条件）")
+        print(f"\n  ⚠️  沪深市场成交额: 获取失败（跳过此条件）")
 
     # ========== 汇总 ==========
     print(f"\n  {'─' * 58}")
@@ -442,9 +493,12 @@ def format_output_single(result: Dict):
 
     vol = result.get('market_volume')
     if vol is not None:
-        print(f"  全市场成交额:   {vol:.0f}亿")
+        trend = result.get('volume_trend', '')
+        avg = result.get('volume_avg_5', 0)
+        trend_str = f' ({trend})' if trend else ''
+        print(f"  沪深市场成交额: {vol['current']:.0f}亿  (5日均量: {avg:.0f}亿{trend_str})")
     else:
-        print(f"  全市场成交额:   获取失败")
+        print(f"  沪深市场成交额:   获取失败")
     print()
     print(f"  {'─' * 50}")
     print(f"  条件检查:")
@@ -522,6 +576,14 @@ def save_signal_history(result: Dict):
         return  # 数据不完整不保存
 
     # 构建精简记录（纯Python原生类型，可直接JSON序列化）
+    def _get_cond_pass(cond):
+        """兼容 tuple (bool, str) 和 dict {'passed': bool, 'desc': str} 两种格式"""
+        if isinstance(cond, tuple):
+            return bool(cond[0])
+        if isinstance(cond, dict):
+            return bool(cond['passed'])
+        return False
+
     indices_summary = []
     for ir in result['indices']:
         ma_s = result['ma_short']
@@ -531,11 +593,12 @@ def save_signal_history(result: Dict):
             'close': ir['close'],
             f'ma{ma_s}': ir[f'ma{ma_s}'],
             f'ma{ma_l}': ir[f'ma{ma_l}'],
-            'cond1_pass': bool(ir['cond1'][0]),
-            'cond2_pass': bool(ir['cond2'][0]),
+            'cond1_pass': _get_cond_pass(ir['cond1']),
+            'cond2_pass': _get_cond_pass(ir['cond2']),
             'healthy': bool(ir['healthy']),
         })
 
+    mv = result.get('market_volume')
     record = {
         'date': result['date'],
         'pass_mode': result['pass_mode'],
@@ -543,7 +606,10 @@ def save_signal_history(result: Dict):
         'passed_conditions': int(result['passed_conditions']),
         'total_conditions': int(result['total_conditions']),
         'indices': indices_summary,
-        'market_volume': result.get('market_volume'),
+        'market_volume': mv['current'] if mv else None,
+        'volume_avg_5': mv['avg_5'] if mv else None,
+        'volume_ratio': mv['ratio'] if mv else None,
+        'volume_trend': mv['trend'] if mv else None,
         'volume_pass': bool(result['cond_volume'][0]),
         'reasons': result.get('reasons', []),
         'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),

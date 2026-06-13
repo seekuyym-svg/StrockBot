@@ -8,11 +8,17 @@
     4. 每日自动更新，支持增量检测（复牌、摘帽等）
 
 使用方法:
-    python local/manage_stock_list.py [--update] [--date YYYYMMDD]
+    python local/manage_stock_list.py [--update] [--date YYYYMMDD] [--universe full|index]
 
 参数说明:
     --update: 强制更新股票列表（默认检查今日是否已更新）
     --date: 指定日期（默认今天）
+    --universe full|index: 选股范围，full=全市场（默认跟随配置），index=成分股模式
+
+成分股模式:
+    当启用 index 模式时，白名单仅包含配置中启用的指数成分股（沪深300、中证1000、科创50）。
+    成分股数据通过 AKShare 从 csindex.com.cn 自动拉取并缓存到 data/constituents_*.csv。
+    在 config.yaml 的 stock_universe 节中配置。
 """
 
 import pandas as pd
@@ -229,13 +235,14 @@ def save_stock_list(all_stocks, blacklisted_stocks, date_str):
     
     print(f"[SAVE] 白名单已保存: {whitelist_file} ({whitelist_count} 只)")
 
-def main(force_update=False, target_date=None):
+def main(force_update=False, target_date=None, universe=None):
     """
     主函数：生成股票列表和黑名单
     
     Args:
         force_update: 是否强制更新
         target_date: 目标日期 YYYYMMDD，默认今天
+        universe: 选股范围，None=跟随配置，'full'=全市场，'index'=成分股模式
     """
     if target_date is None:
         date_str = datetime.now().strftime('%Y%m%d')
@@ -258,6 +265,29 @@ def main(force_update=False, target_date=None):
         print(f"[TIP] 如需重新生成，请使用 --update 参数")
         return
     
+    # === 成分股自动更新（2026-06-11 新增）===
+    stock_universe_cfg = config.get('stock_universe', {})
+    if universe is None:
+        universe_mode = stock_universe_cfg.get('mode', 'full_market')
+    else:
+        universe_mode = 'index_constituents' if universe == 'index' else 'full_market'
+    
+    if universe_mode == 'index_constituents':
+        enabled_indices = [
+            idx for idx in stock_universe_cfg.get('indices', [])
+            if idx.get('enabled', False)
+        ]
+        if enabled_indices:
+            auto_update = stock_universe_cfg.get('auto_update', True)
+            if auto_update:
+                from backtest.fetch_constituents import update_constituents
+                freq = stock_universe_cfg.get('update_freq_days', 7)
+                print(f"\n[UNIVERSE] 成分股模式: 自动更新缓存（{freq}天周期）...")
+                update_constituents(enabled_indices, freq_days=freq)
+        else:
+            print(f"\n[WARN] 未启用任何指数，将使用全市场模式")
+            universe_mode = 'full_market'
+    
     # 初始化 Reader
     try:
         reader = Reader.factory(market='std', tdxdir=TDX_DIR)
@@ -273,6 +303,19 @@ def main(force_update=False, target_date=None):
     if not stock_codes:
         print("[ERROR] 未扫描到任何股票，请检查 TDX_DIR 配置")
         return
+    
+    # === 成分股过滤（2026-06-21 新增）===
+    if universe_mode == 'index_constituents' and enabled_indices:
+        from backtest.fetch_constituents import load_constituents
+        index_codes = [idx['code'] for idx in enabled_indices]
+        mode = stock_universe_cfg.get('union_or_intersection', 'union')
+        constituent_codes = load_constituents(index_codes, mode=mode)
+        
+        original_count = len(stock_codes)
+        stock_codes = [c for c in stock_codes if c in constituent_codes]
+        print(f"\n[FILTER] 成分股过滤: {original_count} → {len(stock_codes)} 只 "
+              f"(指数: {', '.join(idx['name'] for idx in enabled_indices)}, "
+              f"模式: {mode})")
     
     # 步骤2: 加载前一天黑名单（用于对比变化）
     print("\n[STEP 2] 加载前一天黑名单...")
@@ -357,7 +400,10 @@ if __name__ == '__main__':
                         help='强制更新股票列表')
     parser.add_argument('--date', type=str, default=None,
                         help='指定日期 (YYYYMMDD)，默认今天')
+    parser.add_argument('--universe', type=str, default=None,
+                        choices=['full', 'index'],
+                        help='选股范围: full=全市场, index=成分股模式（默认跟随配置）')
     
     args = parser.parse_args()
     
-    main(force_update=args.update, target_date=args.date)
+    main(force_update=args.update, target_date=args.date, universe=args.universe)

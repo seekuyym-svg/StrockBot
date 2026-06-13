@@ -71,8 +71,24 @@ class HistoricalStockScorer:
         
         self.reader = Reader.factory(market='std', tdxdir=tdx_dir)
         self.industry_cache = {}           # 行业信息缓存: symbol -> industry_name
+        self._return_pct_cache = {}        # 股票池涨幅缓存: {date: {code: return_pct}}
         self.industry_cache_file = Path(__file__).parent.parent / "data" / "industry_cache.json"
         self._load_industry_cache()        # 尝试从本地文件恢复上次的缓存
+        self.pref_vol_ratio_threshold = 2.8  # 优选分成交量量比上限阈值
+        self.pref_vol_ratio_min = 1.2  # 优选分成交量量比下限阈值
+        self.min_pref_score = 7  # 优选分最低要求（低于此分直接淘汰）
+        self.max_per_score = 3  # 同分值最多保留几只
+        # 高分段优先入选配置
+        self.high_score_min = 90
+        self.high_score_max = 95
+        self.high_pref_score = 10
+        self.high_max_count = 3
+        self.pref_gain_lo = 8   # 涨幅评分阈值下限（<此值得3分）
+        self.pref_gain_hi = 12  # 涨幅评分阈值上限（lo~hi得1.5分）
+        self.pref_pull_lo = 3   # 冲高回落评分下限（≤此值得2分）
+        self.pref_pull_hi = 6   # 冲高回落评分上限（lo~hi得1分）
+        self.pref_gain_5d_threshold = 22  # 过去5天涨幅上限（超过则优选分减3分）
+        self.pref_pull_all_days_threshold = 3  # 放量期3天都冲高回落超过此值则减3分
         logger.info(f"✅ 已初始化 mootdx Reader (通达信目录: {tdx_dir})")
     
     def _get_historical_klines(self, stock_code: str, analysis_date: str, days: int = 300) -> pd.DataFrame:
@@ -192,7 +208,7 @@ class HistoricalStockScorer:
         
         return position, upper.iloc[-1], lower.iloc[-1]
     
-    def analyze_stock(self, symbol: str, analysis_date: str) -> Optional[float]:
+    def analyze_stock(self, symbol: str, analysis_date: str) -> Optional[Tuple[float, float]]:
         """
         分析单只股票并返回评分（基于指定历史日期）
         
@@ -201,7 +217,7 @@ class HistoricalStockScorer:
             analysis_date: 分析日期 (格式: YYYY-MM-DD)
             
         Returns:
-            综合评分 (float)，如果分析失败返回 None（新版：0-100分制）
+            Tuple[综合评分(0-100), 优选分(0-10)]，失败返回 None
         """
         try:
             # 解析股票代码
@@ -216,11 +232,123 @@ class HistoricalStockScorer:
             from local.utils import calculate_trend_score_v2
             score = calculate_trend_score_v2(market, code, days=300, end_date=analysis_date)
             
-            return score
+            # 评分失败则整只股票跳过
+            if score is None:
+                return None
+            
+            # 计算优选分
+            pref_score = self._calc_pref_and_veto(market, code, analysis_date)
+            
+            return (score, pref_score)
                 
         except Exception as e:
             logger.debug(f"❌ 分析 {symbol} 失败: {e}")
             return None
+    
+    def _calc_pref_and_veto(self, market: str, code: str, 
+                            analysis_date: str) -> float:
+        """
+        计算优选分（0~10分）
+        
+        六项评分：
+          ① 成交量温和放量（量递增1.5分 + 量比1.2x~pref_vol_ratio_threshold 1.5分）
+          ② 最后1天价格最高 → 2分
+          ③ 涨幅<pref_gain_lo → 3分，lo~hi → 1.5分，≥hi → 0分
+          ④ 第3天上影线≤pref_pull_lo → 2分，lo~hi → 1分
+          ⑤ 过去5天涨幅>pref_gain_5d_threshold → 减3分
+          ⑥ 放量期3天都冲高回落>pref_pull_all_days_threshold → 减2分，其中一天>5%再减1分
+        
+        Returns:
+            优选分(0~10)
+        """
+        try:
+            df = self._get_historical_klines(f"{market}{code}", analysis_date, days=30)
+            if df.empty or len(df) < 20:
+                return 0
+            
+            volumes = df['volume'].iloc[-3:].values
+            closes = df['close'].iloc[-3:].values
+            highs = df['high'].iloc[-3:].values
+            base_close = df['close'].iloc[-4]
+            
+            # === 计算优选分 ===
+            # 涨幅优先从股票池文件读取（已按基准日收盘计算），不存在时自己算
+            gain_pct = self._get_return_pct_from_file(code, analysis_date)
+            if gain_pct is None:
+                gain_pct = (closes[-1] - base_close) / base_close * 100
+            latest_pullback = (highs[-1] - closes[-1]) / highs[-1] * 100 if highs[-1] > 0 else 0
+            total = 0
+            
+            # ① 成交量温和放量（3分，量递增1.5分 + 量比合理1.5分）
+            vol_increasing = volumes[0] < volumes[1] < volumes[2]
+            vol_ma20 = df['volume'].iloc[-20:].mean()
+            vol_ratio = volumes[-1] / vol_ma20 if vol_ma20 > 0 else 99
+            vol_ok = self.pref_vol_ratio_min < vol_ratio < self.pref_vol_ratio_threshold
+            
+            if vol_increasing:
+                total += 1.5
+            if vol_ok:
+                total += 1.5
+            
+            # ② 最后1天价格最高（2分）
+            if closes[-1] >= max(closes):
+                total += 2
+            elif closes[-1] > closes[-2]:
+                total += 1
+            
+            # ③ 涨幅评分（3分）
+            if gain_pct < self.pref_gain_lo:
+                total += 3
+            elif gain_pct < self.pref_gain_hi:
+                total += 1.5
+            
+            # ④ 冲高回落评分（2分）
+            if latest_pullback <= self.pref_pull_lo:
+                total += 2
+            elif latest_pullback <= self.pref_pull_hi:
+                total += 1
+            
+            # ⑤ 过去5天涨幅过大惩罚（减3分）
+            if len(df) >= 6:
+                close_5d_ago = df['close'].iloc[-6]
+                gain_5d = (closes[-1] - close_5d_ago) / close_5d_ago * 100
+                if gain_5d > self.pref_gain_5d_threshold:
+                    total -= 3
+            
+            # ⑥ 放量期3天都冲高回落超过阈值（减2分），其中一天超5%再减1分
+            pullbacks = [(highs[i] - closes[i]) / highs[i] * 100 for i in range(3) if highs[i] > 0]
+            if len(pullbacks) == 3 and all(p > self.pref_pull_all_days_threshold for p in pullbacks):
+                total -= 2
+                if any(p > 5 for p in pullbacks):
+                    total -= 1
+            
+            return min(total, 10)
+            
+        except Exception:
+            return 0
+    
+    def _get_return_pct_from_file(self, code: str, analysis_date: str) -> Optional[float]:
+        """从股票池文件读取放量期涨幅（return_pct），带缓存"""
+        date_key = analysis_date.replace('-', '')
+        
+        # 按日期缓存，避免重复读取文件
+        if date_key not in self._return_pct_cache:
+            filepath = Path(__file__).parent.parent / "data" / f"stockpool_{date_key}.txt"
+            if not filepath.exists():
+                self._return_pct_cache[date_key] = {}
+            else:
+                cache = {}
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            parts = line.strip().split(',')
+                            if len(parts) == 5 and parts[0].isdigit():
+                                cache[parts[0]] = float(parts[4])
+                except Exception:
+                    pass
+                self._return_pct_cache[date_key] = cache
+        
+        return self._return_pct_cache[date_key].get(code, None)
     
     def _load_industry_cache(self):
         """从本地文件加载行业信息缓存"""
@@ -391,6 +519,50 @@ class HistoricalStockScorer:
         
         return selected[:max_count]
     
+    def _select_with_score_distribution(self, 
+                                        sorted_results: List[Tuple[str, float]], 
+                                        max_candidates: int) -> List[Tuple[str, float]]:
+        """
+        评分分层采样：让选出的股票评分均匀分布
+        
+        把按评分降序排列的候选股等距抽样，避免集中在同一分数。
+        比如候选股100只，从第1名开始每隔10名取1只，共取max_candidates只。
+        
+        Args:
+            sorted_results: 已按评分降序排序的列表
+            max_candidates: 最多保留的候选数量（后续还有行业分散）
+        
+        Returns:
+            评分分散后的股票列表
+        """
+        if len(sorted_results) <= max_candidates:
+            return sorted_results
+        
+        # 检查评分是否集中（max-min < 5分说明很集中，没必要分层）
+        scores = [s for _, s in sorted_results]
+        if max(scores) - min(scores) < 5:
+            return sorted_results[:max_candidates]
+        
+        # 等距抽样：从排序列表中均匀取 max_candidates 只
+        selected = []
+        step = len(sorted_results) / max_candidates
+        for i in range(max_candidates):
+            idx = int(i * step)
+            if idx < len(sorted_results):
+                selected.append(sorted_results[idx])
+        
+        # 限制：同一个分值最多取3只，避免单个分值占比过高
+        score_count = {}
+        final_selected = []
+        for symbol, score in selected:
+            int_score = int(score)
+            if score_count.get(int_score, 0) >= self.max_per_score:
+                continue
+            score_count[int_score] = score_count.get(int_score, 0) + 1
+            final_selected.append((symbol, score))
+        
+        return final_selected
+    
     def load_stock_pool(self, date_str: str) -> List[str]:
         """
         加载指定日期的股票池
@@ -439,7 +611,8 @@ class HistoricalStockScorer:
         
         return stocks
     
-    def append_scores_to_file(self, date_str: str, scored_results: List[Tuple[str, float]], 
+    def append_scores_to_file(self, date_str: str, 
+                             scored_results: List[Tuple[str, float, int]], 
                              backup: bool = False, min_score: float = 60.0, max_score: float = 100.0, 
                              max_count: int = 10, max_per_industry: int = 3, min_count: int = 3):
         """
@@ -447,7 +620,7 @@ class HistoricalStockScorer:
         
         Args:
             date_str: 日期字符串 (格式: YYYY-MM-DD)
-            scored_results: 评分结果列表 [(股票代码, 评分), ...]
+            scored_results: [(股票代码, 评分, 优选分), ...]
             backup: 是否创建备份文件（默认False）
             min_score: 最低评分阈值（默认60）
             max_score: 最高评分阈值（默认100）
@@ -465,8 +638,8 @@ class HistoricalStockScorer:
         
         # === 第一步：按评分区间筛选 ===
         filtered_results = [
-            (symbol, score) for symbol, score in scored_results 
-            if min_score <= score <= max_score
+            (symbol, score, pref) for symbol, score, pref in scored_results 
+            if min_score <= score <= max_score and pref >= self.min_pref_score
         ]
         
         original_count = len(scored_results)
@@ -478,14 +651,58 @@ class HistoricalStockScorer:
             logger.warning(f"[WARN] {date_str}: 无股票满足评分要求（[{min_score}-{max_score}]），跳过保存")
             return
         
-        # === 第二步：按评分降序排序，再按行业分散取Top N ===
-        sorted_results = sorted(filtered_results, key=lambda x: x[1], reverse=True)
+        # === 第二步：先按原逻辑选出10只，高分股替换最低分 ===
+        # 先按原逻辑选出10只（评分降序→分层采样→行业分散）
+        sorted_results = sorted(filtered_results, key=lambda x: (x[1], x[2]), reverse=True)
+        sorted_pairs = [(s, sc) for s, sc, _ in sorted_results]
+        distributed = self._select_with_score_distribution(sorted_pairs, max_count * 2)
         top_results = self._select_with_industry_diversification(
-            sorted_results, max_count, max_per_industry, min_count
+            distributed, max_count, max_per_industry, min_count
         )
         
+        # 构建优选分查找表（用于替换决策）
+        pref_map = {}
+        for sym, sc, p in scored_results:
+            code = sym.split('.')[1] if '.' in sym else sym
+            pref_map[code] = p
+        
+        # 高分段股票
+        high = [(s, sc, p) for s, sc, p in scored_results
+                if self.high_score_min <= sc < self.high_score_max and p >= self.high_pref_score]
+        high_sorted = sorted(high, key=lambda x: (x[1], x[2]), reverse=True)
+        
+        replaced = 0
+        for hs, hsc, hp in high_sorted[:self.high_max_count]:
+            hs_code = hs.split('.')[1] if '.' in hs else hs
+            # 已在top中则跳过
+            if any(s == hs for s, _ in top_results):
+                continue
+            if not top_results:
+                continue
+            
+            # 检查当前top中所有股票的优选分
+            top_prefs = []
+            for s, sc in top_results:
+                code = s.split('.')[1] if '.' in s else s
+                p = pref_map.get(code, 0)
+                top_prefs.append(p)
+            
+            # 如果全部≥8，替换评分最低的；否则替换优选分最低的
+            if all(p >= 8 for p in top_prefs):
+                target = min(top_results, key=lambda x: x[1])
+            else:
+                # 找优选分最低的
+                target = min(top_results, key=lambda x: pref_map.get(x[0].split('.')[1] if '.' in x[0] else x[0], 0))
+            
+            new_top = [(s, sc) for s, sc in top_results if s != target[0]]
+            new_top.append((hs, hsc))
+            top_results = new_top
+            replaced += 1
+        
         final_count = len(top_results)
-        logger.info(f"[TOP] {date_str}: 保留 {final_count} 只股票（行业上限: {max_per_industry}/行业，评分排序）")
+        scores_str = ",".join(f"{s:.0f}" for _, s in top_results)
+        if replaced > 0:
+            logger.info(f"[HIGH] {date_str}: 高分段替换 {replaced} 只")
         
         # 根据参数决定是否创建备份文件
         if backup:
@@ -512,13 +729,16 @@ class HistoricalStockScorer:
             # 添加评分数据标识
             f.write(f"\n# === 技术评分数据 (自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
             f.write(f"# 筛选条件: 评分 [{min_score}-{max_score}], 最多保留 {max_count} 只\n")
+            f.write(f"# 格式: 股票代码,评分,优选分\n")
             f.write(f"# 原始数量: {original_count}, 筛选后: {after_filter_count}, 最终保留: {final_count}\n")
             
-            # 写入评分数据（不带市场前缀，保持与原文件格式一致）
+            # 构建优选分查找表
+            pref_map = {s: p for s, _, p in scored_results}
+            # 写入评分数据（不带市场前缀，格式: 股票代码,评分,优选分）
             for symbol, score in top_results:
-                # 移除市场前缀以保持与原文件格式一致
                 code_without_prefix = symbol.split('.')[1] if '.' in symbol else symbol
-                f.write(f"{code_without_prefix},{score:.1f}\n")
+                pref = pref_map.get(symbol, 0)
+                f.write(f"{code_without_prefix},{score:.0f},{pref}\n")
     
     def batch_process(self, start_date: str, end_date: str, backup: bool = False, 
                      min_score: float = None, max_score: float = None, max_stocks: int = None):
@@ -565,8 +785,24 @@ class HistoricalStockScorer:
             # 行业分散配置
             max_per_industry = backtest_config.get('max_stocks_per_industry', 3)
             min_stocks_per_cycle = backtest_config.get('min_stocks_per_cycle', 3)
+            # 优选分配置
+            pref_vol_ratio = backtest_config.get('pref_vol_ratio_threshold', 2.8)
+            self.pref_vol_ratio_threshold = pref_vol_ratio
+            self.min_pref_score = backtest_config.get('min_pref_score', 7)
+            self.pref_vol_ratio_min = backtest_config.get('pref_vol_ratio_min', 1.2)
+            self.max_per_score = backtest_config.get('max_per_score', 3)
+            self.high_score_min = backtest_config.get('high_score_min', 90)
+            self.high_score_max = backtest_config.get('high_score_max', 95)
+            self.high_pref_score = backtest_config.get('high_pref_score', 10)
+            self.high_max_count = backtest_config.get('high_max_count', 3)
+            self.pref_gain_lo = backtest_config.get('pref_gain_lo', 8)
+            self.pref_gain_hi = backtest_config.get('pref_gain_hi', 12)
+            self.pref_pull_lo = backtest_config.get('pref_pull_lo', 3)
+            self.pref_pull_hi = backtest_config.get('pref_pull_hi', 6)
+            self.pref_gain_5d_threshold = backtest_config.get('pref_gain_5d_threshold', 22)
+            self.pref_pull_all_days_threshold = backtest_config.get('pref_pull_all_days_threshold', 3)
             
-            logger.info(f"[CONFIG] 评分区间: [{min_score}-{max_score}], 最大选股数: {max_stocks}, 行业上限: {max_per_industry}")
+            logger.info(f"[CONFIG] 评分区间: [{min_score}-{max_score}], 最大选股数: {max_stocks}, 优选分量比: [{self.pref_vol_ratio_min}-{pref_vol_ratio}]x, 优选分最低: {self.min_pref_score}")
         except Exception as e:
             logger.warning(f"[WARN] 读取配置文件失败: {e}，使用默认值")
             # 如果配置文件读取失败，使用硬编码默认值
@@ -578,6 +814,20 @@ class HistoricalStockScorer:
                 max_stocks = 10
             max_per_industry = 3
             min_stocks_per_cycle = 3
+            self.pref_vol_ratio_threshold = 2.8
+            self.min_pref_score = 7
+            self.pref_vol_ratio_min = 1.2
+            self.max_per_score = 3
+            self.high_score_min = 90
+            self.high_score_max = 95
+            self.high_pref_score = 10
+            self.high_max_count = 3
+            self.pref_gain_lo = 8
+            self.pref_gain_hi = 12
+            self.pref_pull_lo = 3
+            self.pref_pull_hi = 6
+            self.pref_gain_5d_threshold = 22
+            self.pref_pull_all_days_threshold = 3
         
         current = datetime.strptime(start_date, '%Y-%m-%d')
         end = datetime.strptime(end_date, '%Y-%m-%d')
@@ -603,9 +853,10 @@ class HistoricalStockScorer:
             
             for symbol in stocks:
                 stock_index += 1
-                score = self.analyze_stock(symbol, date_str)
-                if score is not None:
-                    scored_results.append((symbol, score))
+                result = self.analyze_stock(symbol, date_str)
+                if result is not None:
+                    score, pref_score = result
+                    scored_results.append((symbol, score, pref_score))
                     scored_count += 1
                 
                 # 每10只股票或最后一只时更新进度

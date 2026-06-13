@@ -76,6 +76,58 @@ def load_scored_stockpool(date_str: str) -> list:
     return scored_stocks
 
 
+def _get_industry(code: str) -> str:
+    """
+    获取股票所属行业（多方案降级）
+    
+    方案1: 东方财富HTTP接口（首选）
+    方案2: akshare（降级）
+    
+    Args:
+        code: 6位股票代码（不含市场前缀），如 '000526'
+    
+    Returns:
+        str: 行业名称，获取失败返回'未知'
+    """
+    import time
+    
+    # === 方案1：东方财富HTTP接口 ===
+    try:
+        import requests as req
+        
+        # 判断市场代码：深交所(SZ) / 上交所(SH)
+        market_code = 'SZ' if not code.startswith('6') else 'SH'
+        
+        url = "http://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/CompanySurveyAjax"
+        params = {"code": f"{market_code}{code}"}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'http://quote.eastmoney.com/'
+        }
+        
+        time.sleep(0.3)
+        response = req.get(url, params=params, headers=headers, timeout=5)
+        data = response.json()
+        
+        if data.get('jbzl') and data['jbzl'].get('sshy'):
+            return str(data['jbzl']['sshy'])
+    except Exception:
+        pass
+    
+    # === 方案2：降级到akshare ===
+    try:
+        import akshare as ak
+        info = ak.stock_individual_info_em(symbol=code)
+        if info is not None and not info.empty:
+            industry_row = info[info['item'] == '行业']
+            if not industry_row.empty:
+                return industry_row['value'].iloc[0]
+    except Exception:
+        pass
+    
+    return '未知'
+
+
 def get_stock_info_batch(scored_stocks: list, top_n: int = None) -> pd.DataFrame:
     """
     批量获取股票基本信息
@@ -88,7 +140,7 @@ def get_stock_info_batch(scored_stocks: list, top_n: int = None) -> pd.DataFrame
         DataFrame: 包含代码、名称、行业、评分、评级等信息
     """
     try:
-        import akshare as ak
+        from local.utils import get_stock_name
         
         # 如果指定了top_n，只处理前N只
         if top_n:
@@ -101,15 +153,13 @@ def get_stock_info_batch(scored_stocks: list, top_n: int = None) -> pd.DataFrame
         results = []
         for idx, (code, score) in enumerate(display_stocks, 1):
             try:
-                # 获取股票基本信息
-                df = ak.stock_individual_info_em(symbol=code)
-                
-                if df is not None and not df.empty:
-                    name = df[df['item'] == '股票简称']['value'].values[0] if len(df[df['item'] == '股票简称']) > 0 else code
-                    industry = df[df['item'] == '行业']['value'].values[0] if len(df[df['item'] == '行业']) > 0 else '未知'
-                else:
+                # 使用腾讯财经API获取名称（比akshare更稳定）
+                name = get_stock_name(code)
+                if name == code:
                     name = '获取失败'
-                    industry = '未知'
+                
+                # 使用东方财富HTTP接口获取行业（多方案降级）
+                industry = _get_industry(code)
                 
                 # 计算评级
                 if score >= 80:
@@ -140,7 +190,7 @@ def get_stock_info_batch(scored_stocks: list, top_n: int = None) -> pd.DataFrame
                 results.append({
                     '序号': idx,
                     '代码': code,
-                    '名称': f'错误',
+                    '名称': '获取失败',
                     '行业': '未知',
                     '评分': score,
                     '评级': '获取失败'
@@ -148,8 +198,8 @@ def get_stock_info_batch(scored_stocks: list, top_n: int = None) -> pd.DataFrame
         
         return pd.DataFrame(results)
         
-    except ImportError:
-        print("[ERROR] 需要安装 akshare: pip install akshare")
+    except ImportError as e:
+        print(f"[ERROR] 导入模块失败: {e}")
         return pd.DataFrame()
 
 

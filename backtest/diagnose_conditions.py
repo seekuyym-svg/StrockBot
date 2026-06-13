@@ -73,45 +73,47 @@ def diagnose_single_stock(generator: StockPoolGenerator, stock_code: str,
         
         result['data_ok'] = True
         
-        # === 条件1：成交量放量（已优化）===
+        # === 条件1：成交量放量 ===
         base_volume = df_before['volume'].iloc[-generator.volume_period - 1]
         period_volumes = df_before['volume'].iloc[-generator.volume_period:].values
-        threshold = base_volume * 0.95
-        result['cond1_volume'] = all(v > threshold for v in period_volumes)
+        # 1b：至少2天 >= 基准日 × volume_up_ratio(默认85%)
+        up_ratio = getattr(generator, 'volume_up_ratio', 0.85)
+        floor_ratio = getattr(generator, 'volume_floor_ratio', 0.65)
+        cond1a = sum(1 for v in period_volumes if v >= base_volume * up_ratio) >= 2
+        # 1b底线：所有天 >= 基准日 × volume_floor_ratio(默认65%)
+        cond1b = all(v >= base_volume * floor_ratio for v in period_volumes)
+        result['cond1_volume'] = cond1a and cond1b
         
         closes = df_before['close'].iloc[-generator.volume_period:].values
-        opens = df_before['open'].iloc[-generator.volume_period:].values
         
-        # === 条件2：放量期价格稳步上涨（允许第2天小幅回调洗盘）===
+        # === 条件2：放量期价格稳步上涨 ===
         base_close = df_before['close'].iloc[-generator.volume_period - 1]
         
-        # 2a：第1天收盘 > 基准日收盘（突破启动）
-        cond2a = closes[0] > base_close
+        # 2a：至少2天收盘 > 基准日收盘
+        cond2a = sum(1 for c in closes if c > base_close) >= 2
         result['cond2_uptrend'] = cond2a
         
-        # 2b：最后1天收盘 > 第1天收盘（最终上涨）
-        cond2b = closes[-1] > closes[0]
-        result['cond2b_final_up'] = cond2b
-        
-        # 2c：第2天收盘 >= 启动开盘价 × 95%（允许洗盘，但不跌破）
-        if len(closes) >= 2:
-            start_price = opens[0]
-            min_allowed = start_price * (1 + generator.max_retracement_pct / 100)
-            cond2c = closes[1] >= min_allowed
-        else:
-            cond2c = True
-        result['cond2c_retracement'] = cond2c
-        
-        # === 条件2d：冲高回落 ===
-        highs = df_before['high'].iloc[-generator.volume_period:].values
-        closes_check = df_before['close'].iloc[-generator.volume_period:].values
-        cond2b_pass = True
-        for h, c in zip(highs, closes_check):
-            if h > 0:
-                pullback = (h - c) / h * 100
-                if pullback >= generator.max_intraday_pullback_pct:
-                    cond2b_pass = False
+        # 2b：低于基准日的天 >= 基准日收盘 × 95%
+        cond2b = True
+        for c in closes:
+            if c <= base_close:
+                if c < base_close * 0.95:
+                    cond2b = False
                     break
+        result['cond2b_retracement'] = cond2b
+        
+        # 2c：第3天不是3天中最低的
+        cond2c = closes[-1] > min(closes)
+        result['cond2c_final_up'] = cond2c
+        
+        # === 条件2d：冲高回落（仅检查第3天）===
+        latest_high = df_before['high'].iloc[-1]
+        latest_close = df_before['close'].iloc[-1]
+        cond2b_pass = True
+        if latest_high > 0:
+            pullback = (latest_high - latest_close) / latest_high * 100
+            if pullback >= generator.max_intraday_pullback_pct:
+                cond2b_pass = False
         result['cond2b_pullback'] = cond2b_pass
         
         # === 条件3：站上MA20 ===
@@ -120,16 +122,27 @@ def diagnose_single_stock(generator: StockPoolGenerator, stock_code: str,
         result['cond3_ma20'] = latest_close >= ma20
         
         # === 条件4：涨幅区间 ===
-        recent_return = (closes[-1] - closes[0]) / closes[0] * 100
+        recent_return = (closes[-1] - base_close) / base_close * 100
         result['recent_return'] = round(recent_return, 2)
         result['cond4_return'] = (generator.min_price_change_pct <= recent_return <= generator.max_price_change_pct)
         
-        # === 条件5：量比区间 ===
+        # === 条件5：量比区间（放量期3天≥min，基准日≥min×0.9）===
         vol_ma20 = df_before['volume'].rolling(20).mean().iloc[-1]
-        latest_vol = df_before['volume'].iloc[-1]
-        vol_ratio = latest_vol / vol_ma20 if vol_ma20 > 0 else 1
+        # 放量期3天
+        cond5_pass = True
+        for i in range(-generator.volume_period, 0):
+            vr = df_before['volume'].iloc[i] / vol_ma20 if vol_ma20 > 0 else 1
+            if not (generator.min_volume_ratio <= vr <= generator.max_volume_ratio):
+                cond5_pass = False
+                break
+        # 基准日
+        if cond5_pass:
+            base_vr = df_before['volume'].iloc[-generator.volume_period - 1] / vol_ma20 if vol_ma20 > 0 else 1
+            if base_vr < generator.base_volume_ratio or base_vr > generator.max_volume_ratio:
+                cond5_pass = False
+        vol_ratio = df_before['volume'].iloc[-1] / vol_ma20 if vol_ma20 > 0 else 1
         result['vol_ratio'] = round(vol_ratio, 2)
-        result['cond5_vol_ratio'] = (generator.min_volume_ratio <= vol_ratio <= generator.max_volume_ratio)
+        result['cond5_vol_ratio'] = cond5_pass
         
         # === 条件6：相对强度（新增）===
         index_ret = generator._get_index_return(check_date, generator.volume_period)
@@ -213,8 +226,8 @@ def main():
     cond_stats = {
         'cond1_volume': {'name': '① 成交量放量（已优化）',       'pass': 0, 'fail': 0},
         'cond2_uptrend': {'name': '②a 突破启动（优化✅）',      'pass': 0, 'fail': 0},
-        'cond2b_final_up': {'name': '②b 最终上涨（优化✅）',    'pass': 0, 'fail': 0},
-        'cond2c_retracement': {'name': '②c 允许洗盘（优化✅）',  'pass': 0, 'fail': 0},
+        'cond2b_retracement': {'name': '②b 不低于95%（优化✅）','pass': 0, 'fail': 0},
+        'cond2c_final_up': {'name': '②c 最高收盘（优化✅）',    'pass': 0, 'fail': 0},
         'cond2b_pullback': {'name': '②d 冲高回落',              'pass': 0, 'fail': 0},
         'cond3_ma20': {'name': '③ 站上MA20',                  'pass': 0, 'fail': 0},
         'cond4_return': {'name': '④ 涨幅区间',                 'pass': 0, 'fail': 0},
@@ -250,7 +263,7 @@ def main():
                 cond_stats[cond_key]['fail'] += 1
         
         # 旧条件（不含2a~2d/6/7）全部通过？
-        cond2_pass = (diag['cond2_uptrend'] and diag['cond2b_final_up'] and diag['cond2c_retracement'])
+        cond2_pass = (diag['cond2_uptrend'] and diag['cond2b_retracement'] and diag['cond2c_final_up'])
         old_pass = (diag['cond1_volume'] and cond2_pass
                     and diag['cond3_ma20'] and diag['cond4_return'] 
                     and diag['cond5_vol_ratio'])

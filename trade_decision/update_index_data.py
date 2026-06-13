@@ -9,16 +9,16 @@
 
 使用示例:
     # 增量更新科创综指（从本地最新日期+1天到今天）
-    python backtest/update_index_data.py --name kc_index --secid 1.000680
+    python trade_decision/update_index_data.py --name kc_index --secid 1.000680
     
     # 增量更新沪深300
-    python backtest/update_index_data.py --name hs300_eastmoney --secid 1.000300
+    python trade_decision/update_index_data.py --name hs300_eastmoney --secid 1.000300
     
     # 全量更新（指定日期范围）
-    python backtest/update_index_data.py --name kc_index --secid 1.000680 --start 2020-01-01
+    python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --start 2020-01-01
     
     # 重命名（可指定输出文件名，默认 data/{name}.csv）
-    python backtest/update_index_data.py --name kc_index --secid 1.000680 --out data/my_kc.csv
+    python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --out data/my_kc.csv
 """
 
 import requests
@@ -195,16 +195,16 @@ def main():
         epilog="""
 使用示例:
   # 增量更新科创综指
-  python backtest/update_index_data.py --name kc_index --secid 1.000680
+  python trade_decision/update_index_data.py --name kc_index --secid 1.000680
 
   # 增量更新沪深300
-  python backtest/update_index_data.py --name hs300_eastmoney --secid 1.000300
+  python trade_decision/update_index_data.py --name hs300_eastmoney --secid 1.000300
 
   # 全量更新
-  python backtest/update_index_data.py --name kc_index --secid 1.000680 --start 2020-01-01
+  python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --start 2020-01-01
 
   # 自定义输出路径
-  python backtest/update_index_data.py --name kc_index --secid 1.000680 --out data/my_kc.csv
+  python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --out data/my_kc.csv
 
 支持任意东方财富指数 secid:
   1.000300  沪深300

@@ -230,6 +230,28 @@ database:
 # 通达信安装目录
 TDX_DIR: "D:\\Install\\zd_zxzq_gm"
 
+# === 选股范围配置（2026-06-21 新增成分股过滤支持）===
+# 支持全市场或按指数成分股选股
+stock_universe:
+  mode: full_market              # full_market=全市场 | index_constituents=按成分股
+  # 以下配置在 mode: index_constituents 时生效
+  indices:
+    - code: "000300"
+      name: "沪深300"
+      enabled: true
+    - code: "000852"
+      name: "中证1000"
+      enabled: true
+    - code: "932000"
+      name: "中证2000"
+      enabled: false             # 已配置但暂不开启
+    - code: "000688"
+      name: "科创50"
+      enabled: true
+  union_or_intersection: union   # union=并集 | intersection=交集
+  auto_update: true              # 启动时自动检查并更新成分股缓存
+  update_freq_days: 7            # 缓存刷新周期（天）
+
 # 回测配置
 backtest:
   # 持仓天数（交易日）
@@ -248,25 +270,45 @@ backtest:
   max_retracement_pct: -5.0    # 放量期内最低收盘 >= 启动价×(1-5%)，默认-5%
   # 日内冲高回落最大允许幅度（%），超过此值视为出货形态
   # 检查放量期内每天：(最高价 - 收盘价) / 最高价 * 100，超过则淘汰
-  max_intraday_pullback_pct: 6.0  # 放宽：从5%调整为8%，放过小幅冲高回落
+  max_intraday_pullback_pct: 8.0  # 放宽：调整为8%，放过小幅冲高回落；优选分再进一步控制
   # 相对大盘的最小超额收益（%），负值表示允许略弱于大盘
   # 目的：确保选出的股票不显著弱于大盘
   min_relative_strength: 0.0    # 放宽：从0.0调回-2%，允许略弱于大盘
   # 日波动率上限（%），超过此值视为高风险股淘汰
   # 用最近20个交易日计算：日收益率标准差 * 100
   # 参考：1-2%正常，2-3%偏高，>3%高波动
-  max_volatility_pct: 3.5       # 放宽：从3.0%调至4.5%，放过中等波动股
+  max_volatility_pct: 6.0       # 放宽：从3.0%调至4.5%，放过中等波动股
   
   # 成交量放大倍数范围
-  min_volume_ratio: 1.1         # 最小量比（提高：从1.1x改为1.3x，过滤温和放量）
-  max_volume_ratio: 6.0         # 最大量比（8.0x降至5.0x）
+  base_volume_ratio: 0.7        # 基准日放量倍数；为了选牛股，降低标准
+  min_volume_ratio: 0.8         # 最小量比（提高：从1.1x改为1.3x，过滤温和放量）
+  max_volume_ratio: 5.0         # 最大量比（8.0x降至5.0x）
+  # 成交量对比前日比例（条件①1b）
+  volume_up_ratio: 0.85         # 至少2天 ≥ 基准日×此比例（默认85%）
+  volume_floor_ratio: 0.65      # 所有天 ≥ 基准日×此比例（默认65%，底线）
   
   # === 第二阶段评分配置 ===
-  min_score: 60                 # 最低评分阈值（满分100分，建议设置为60-70分）
-  max_score: 100                # 最高评分阈值（满分100分）
+  min_score: 65                 # 最低评分阈值（满分100分，建议设置为60-70分）
+  max_score: 75                 # 最高评分阈值（满分100分）
   max_stocks_per_cycle: 10      # 每个周期最多选10只股票
   min_stocks_per_cycle: 3       # 最少选3只（保证分散）
   max_stocks_per_industry: 3    # 每个行业最多选几只（行业分散，降低系统性风险）
+  max_per_score: 3              # 同分值最多保留几只（默认3）；该设置很关键，会明显影响收益率
+  
+  pref_vol_ratio_threshold: 3.0 # 优选分量比上限
+  pref_vol_ratio_min: 1.0       # 优选分量比下限，必须大于等于min_volume_ratio
+  min_pref_score: 0             # 优选分最低要求（低于此分直接淘汰）；0代表暂时不限制，主要就是用来排序的  
+ 
+  high_score_min: 90            # 高分段最低评分
+  high_score_max: 95            # 高分段最高评分
+  high_pref_score: 7.5          # 高分段最低优选分
+  high_max_count: 3             # 高分段最多入选几只
+  pref_gain_lo: 10              # 涨幅评分下限（<此值得3分）
+  pref_gain_hi: 15.5            # 涨幅评分上限（lo~hi得1.5分，超过得0分）；为了抓牛股，放宽涨幅
+  pref_pull_lo: 3               # 冲高回落评分下限（≤此值得2分）
+  pref_pull_hi: 6               # 冲高回落评分上限（lo~hi得1分）
+  pref_gain_5d_threshold: 24    # 过去5天涨幅上限（超过则优选分减3分）
+  pref_pull_all_days_threshold: 3  # 放量期3天都冲高回落超过此值则减3分
   
   # === 数据源配置（2026-05-04新增）===
   use_local_data: true          # 是否使用本地通达信数据（服务器环境设置为false，使用网络API）
@@ -274,7 +316,7 @@ backtest:
   max_data_age_days: 7          # 数据最大允许年龄（交易日），超过则警告
   
   # 综合评分最小值（兼容旧配置）
-  backtest_minscore: 60         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score
+  backtest_minscore: 65         # run_backtest.py还在读取，用于进一步筛选股票评分，低于该评分不交易，大于等于min_score
 
 # === 大盘环境信号配置 ===
 # 用于 trade_decision/market_signal.py，判断是否允许买入

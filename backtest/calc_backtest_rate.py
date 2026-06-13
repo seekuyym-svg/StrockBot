@@ -19,6 +19,7 @@
 """
 
 import pandas as pd
+import requests
 from datetime import datetime
 import os
 import sys
@@ -52,6 +53,7 @@ DATA_DIR = project_root / "data"  # 报告输出目录（项目根目录下的da
 # 从 config.yaml 的 backtest 节点读取初始资金，命令行参数可覆盖
 BACKTEST_CONFIG = config.get('backtest', {})
 DEFAULT_INITIAL_CAPITAL = BACKTEST_CONFIG.get('initial_capital', 100000)
+KLINE_CACHE_DIR = project_root / "data" / "kline_cache"
 
 
 def load_stock_pool(pooldate: str) -> List[Dict[str, str]]:
@@ -131,7 +133,8 @@ def load_stock_pool(pooldate: str) -> List[Dict[str, str]]:
                 
                 watchlist.append({
                     'code': code,
-                    'market': market
+                    'market': market,
+                    'score': score
                 })
         
         # 输出统计信息
@@ -177,6 +180,59 @@ def save_report_to_file(content: str, filename: str):
     except Exception as e:
         print(f"❌ 保存报告失败: {e}")
         return False
+
+
+def fetch_klines_from_tencent(code: str) -> Optional[pd.DataFrame]:
+    """
+    从腾讯API获取前复权K线数据，带本地缓存
+    
+    Args:
+        code: 股票代码（6位数字）
+    Returns:
+        DataFrame 含 date(索引), open, close, high, low, volume，失败返回 None
+    """
+    cache_file = KLINE_CACHE_DIR / f"{code}.pkl"
+    if cache_file.exists():
+        try:
+            return pd.read_pickle(cache_file)
+        except Exception:
+            pass
+    
+    market = 'sh' if code.startswith('6') else 'sz'
+    url = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    params = {"param": f"{market}{code},day,,,200,qfq"}
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        data = resp.json()
+        stock_data = data.get('data', {}).get(f'{market}{code}', {})
+        klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
+        
+        records = []
+        for line in klines:
+            if isinstance(line, (list, tuple)) and len(line) >= 6:
+                try:
+                    records.append({
+                        'date': pd.to_datetime(line[0]),
+                        'open': float(line[1]),
+                        'close': float(line[2]),
+                        'high': float(line[3]),
+                        'low': float(line[4]),
+                        'volume': float(line[5]),
+                    })
+                except (ValueError, TypeError):
+                    continue
+        
+        if not records:
+            return None
+        
+        df = pd.DataFrame(records).set_index('date').sort_index()
+        KLINE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_pickle(cache_file)
+        return df
+    except Exception:
+        return None
 
 
 def format_single_day_report(target_date: str, results: list, total_investment: float, 
@@ -261,11 +317,11 @@ def format_single_day_report(target_date: str, results: list, total_investment: 
     lines.append("=" * 80)
     lines.append("📋 详细数据表")
     lines.append("=" * 80)
-    lines.append(f"{'代码':<10} {'名称':<15} {'开盘价':>8} {'收盘价':>8} {'收益率':>10} {'盈亏':>12}")
-    lines.append("-" * 80)
+    lines.append(f"{'代码':<10} {'名称':<15} {'评分':>5} {'开盘价':>8} {'收盘价':>8} {'收益率':>10} {'盈亏':>12}")
+    lines.append("-" * 90)
     
     for r in sorted(results, key=lambda x: x['return_rate'], reverse=True):
-        lines.append(f"{r['code']:<10} {r['name']:<15} {r['open_price']:>8.2f} {r['close_price']:>8.2f} {r['return_rate']:>+9.2f}% {r['profit_loss']:>+11,.2f}")
+        lines.append(f"{r['code']:<10} {r['name']:<15} {r['score']:>5.0f} {r['open_price']:>8.2f} {r['close_price']:>8.2f} {r['return_rate']:>+9.2f}% {r['profit_loss']:>+11,.2f}")
     
     lines.append("")
     lines.append("=" * 80)
@@ -358,11 +414,11 @@ def format_period_report(start_date: str, end_date: str, results: list, total_in
     lines.append("=" * 80)
     lines.append("📋 详细数据表")
     lines.append("=" * 80)
-    lines.append(f"{'代码':<10} {'名称':<15} {'买入价':>8} {'卖出价':>8} {'收益率':>10} {'盈亏':>12}")
-    lines.append("-" * 80)
+    lines.append(f"{'代码':<10} {'名称':<15} {'评分':>5} {'买入价':>8} {'卖出价':>8} {'收益率':>10} {'盈亏':>12}")
+    lines.append("-" * 90)
     
     for r in sorted(results, key=lambda x: x['return_rate'], reverse=True):
-        lines.append(f"{r['code']:<10} {r['name']:<15} {r['buy_price']:>8.2f} {r['sell_price']:>8.2f} {r['return_rate']:>+9.2f}% {r['profit_loss']:>+11,.2f}")
+        lines.append(f"{r['code']:<10} {r['name']:<15} {r['score']:>5.0f} {r['buy_price']:>8.2f} {r['sell_price']:>8.2f} {r['return_rate']:>+9.2f}% {r['profit_loss']:>+11,.2f}")
     
     lines.append("")
     lines.append("=" * 80)
@@ -372,7 +428,8 @@ def format_period_report(start_date: str, end_date: str, results: list, total_in
     return "\n".join(lines)
 
 
-def calculate_single_day_returns(target_date: str, watchlist: list, initial_capital: float):
+def calculate_single_day_returns(target_date: str, watchlist: list, initial_capital: float,
+                                 source: str = 'local'):
     """
     计算指定日期的单日收益率
     
@@ -403,8 +460,11 @@ def calculate_single_day_returns(target_date: str, watchlist: list, initial_capi
             # 获取股票名称
             stock_name = get_stock_name(code)
             
-            # 读取日线数据
-            df = reader.daily(symbol=code)
+            # 读取日线数据（本地或腾讯前复权）
+            if source == 'tencent':
+                df = fetch_klines_from_tencent(code)
+            else:
+                df = reader.daily(symbol=code)
             
             if df is None or df.empty:
                 print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): 无交易数据，跳过")
@@ -454,6 +514,7 @@ def calculate_single_day_returns(target_date: str, watchlist: list, initial_capi
             results.append({
                 'code': code,
                 'name': stock_name,
+                'score': stock.get('score', 0),
                 'open_price': open_price,
                 'close_price': close_price,
                 'shares': shares_bought,
@@ -509,7 +570,8 @@ def calculate_single_day_returns(target_date: str, watchlist: list, initial_capi
         print("=" * 80)
 
 
-def calculate_period_returns(start_date: str, end_date: str, watchlist: list, initial_capital: float):
+def calculate_period_returns(start_date: str, end_date: str, watchlist: list, initial_capital: float,
+                               source: str = 'local'):
     """
     计算指定区间的累计收益率
     
@@ -542,8 +604,11 @@ def calculate_period_returns(start_date: str, end_date: str, watchlist: list, in
             # 获取股票名称
             stock_name = get_stock_name(code)
             
-            # 读取日线数据
-            df = reader.daily(symbol=code)
+            # 读取日线数据（本地或腾讯前复权）
+            if source == 'tencent':
+                df = fetch_klines_from_tencent(code)
+            else:
+                df = reader.daily(symbol=code)
             
             if df is None or df.empty:
                 print(f"[{idx}/{len(watchlist)}] ⚠️  {code} ({stock_name}): 无交易数据，跳过")
@@ -602,6 +667,7 @@ def calculate_period_returns(start_date: str, end_date: str, watchlist: list, in
             results.append({
                 'code': code,
                 'name': stock_name,
+                'score': stock.get('score', 0),
                 'buy_price': buy_price,
                 'sell_price': sell_price,
                 'shares': shares_bought,
@@ -685,6 +751,7 @@ def main():
     parser.add_argument('--end', type=str, help='区间结束日期 (YYYY-MM-DD)')
     parser.add_argument('--pooldate', type=str, help='股票池日期 (YYYYMMDD)')
     parser.add_argument('--capital', type=float, default=None, help=f'初始资金，默认从config.yaml读取（当前配置: {DEFAULT_INITIAL_CAPITAL:,}）')
+    parser.add_argument('--source', type=str, default='local', choices=['local', 'tencent'], help='数据源: local(本地通达信) 或 tencent(腾讯前复权API)')
     
     args = parser.parse_args()
     
@@ -749,13 +816,16 @@ def main():
         sys.exit(1)
     
     # 执行计算
+    if args.source == 'tencent':
+        print(f"📡 数据源: 腾讯前复权API")
+    
     if args.date:
-        calculate_single_day_returns(args.date, watchlist, initial_capital)
+        calculate_single_day_returns(args.date, watchlist, initial_capital, source=args.source)
     
     if args.start and args.end:
         if args.date:
             print("\n\n")
-        calculate_period_returns(args.start, args.end, watchlist, initial_capital)
+        calculate_period_returns(args.start, args.end, watchlist, initial_capital, source=args.source)
 
 
 if __name__ == "__main__":
