@@ -68,19 +68,51 @@ python backtest/score_stockpool.py --date 2026-04-13
 python backtest/score_stockpool.py --start-date 2026-01-01 --end-date 2026-06-01
 ```
 
+**命令行参数**：
+
+```bash
+# 批量评分
+python backtest/score_stockpool.py --start-date 2026-01-01 --end-date 2026-06-01
+
+# 自定义评分区间
+python backtest/score_stockpool.py --date 2026-06-10 --min-score 65 --max-score 70 --max-stocks 10
+
+# 全量评分（不过滤区间）
+python backtest/score_stockpool.py --date 2026-06-10 --min-score 0 --max-score 100 --max-stocks 500
+```
+
 **评分系统**：
 
-| 维度 | 权重 | 说明 |
+**综合评分（100分制）**：
+
+| 维度 | 权重 | 子项 | 说明 |
+|:----:|:----:|:-----|:------|
+| 量能因子 | 25分 | 成交量递增10+量比10+换手率5 | 温和放量(1~2倍)最优 |
+| 趋势因子 | 25分 | 均线排列15+均线斜率10 | 短期多头，斜率0.5~2%最优 |
+| 动量因子 | 20分 | 3日涨幅8+相对强度7+偏离5日线5 | 2~5%涨幅最优 |
+| 形态因子 | 20分 | MACD柱体10+布林带5+K线形态5 | 柱体放大+收窄蓄力+小阳线最优 |
+| 风险因子 | 10分 | RSI 5+波动率5 | 波动率2~8%最优 |
+
+**优选分（0~25分）**：综合同分时的第二排序，评估强势延续性
+
+| 子项 | 分值 | 说明 |
 |:----:|:----:|:------|
-| 量能因子 | 20分 | 成交量递增、量比、换手率 |
-| 趋势因子 | 35分 | 均线多头排列、均线斜率 |
-| 动量因子 | 20分 | 5日/10日涨幅、相对强度 |
-| 形态因子 | 15分 | MACD、布林带 |
-| 风险因子 | 10分 | RSI、波动率 |
+| 趋势疲劳度 | 6分 | 阳线连涨天数，≤3天满分，>7天0分 |
+| 前高压力 | 6分 | 距60日高距离，>10%满分，贴前高0分 |
+| 当日强度 | 4分 | 涨1~3%+量比适中满分，大涨过热扣分 |
+| 乖离率 | 4分 | 偏离20日线2~4%满分，>6%或<0%扣分 |
+| 评分趋势 | 5分 | 历史综合评分逐日升高满分 |
 
-**优选分（0~10分）**：评分相同时，按量能和幅度二次排序
+### 第3步：收益率计算
 
-### 第3步：回测
+```bash
+# 计算区间收益率（回测）
+python backtest/calc_backtest_rate.py --start 2026-06-08 --end 2026-06-09 --pooldate 20260605 --capital 1000000
+
+# 收益率会自动写回股票池文件中（第4列为回测收益率%）
+```
+
+### 第4步：回测（完整流程）
 
 ```bash
 # 持有2天（推荐）
@@ -149,26 +181,18 @@ python backtest/update_hs300_data.py
 ```yaml
 backtest:
   hold_days: 2                    # 持仓天数
-  volume_period: 3                # 放量周期
-  min_score: 65                   # 最低评分
-  max_score: 75                   # 最高评分
-  max_stocks_per_cycle: 10        # 每周期最多10只
-  max_stocks_per_industry: 3      # 每行业最多3只
-  min_volume_ratio: 1.0
-  max_volume_ratio: 5.0
-  max_volatility_pct: 6.0
-  min_relative_strength: -2.0
+  min_score: 65                   # 综合评分下限
+  max_score: 70                   # 综合评分上限
+  min_pref_score: 0               # 优选分下限（0=不淘汰）
+  max_pref_score: 16              # 优选分上限（排除过热股）
+  max_stocks_per_cycle: 10        # 每周期最多选股数
+  max_stocks_per_industry: 4      # 每行业最多选几只
+  dynamic_select_ratio: 0.4       # 动态选股比例（候选少时自动减少选股）
+  max_per_score: 3                # 同分值最多保留几只
+  pref_vol_ratio_threshold: 2.8   # 量比上限
+  pref_vol_ratio_min: 1.2         # 量比下限
+  pref_upper_shadow_threshold: 2.5  # 上影线出货信号阈值
   ...
-
-trade_decision:
-  ma_short: 20
-  ma_long: 60
-  min_market_volume: 25000
-
-breakout:
-  consolidation_days: 60
-  consolidation_range: 15.0
-  vol_ratio_threshold: 1.5
 ```
 
 ---
@@ -198,5 +222,5 @@ A: `update_hs300_data.py` → `market_signal.py` → 根据信号决定是否选
 
 ---
 
-**版本**: v2.0  
-**最后更新**: 2026-06-12
+**版本**: v2.1  
+**最后更新**: 2026-06-14

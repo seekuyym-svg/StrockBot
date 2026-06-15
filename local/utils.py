@@ -114,88 +114,78 @@ def get_circulating_shares_from_tencent(market: str, code: str) -> Optional[floa
         return None
 
 
-def calculate_cumulative_turnover_score(market: str, code: str, analysis_date: str = None) -> int:
+# 模块级换手率评分缓存（只初始化一次）
+_TURNOVER_VOL_PERIOD = 3
+
+def calculate_cumulative_turnover_score(market: str, code: str, analysis_date: str = None,
+                                        df: pd.DataFrame = None, vol_ma20: float = None) -> float:
     """
-    计算3天累计换手率评分（新版规则）
+    计算换手率活跃度评分（0~5分）
     
-    评分规则：
-    - 5分：每日换手率均在 5%~15% 且 3日累计 15%~45%（优质活跃度）
-    - 3分：每日换手率均在 3%~20% 且 3日累计 12%~50%（一般活跃度）
-    - 0分：任一日换手率 >25% 或 <2%，或其他情况（不活跃或异常）
-    
-    注意：去掉了负分机制，最低得分为0分
+    优先用真实换手率评分（获取流通股本），失败时降级为量比评分。
+    有传入df时用已有数据，避免重复获取K线。
     
     Args:
         market: 市场代码 ('sh' 或 'sz')
         code: 股票代码
-        analysis_date: 分析日期 (格式: YYYY-MM-DD)，用于回测场景。None表示使用最新数据
+        analysis_date: 分析日期
+        df: 已有的K线DataFrame（可选）
+        vol_ma20: 已有的20日均量（可选）
         
     Returns:
-        int: 评分 (0、3或5分)，API调用失败或数据不足时返回0并输出警告
+        float: 评分 (0~5分)
     """
+    # === 优先方案：真实换手率评分 ===
     try:
-        # 1. 获取流通股本
         circulating_shares = get_circulating_shares_from_tencent(market, code)
-        
-        if circulating_shares is None or circulating_shares <= 0:
-            print(f"⚠️  {market}{code} 无法获取流通股本，换手率评分计0分")
-            return 0
-        
-        # 2. 从配置文件读取volume_period作为最小数据长度要求
-        try:
-            import yaml
-            from pathlib import Path
+        if circulating_shares is not None and circulating_shares > 0:
+            # 有df直接用，没有就临时获取
+            if df is None or df.empty or len(df) < _TURNOVER_VOL_PERIOD:
+                kline_df = _get_historical_klines(market, code, days=10, end_date=analysis_date,
+                                                   min_data_length=_TURNOVER_VOL_PERIOD)
+            else:
+                kline_df = df
             
-            project_root = Path(__file__).parent.parent
-            config_path = project_root / 'config.yaml'
-            
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            
-            volume_period = config.get('backtest', {}).get('volume_period', 3)
-        except Exception as e:
-            print(f"⚠️  读取配置文件失败: {e}，使用默认值3")
-            volume_period = 3
-        
-        # 3. 获取最近N个交易日的K线数据（N = volume_period）
-        df = _get_historical_klines(market, code, days=10, end_date=analysis_date, min_data_length=volume_period)
-        
-        if df.empty or len(df) < volume_period:
-            print(f"⚠️  {market}{code} K线数据不足（仅{len(df)}条），换手率评分计0分")
+            if kline_df is not None and not kline_df.empty and len(kline_df) >= _TURNOVER_VOL_PERIOD:
+                last_n = kline_df.iloc[-_TURNOVER_VOL_PERIOD:]
+                turnovers = []
+                for _, row in last_n.iterrows():
+                    vol_shares = row['volume'] * 100
+                    rate = (vol_shares / circulating_shares) * 100
+                    turnovers.append(rate)
+                
+                avg_turnover = sum(turnovers) / len(turnovers)
+                
+                # 连续评分：基于3天平均换手率
+                if 2 <= avg_turnover <= 8:
+                    return 5.0   # 最佳活跃度，匹配2~4%收益目标
+                elif 1 <= avg_turnover < 2 or 8 < avg_turnover <= 15:
+                    return 3.0   # 一般活跃度
+                elif avg_turnover > 15:
+                    return 1.0   # 过热
+                else:
+                    return 2.0   # 偏低但还不是僵尸
+    except Exception:
+        pass
+    
+    # === 降级方案：量比评分（获取流通股本失败时）===
+    if df is not None and not df.empty and len(df) >= 5:
+        if vol_ma20 is None or vol_ma20 <= 0:
+            vol_ma20 = df['volume'].iloc[-20:].mean()
+        if vol_ma20 <= 0:
             return 0
-        
-        # 取最近volume_period天
-        last_n_days = df.iloc[-volume_period:]
-        
-        # 4. 计算每日换手率列表
-        daily_turnovers = []
-        for _, row in last_n_days.iterrows():
-            volume_lots = row['volume']  # 手
-            volume_shares = volume_lots * 100  # 转换为股
-            turnover_rate = (volume_shares / circulating_shares) * 100
-            daily_turnovers.append(turnover_rate)
-        
-        cumulative_turnover = sum(daily_turnovers)
-        
-        # 5. 根据新规则评分
-        # 检查排除条件：任一日换手率 >25% 或 <2%
-        if any(t > 25 or t < 2 for t in daily_turnovers):
-            return 0
-        
-        # 判断5分条件：每日均在 5%~15% 且 累计 15%~45%
-        if all(5 <= t <= 15 for t in daily_turnovers) and 15 <= cumulative_turnover <= 45:
-            return 5
-        
-        # 判断3分条件：每日均在 3%~20% 且 累计 12%~50%
-        if all(3 <= t <= 20 for t in daily_turnovers) and 12 <= cumulative_turnover <= 50:
-            return 3
-        
-        # 其他情况
-        return 0
-        
-    except Exception as e:
-        print(f"⚠️  计算 {market}{code} 换手率评分失败: {e}，计0分")
-        return 0
+        ratios = [df['volume'].iloc[-1-i] / vol_ma20 for i in range(3)]
+        avg_ratio = sum(ratios) / 3
+        if 0.8 <= avg_ratio <= 2.0:
+            return 5.0
+        elif 2.0 < avg_ratio <= 2.8:
+            return 3.0
+        elif 0.5 <= avg_ratio < 0.8:
+            return 2.0
+        else:
+            return 1.0
+    
+    return 0
 
 
 def calculate_trend_score(market: str, code: str, days: int = 300) -> Optional[float]:
@@ -1172,36 +1162,38 @@ def _get_hs300_period_return(end_date: str, period: int = 5) -> Optional[float]:
 def calculate_trend_score_v2(market: str, code: str, days: int = 300,
                              end_date: str = None) -> Optional[float]:
     """
-    计算股票综合趋势评分（新版，满分100分）
-    
-    评分维度及权重：
-    1. 量能因子（20分）
+    计算股票综合趋势评分（持股2~3天优化版，满分100分）
+
+    评分维度及权重（25+25+20+20+10）：
+    1. 量能因子（25分）
        - 成交量递增强度（10分）
-       - 量比大小（5分）
+       - 量比大小（10分）
        - 换手率活跃度（5分）
-    
-    2. 趋势因子（35分）
-       - 均线多头排列（20分）
-       - 均线斜率（15分）
-    
+
+    2. 趋势因子（25分）
+       - 均线多头排列（15分）
+       - 均线斜率（10分）
+
     3. 动量因子（20分）
-       - 5日/10日涨幅（10分）
-       - 相对强度RS（10分）
-    
-    4. 形态因子（15分）
-       - MACD金叉及位置（8分）
-       - 布林带位置（7分）
-    
+       - 近3日涨幅（8分）
+       - 相对强度RS（7分）
+       - 偏移5日均线（5分）
+
+    4. 形态因子（20分）
+       - MACD金叉及位置（10分）
+       - 布林带位置与带宽（5分）
+       - K线形态（5分）
+
     5. 风险因子（10分）
        - RSI超买超卖（5分）
        - 波动率控制（5分）
-    
+
     Args:
         market: 市场代码 ('sh' 或 'sz')
         code: 股票代码
         days: 获取历史数据天数，默认300天
         end_date: 截止日期 (格式: YYYY-MM-DD)，用于回测场景
-        
+
     Returns:
         float: 综合评分（0-100分），失败返回None
     """
@@ -1210,211 +1202,247 @@ def calculate_trend_score_v2(market: str, code: str, days: int = 300,
         df = _get_historical_klines(market, code, days, end_date=end_date)
         if df.empty or len(df) < 60:
             return None
-        
+
         # 2. 计算技术指标
-        df = _calculate_ma(df, periods=[5, 10, 20, 60])
-        dif, dea, macd_bar = _compute_macd(df)
+        df = _calculate_ma(df, periods=[5, 10, 20])
+        # MACD: 需要系列数据判断柱体变化，内联计算
+        ema_fast = df['close'].ewm(span=12, adjust=False).mean()
+        ema_slow = df['close'].ewm(span=26, adjust=False).mean()
+        dif_series = ema_fast - ema_slow
+        dea_series = dif_series.ewm(span=9, adjust=False).mean()
+        macd_bar_series = (dif_series - dea_series) * 2
+        dif = dif_series.iloc[-1]
+        dea = dea_series.iloc[-1]
+        macd_bar_current = macd_bar_series.iloc[-1]
+        macd_bar_prev = macd_bar_series.iloc[-2] if len(macd_bar_series) >= 2 else macd_bar_current
+
         rsi_val = _compute_rsi(df)
         boll_pos, upper, lower = _compute_bollinger(df)
-        
+
         # 3. 综合评分（满分100分）
         total_score = 0
-        
-        # ========== 1. 量能因子（20分）==========
+        latest_close = df['close'].iloc[-1]
+
+        # ========== 1. 量能因子（25分）==========
         latest_vol = df['volume'].iloc[-1]
-        vol_ma5 = df['volume'].rolling(5).mean().iloc[-1]
         vol_ma20 = df['volume'].rolling(20).mean().iloc[-1]
-        
+
         # 1.1 成交量递增强度（10分）
         volumes_5d = df['volume'].iloc[-5:].values
         vol_increase_days = sum(1 for i in range(1, 5) if volumes_5d[i] > volumes_5d[i-1])
         if vol_increase_days >= 4:
-            total_score += 10  # 连续4天以上递增
+            total_score += 10
         elif vol_increase_days >= 3:
-            total_score += 8   # 连续3天递增
+            total_score += 8
         elif vol_increase_days >= 2:
-            total_score += 5   # 连续2天递增
+            total_score += 5
         elif vol_increase_days >= 1:
-            total_score += 3   # 有1天递增
-        
-        # 1.2 量比大小（5分）
+            total_score += 3
+
+        # 1.2 量比大小（10分）— 适中最好，保留强势股通道
         vol_ratio = latest_vol / vol_ma20 if vol_ma20 > 0 else 1
-        if vol_ratio >= 3.0:
-            total_score += 5   # 显著放量
-        elif vol_ratio >= 2.0:
-            total_score += 4   # 明显放量
-        elif vol_ratio >= 1.5:
-            total_score += 3   # 温和放量
-        elif vol_ratio >= 1.2:
-            total_score += 2   # 轻微放量
-        elif vol_ratio >= 1.0:
-            total_score += 1   # 正常水平
-        
-        # 1.3 换手率活跃度（-5到+5分）- 基于真实换手率计算
-        turnover_score = calculate_cumulative_turnover_score(market, code, end_date)
+        if 1.0 <= vol_ratio <= 2.0:
+            total_score += 10    # 温和放量，最优
+        elif 2.0 < vol_ratio <= 2.5:
+            total_score += 7     # 偏高但可接受（强势股通道）
+        elif 0.8 <= vol_ratio < 1.0 and volumes_5d[-1] > volumes_5d[-2]:
+            total_score += 5     # 缩量上涨
+        elif vol_ratio > 2.5:
+            total_score += 3     # 过热但还给分
+        elif vol_ratio >= 0.8:
+            total_score += 1
+        else:
+            total_score += 0
+
+        # 1.3 换手率活跃度（5分）— 用已有df计算，避免重复获取K线
+        turnover_score = calculate_cumulative_turnover_score(market, code, end_date, df=df, vol_ma20=vol_ma20)
         total_score += turnover_score
-        
-        # ========== 2. 趋势因子（35分）==========
+
+        # ========== 2. 趋势因子（25分）==========
         ma5 = df['MA5'].iloc[-1]
         ma10 = df['MA10'].iloc[-1]
         ma20 = df['MA20'].iloc[-1]
-        ma60 = df['MA60'].iloc[-1]
-        
-        # 2.1 均线多头排列（20分）
-        if pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20) and pd.notna(ma60):
-            if ma5 > ma10 > ma20 > ma60:
-                # 检查发散程度
-                spread_ratio = (ma5 - ma60) / ma60 if ma60 > 0 else 0
-                if spread_ratio > 0.05:  # 发散超过5%
-                    total_score += 20  # 强势多头
-                else:
-                    total_score += 16  # 弱多头
-            elif ma5 > ma10 > ma20:
-                total_score += 12  # 短期多头
+
+        # 2.1 均线多头排列（15分）— 去掉MA60
+        if pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20):
+            if ma5 > ma10 > ma20:
+                total_score += 15   # 完整短期多头
+            elif ma5 > ma10:
+                total_score += 10   # 仅MA5>MA10
             elif ma5 > ma20:
-                total_score += 8   # 仅MA5>MA20
-            elif ma5 < ma10 < ma20 < ma60:
-                total_score += 0   # 空头排列，不给分
+                total_score += 7    # 仅MA5>MA20
+            elif ma5 < ma10 < ma20:
+                total_score += 0    # 空头
             else:
-                total_score += 4   # 震荡状态
-        
-        # 2.2 均线斜率（15分）
+                total_score += 4    # 震荡
+
+        # 2.2 均线斜率（10分）— 温和上行最优
         if pd.notna(ma20):
             ma20_5d_ago = df['MA20'].iloc[-5] if len(df) >= 5 else ma20
             ma20_slope = (ma20 - ma20_5d_ago) / ma20_5d_ago * 100 if ma20_5d_ago > 0 else 0
-            
-            if ma20_slope > 2.0:
-                total_score += 15  # 陡峭上升
-            elif ma20_slope > 1.0:
-                total_score += 12  # 缓步上升
+
+            if 0.5 <= ma20_slope <= 2.0:
+                total_score += 10   # 温和上行，最优
+            elif 2.0 < ma20_slope <= 4.0:
+                total_score += 7    # 较快上行（强势股通道）
+            elif ma20_slope > 4.0:
+                total_score += 3    # 过陡
             elif ma20_slope > 0:
-                total_score += 8   # 微幅上升
-            elif ma20_slope > -1.0:
-                total_score += 4   # 基本持平
+                total_score += 5    # 微幅上升
             else:
-                total_score += 0   # 下降趋势
-        
+                total_score += 0    # 下降
+
         # ========== 3. 动量因子（20分）==========
-        latest_close = df['close'].iloc[-1]
-        
-        # 3.1 5日/10日涨幅（10分）
-        close_5d_ago = df['close'].iloc[-5] if len(df) >= 5 else latest_close
-        close_10d_ago = df['close'].iloc[-10] if len(df) >= 10 else latest_close
-        
-        return_5d = (latest_close - close_5d_ago) / close_5d_ago * 100 if close_5d_ago > 0 else 0
-        return_10d = (latest_close - close_10d_ago) / close_10d_ago * 100 if close_10d_ago > 0 else 0
-        
-        # 综合5日和10日涨幅
-        avg_return = (return_5d + return_10d) / 2
-        
-        if avg_return > 10:
-            total_score += 10  # 强势上涨
-        elif avg_return > 5:
-            total_score += 8   # 明显上涨
-        elif avg_return > 2:
-            total_score += 6   # 温和上涨
-        elif avg_return > 0:
-            total_score += 4   # 微幅上涨
-        elif avg_return > -2:
-            total_score += 2   # 基本持平
+
+        # 3.1 近3日涨幅（8分）
+        close_3d_ago = df['close'].iloc[-3] if len(df) >= 3 else latest_close
+        return_3d = (latest_close - close_3d_ago) / close_3d_ago * 100 if close_3d_ago > 0 else 0
+
+        if 2 <= return_3d <= 5:
+            total_score += 8     # 最优：恰好在目标起步区间
+        elif 5 < return_3d <= 8:
+            total_score += 6     # 偏高但强势股通道
+        elif 0 <= return_3d < 2:
+            total_score += 4     # 微涨
+        elif 8 < return_3d <= 10:
+            total_score += 2     # 涨多了
+        elif return_3d > 10:
+            total_score += 0     # 过热
         else:
-            total_score += 0   # 下跌
-        
-        # 3.2 相对强度RS（10分）- 对比沪深300
+            total_score += 0     # 下跌
+
+        # 3.2 相对强度RS（7分）
+        close_5d_ago = df['close'].iloc[-5] if len(df) >= 5 else latest_close
+        return_5d = (latest_close - close_5d_ago) / close_5d_ago * 100 if close_5d_ago > 0 else 0
+
         hs300_return = _get_hs300_period_return(end_date, 5) if end_date else None
         if hs300_return is not None:
             relative_strength = return_5d - hs300_return
-            if relative_strength > 5:
-                total_score += 10  # 大幅跑赢大盘5%+
-            elif relative_strength > 2:
-                total_score += 8   # 明显跑赢大盘2%+
-            elif relative_strength > 0:
-                total_score += 6   # 微幅跑赢大盘
-            elif relative_strength > -2:
-                total_score += 4   # 与大盘基本持平
+            if 0 <= relative_strength <= 3:
+                total_score += 7   # 刚刚跑赢，最优
+            elif 3 < relative_strength <= 5:
+                total_score += 5   # 明显跑赢（强势股通道）
+            elif relative_strength > 5:
+                total_score += 3   # 大幅跑赢，透支可能
             else:
-                total_score += 2   # 跑输大盘2%+
+                total_score += 0   # 跑输
         else:
-            # 降级方案：沪深300数据不可用时，用个股涨幅替代
-            if return_5d > 8:
-                total_score += 10
-            elif return_5d > 5:
-                total_score += 8
-            elif return_5d > 2:
-                total_score += 6
-            elif return_5d > 0:
-                total_score += 4
+            if 2 <= return_5d <= 5:
+                total_score += 7
+            elif 5 < return_5d <= 8:
+                total_score += 5
+            elif 0 <= return_5d < 2:
+                total_score += 3
             else:
-                total_score += 2
-        
-        # ========== 4. 形态因子（15分）==========
-        
-        # 4.1 MACD金叉及位置（8分）
+                total_score += 0
+
+        # 3.3 偏移5日均线（5分）
+        deviation_pct = (latest_close - ma5) / ma5 * 100 if pd.notna(ma5) and ma5 > 0 else 0
+        if 0.5 <= deviation_pct <= 2.5:
+            total_score += 5     # 最佳买点
+        elif -0.5 <= deviation_pct < 0.5:
+            total_score += 3     # 在5日线附近
+        elif 2.5 < deviation_pct <= 4.0:
+            total_score += 3     # 略偏离（强势股可接受）
+        elif 4.0 < deviation_pct <= 6.0:
+            total_score += 2     # 偏高
+        else:
+            total_score += 0     # 偏移过大
+
+        # ========== 4. 形态因子（20分）==========
+
+        # 4.1 MACD金叉及位置+柱体变化（10分）
         if dif > dea and dif > 0:
-            total_score += 8   # MACD金叉且在零轴上方
-        elif dif > dea and dif <= 0:
-            total_score += 5   # MACD金叉但在零轴下方
-        elif dif < dea and dif > 0:
-            total_score += 3   # MACD死叉但在零轴上方
-        else:
-            total_score += 0   # MACD死叉且在零轴下方
-        
-        # 4.2 布林带位置（7分）
-        if boll_pos == 0:
-            # 在中轨附近，判断更接近上轨还是下轨
-            mid = (upper + lower) / 2
-            if latest_close > mid:
-                total_score += 5  # 中轨上方（最理想，既有空间又强势）
+            if macd_bar_current > macd_bar_prev:
+                total_score += 10   # 金叉+零轴上+柱体放大，最强信号
             else:
-                total_score += 2  # 中轨下方
-        elif boll_pos == 1:
-            total_score += 4   # 突破上轨（强势但可能追高）
+                total_score += 6    # 金叉+零轴上+柱体缩小
+        elif dif > dea and dif <= 0:
+            total_score += 4        # 金叉+零轴下
+        elif dif < dea and dif > 0:
+            total_score += 3        # 死叉+零轴上
         else:
-            total_score += 0   # 跌破下轨
-        
+            total_score += 0        # 死叉+零轴下
+
+        # 4.2 布林带位置与带宽（5分）
+        ma20_series = df['close'].rolling(20).mean()
+        std20_series = df['close'].rolling(20).std()
+        upper_band = ma20_series + 2 * std20_series
+        lower_band = ma20_series - 2 * std20_series
+        bandwidth_pct = (upper_band - lower_band) / df['close'] * 100
+        current_bw = bandwidth_pct.iloc[-1]
+        avg_bw_10 = bandwidth_pct.iloc[-10:].mean() if len(bandwidth_pct) >= 10 else current_bw
+        is_narrowing = current_bw < avg_bw_10 * 0.85  # 收窄15%以上
+
+        if boll_pos == 0:
+            mid = (upper + lower) / 2
+            if latest_close > mid and is_narrowing:
+                total_score += 5    # 中轨上方+收窄蓄力
+            elif latest_close > mid:
+                total_score += 3    # 中轨上方但无收窄
+            else:
+                total_score += 1    # 中轨下方
+        elif boll_pos == 1:
+            total_score += 2        # 突破上轨
+        else:
+            total_score += 0        # 跌破下轨
+
+        # 4.3 K线形态（5分）
+        latest_open = df['open'].iloc[-1]
+        latest_high = df['high'].iloc[-1]
+        latest_low = df['low'].iloc[-1]
+        prev_close = df['close'].iloc[-2] if len(df) >= 2 else latest_open
+
+        amplitude = (latest_high - latest_low) / prev_close * 100 if prev_close > 0 else 0
+        candle_body_pct = (latest_close - latest_open) / latest_open * 100 if latest_open > 0 else 0
+        upper_shadow = (latest_high - max(latest_open, latest_close)) / latest_high * 100 if latest_high > 0 else 0
+
+        if amplitude < 3 and candle_body_pct > 0 and upper_shadow < 1.5:
+            total_score += 5        # 小阳线/十字星+短上影，最优
+        elif 2 <= candle_body_pct <= 4:
+            total_score += 3        # 中阳线
+        elif candle_body_pct > 5 or upper_shadow > 3:
+            total_score += 0        # 大阳线或长上影
+        elif candle_body_pct > 0 and amplitude < 5:
+            total_score += 2        # 普通小阳
+        else:
+            total_score += 0        # 阴线或异常
+
         # ========== 5. 风险因子（10分）==========
-        
-        # 5.1 RSI超买超卖（5分）
+
+        # 5.1 RSI超买超卖（5分）— 不变
         if 50 <= rsi_val <= 70:
-            total_score += 5   # 理想区间
+            total_score += 5
         elif rsi_val > 70:
-            total_score += 2   # 超买区，有风险
+            total_score += 2
         elif 40 <= rsi_val < 50:
-            total_score += 3   # 偏弱
+            total_score += 3
         elif rsi_val < 40:
-            total_score += 1   # 超卖区，可能有反弹机会
+            total_score += 1
         else:
             total_score += 0
-        
-        # 5.2 波动率控制（5分）- 改进版，使用多时间窗口加权平均振幅
-        # 计算5日、10日、20日的振幅，取加权平均值以减少极端值影响
+
+        # 5.2 波动率控制（5分）— 不变
         amplitudes = []
-        
-        # 5日振幅（权重最高，反映近期波动）
         if len(df) >= 5:
             high_5d = df['high'].iloc[-5:].max()
             low_5d = df['low'].iloc[-5:].min()
             close_5d_start = df['close'].iloc[-5]
             amp_5d = (high_5d - low_5d) / close_5d_start * 100 if close_5d_start > 0 else 0
             amplitudes.append(amp_5d)
-        
-        # 10日振幅（中等权重）
         if len(df) >= 10:
             high_10d = df['high'].iloc[-10:].max()
             low_10d = df['low'].iloc[-10:].min()
             close_10d_start = df['close'].iloc[-10]
             amp_10d = (high_10d - low_10d) / close_10d_start * 100 if close_10d_start > 0 else 0
             amplitudes.append(amp_10d)
-        
-        # 20日振幅（较低权重，反映中期波动）
         if len(df) >= 20:
             high_20d = df['high'].iloc[-20:].max()
             low_20d = df['low'].iloc[-20:].min()
             close_20d_start = df['close'].iloc[-20]
             amp_20d = (high_20d - low_20d) / close_20d_start * 100 if close_20d_start > 0 else 0
             amplitudes.append(amp_20d)
-        
-        # 计算加权平均振幅（短期权重更高：50% + 30% + 20%）
+
         if len(amplitudes) == 3:
             avg_volatility = amplitudes[0] * 0.5 + amplitudes[1] * 0.3 + amplitudes[2] * 0.2
         elif len(amplitudes) == 2:
@@ -1423,22 +1451,21 @@ def calculate_trend_score_v2(market: str, code: str, days: int = 300,
             avg_volatility = amplitudes[0]
         else:
             avg_volatility = 0
-        
-        # 根据加权平均振幅评分
-        if 5 <= avg_volatility <= 15:
-            total_score += 5   # 适中波动（最优）
-        elif avg_volatility < 5:
-            total_score += 3   # 波动过低，缺乏活力
-        elif avg_volatility < 25:
-            total_score += 2   # 波动较高
+
+        if 2 <= avg_volatility <= 8:
+            total_score += 5     # 低波动，匹配2~4%收益目标
+        elif 8 < avg_volatility <= 15:
+            total_score += 3     # 中等波动
+        elif avg_volatility < 2:
+            total_score += 3     # 波动过低，可能不动
+        elif 15 < avg_volatility <= 25:
+            total_score += 1     # 高波动
         else:
-            total_score += 0   # 波动过高，风险大
-        
-        # 确保分数在0-100范围内
+            total_score += 0     # 极高波动，排除
+
         total_score = max(0, min(100, total_score))
-        
         return round(total_score, 1)
-        
+
     except Exception as e:
         print(f"⚠️  计算评分失败 ({market}{code}): {e}")
         return None

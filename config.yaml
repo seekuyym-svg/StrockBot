@@ -289,26 +289,19 @@ backtest:
   
   # === 第二阶段评分配置 ===
   min_score: 65                 # 最低评分阈值（满分100分，建议设置为60-70分）
-  max_score: 75                 # 最高评分阈值（满分100分）
+  max_score: 70                 # 最高评分阈值（满分100分）
+  
   max_stocks_per_cycle: 10      # 每个周期最多选10只股票
+  dynamic_select_ratio: 0.4     # 动态选股比例（候选数×此比例=实际选股数，最少3最多10）
   min_stocks_per_cycle: 3       # 最少选3只（保证分散）
-  max_stocks_per_industry: 3    # 每个行业最多选几只（行业分散，降低系统性风险）
-  max_per_score: 3              # 同分值最多保留几只（默认3）；该设置很关键，会明显影响收益率
+  max_stocks_per_industry: 4    # 每个行业最多选几只（行业分散，降低系统性风险）
+  max_per_score: 3              # 同分值最多保留几只（默认3）；该设置很关键，会明显影响收益率；排序时，同分值——>行业分散
   
   pref_vol_ratio_threshold: 3.0 # 优选分量比上限
-  pref_vol_ratio_min: 1.0       # 优选分量比下限，必须大于等于min_volume_ratio
-  min_pref_score: 0             # 优选分最低要求（低于此分直接淘汰）；0代表暂时不限制，主要就是用来排序的  
- 
-  high_score_min: 90            # 高分段最低评分
-  high_score_max: 95            # 高分段最高评分
-  high_pref_score: 7.5          # 高分段最低优选分
-  high_max_count: 3             # 高分段最多入选几只
-  pref_gain_lo: 10              # 涨幅评分下限（<此值得3分）
-  pref_gain_hi: 15.5            # 涨幅评分上限（lo~hi得1.5分，超过得0分）；为了抓牛股，放宽涨幅
-  pref_pull_lo: 3               # 冲高回落评分下限（≤此值得2分）
-  pref_pull_hi: 6               # 冲高回落评分上限（lo~hi得1分）
-  pref_gain_5d_threshold: 24    # 过去5天涨幅上限（超过则优选分减3分）
-  pref_pull_all_days_threshold: 3  # 放量期3天都冲高回落超过此值则减3分
+  pref_vol_ratio_min: 1.0       # 优选分量比下限
+  min_pref_score: 0             # 优选分最低门槛（0=仅排序不淘汰）
+  max_pref_score: 14            # 优选分上限（16以上多为过热股，排除）
+  pref_upper_shadow_threshold: 2.5  # 上影线出货阈值（3天平均上影线超过此值扣分）
   
   # === 数据源配置（2026-05-04新增）===
   use_local_data: true          # 是否使用本地通达信数据（服务器环境设置为false，使用网络API）
