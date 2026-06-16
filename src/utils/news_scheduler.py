@@ -10,6 +10,7 @@ from loguru import logger
 import requests
 import re
 import json
+import time
 import akshare as ak
 
 # 添加项目根目录到路径
@@ -484,10 +485,12 @@ class NewsMonitorScheduler:
             
             # 发送大盘环境信号通知
             self._send_market_signal_notification()
-            
+            time.sleep(1.5)
+
             # 发送选股结果通知
             self._send_stockpool_notification()
-            
+            time.sleep(1.5)
+
             # 再发送资讯日报通知
             if total_count > 0:
                 news_data = {

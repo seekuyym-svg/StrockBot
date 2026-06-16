@@ -65,9 +65,10 @@ def load_stock_pool_from_file():
                 if not line or line.startswith('#') or line.startswith('-'):
                     continue
                 
-                # 解析格式：股票代码,评分
+                # 解析格式：股票代码,评分[,优选分]
+                # 兼容新旧格式：旧2列(code,score)，新3列(code,score,优选分)
                 parts = line.split(',')
-                if len(parts) != 2:
+                if len(parts) < 2:
                     continue
                 
                 code = parts[0].strip()

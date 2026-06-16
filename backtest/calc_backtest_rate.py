@@ -187,9 +187,9 @@ def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, en
     """
     将回测区间收益率写回到股票池文件中
     
-    在评分数据行的末尾追加 backtest_return 列：
-        code,score,pref,backtest_return
-        002353,79,8.0,+2.35
+    在评分数据行的末尾追加 backtest_return 列和所属行业列：
+        code,score,pref,backtest_return,所属行业
+        002353,79,8.0,+2.35,游戏
     
     如果已经存在该列（再次运行回测），只更新值不追加新列。
     
@@ -203,17 +203,35 @@ def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, en
     if not stockpool_file.exists():
         stockpool_file = DATA_DIR / f"stockpool_{pooldate}"
     if not stockpool_file.exists():
-        print(f"\u26a0\ufe0f  股票池文件不存在，跳过回写: {stockpool_file}")
+        print(f"⚠️  股票池文件不存在，跳过回写: {stockpool_file}")
         return
     
     # 构建 code -> return_rate 映射
     return_map = {r['code']: r['return_rate'] for r in results}
+    
+    # 加载行业缓存 industry_cache.json
+    # key 格式: "sz.002824" / "sh.600114", value: 行业名称
+    industry_cache = {}
+    cache_file = Path(__file__).parent.parent / "data" / "industry_cache.json"
+    if cache_file.exists():
+        try:
+            import json
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                industry_cache = json.load(f)
+        except Exception as e:
+            print(f"⚠️  加载行业缓存失败: {e}")
+    
+    def _get_industry(code: str) -> str:
+        """根据6位股票代码查询所属行业，查不到返回空字符串"""
+        market_prefix = 'sh' if code.startswith('6') or code.startswith('9') else 'sz'
+        return industry_cache.get(f"{market_prefix}.{code}", '')
     
     with open(stockpool_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     
     new_lines = []
     has_return_col = False
+    has_industry_col = False
     in_scored_section = False
     updated_count = 0
     
@@ -224,10 +242,10 @@ def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, en
             in_scored_section = True
         
         if in_scored_section and stripped.startswith('# 格式:'):
-            if '回测收益率%' in stripped:
-                has_return_col = True
-            else:
-                line = line.rstrip('\n') + ',回测收益率%\n'
+            has_return_col = '回测收益率%' in stripped
+            has_industry_col = '所属行业' in stripped
+            if not has_industry_col:
+                line = line.rstrip('\n') + ',所属行业\n'
             new_lines.append(line)
             continue
         
@@ -237,14 +255,27 @@ def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, en
                 code = parts[0]
                 if code in return_map:
                     return_rate = return_map[code]
+                    industry = _get_industry(code)
+                    
+                    # 处理收益率列
                     if has_return_col:
                         if len(parts) >= 4:
                             parts[3] = f'{return_rate:+.2f}'
                         else:
                             parts.append(f'{return_rate:+.2f}')
-                        line = ','.join(parts) + '\n'
                     else:
-                        line = line.rstrip('\n') + f',{return_rate:+.2f}\n'
+                        parts.append(f'{return_rate:+.2f}')
+                    
+                    # 处理行业列
+                    if has_industry_col:
+                        if len(parts) >= 5:
+                            parts[4] = industry
+                        else:
+                            parts.append(industry)
+                    else:
+                        parts.append(industry)
+                    
+                    line = ','.join(parts) + '\n'
                     updated_count += 1
         
         new_lines.append(line)
@@ -252,8 +283,8 @@ def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, en
     with open(stockpool_file, 'w', encoding='utf-8') as f:
         f.writelines(new_lines)
     
-    print(f"\U0001f4be 已将 {updated_count} 只股票的回测收益率写回 {stockpool_file.name}")
-    print(f"   \U0001f4c5 区间: {start_date} ~ {end_date}")
+    print(f"💾 已将 {updated_count} 只股票的回测收益率写回 {stockpool_file.name}")
+    print(f"   📅 区间: {start_date} ~ {end_date}")
 
 
 def fetch_klines_from_tencent(code: str) -> Optional[pd.DataFrame]:
