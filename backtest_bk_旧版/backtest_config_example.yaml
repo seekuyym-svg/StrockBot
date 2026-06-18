@@ -1,0 +1,42 @@
+# 选股策略回测配置文件示例
+# 
+# 使用方法:
+#   python local/run_backtest.py --config backtest_config.yaml
+#
+# 注意: 当前版本暂不支持配置文件，此文件仅供参考
+# 所有参数可通过命令行指定
+
+# 回测周期配置
+backtest_period:
+  start_date: "2024-01-01"    # 回测起始日期 (YYYY-MM-DD)
+  end_date: "2026-01-01"      # 回测结束日期 (YYYY-MM-DD)
+
+# 策略参数配置
+strategy:
+  volume_period: 5            # 连续放量天数
+  hold_days: 3                # 持仓天数（交易日）
+
+# 数据源配置
+data_source:
+  tdx_dir: "D:\\Install\\zd_zxzq_gm"  # 通达信安装目录
+  whitelist_file: null                 # 白名单文件路径（null表示自动查找最近的）
+  
+# 输出配置
+output:
+  output_dir: "data"          # 输出目录
+  save_charts: true           # 是否保存图表
+  save_csv: true              # 是否保存CSV明细
+  log_level: "INFO"           # 日志级别 (DEBUG/INFO/WARNING/ERROR)
+
+# 基准对比配置
+benchmark:
+  enabled: true               # 是否启用基准对比
+  symbol: "sh.000300"         # 基准指数代码（沪深300）
+  data_source: "akshare"      # 数据源 (akshare/tencent)
+
+# 高级配置（可选）
+advanced:
+  skip_suspended: true        # 跳过停牌股票
+  commission_rate: 0.0        # 手续费率（0表示不计入）
+  slippage: 0.0               # 滑点（0表示不计入）
+  initial_capital: 1000000    # 初始资金（用于计算组合价值）
