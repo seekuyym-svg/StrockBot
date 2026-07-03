@@ -1278,7 +1278,7 @@ class NewsMonitorScheduler:
                     lines = open(hist_file, 'r', encoding='utf-8').readlines()
                     if len(lines) >= 2:
                         header = lines[0].strip()
-                        trade_date_compact = stock_date  # YYYYMMDD格式（选股日，用于匹配决策记录）
+                        trade_date_compact = buy_date  # YYYYMMDD格式（买入日，用于匹配决策记录）
                         # 转换为YYYY-MM-DD格式
                         trade_date_fmt = f"{trade_date_compact[:4]}-{trade_date_compact[4:6]}-{trade_date_compact[6:8]}"
                         updated = False

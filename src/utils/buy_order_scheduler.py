@@ -70,7 +70,22 @@ def execute_buy_calculation():
     logger.info(f"[START] 开始执行买入委托计算任务")
     logger.info(f"[TIME] 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 80)
-    
+
+    # 0. 检查是否为交易日（剔除法定节假日）
+    try:
+        import akshare as ak
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        df = ak.tool_trade_date_hist_sina()
+        if not df.empty:
+            # 取最近一年交易日，判断今天是否在其中
+            latest = df.tail(365)
+            is_trading = today_str in latest['trade_date'].astype(str).values
+            if not is_trading:
+                logger.warning(f"[SKIP] 今日({today_str})非交易日（法定节假日），跳过本次执行")
+                return
+    except Exception as e:
+        logger.warning(f"[CALENDAR] 获取交易日历失败({e})，降级为仅过滤周末")
+
     # 1. 检查选股结果文件
     logger.info("\n[STEP 1] 检查选股结果文件...")
     if not check_stockpool_file():
@@ -283,8 +298,8 @@ def send_index_snapshot():
         data = resp.json()
         klines = data['data']['sh000001']['day']
         if len(klines) >= 6:
-            y_vol = float(klines[-1][5])
-            recent = [float(k[5]) for k in klines[-6:-1]]
+            y_vol = float(klines[-1][5])  # 昨日成交量（腾讯kline只返回已收盘日K线）
+            recent = [float(k[5]) for k in klines[-6:-1]]  # 前5日均量
             vol_ratio = round(y_vol / (sum(recent) / len(recent)), 2)
             logger.info(f"[SCORE] 前日量比: {vol_ratio}")
     except Exception as e:
@@ -300,7 +315,7 @@ def send_index_snapshot():
             df = df.sort_values('date')
             if len(df) >= 2:
                 y_kc = df.iloc[-2]  # 前天
-                t_kc = df.iloc[-1]  # 昨天
+                t_kc = df.iloc[-1]  # 昨天（CSV每日16时更新，9:26时最后一条=昨日）
                 # 昨天相对于前天的涨跌幅
                 kc_change = (t_kc['close'] - y_kc['close']) / y_kc['close'] * 100
                 logger.info(f"[SCORE] 前日科创50涨跌: {kc_change:+.2f}%")
@@ -329,8 +344,18 @@ def send_index_snapshot():
     s_ks = _score_ks(kospi_pct)
     raw_total = s_lb + s_kc + s_ks
 
-    # 排除规则：前日科创50涨超+3%时降1级
-    penalty = 1 if (kc_change is not None and kc_change > 3.0) else 0
+    # 排除规则：前日科创50过热阶梯扣分（涨越多扣越多）
+    if kc_change is not None:
+        if kc_change > 5.0:
+            penalty = 3
+        elif kc_change > 4.0:
+            penalty = 2
+        elif kc_change > 3.0:
+            penalty = 1
+        else:
+            penalty = 0
+    else:
+        penalty = 0
     final_total = raw_total - penalty
 
     # 转为建议
