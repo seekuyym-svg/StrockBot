@@ -64,7 +64,7 @@ def load_scored_stockpool(date_str: str) -> list:
             # 解析评分数据
             if in_score_section and ',' in line:
                 parts = line.split(',')
-                if len(parts) == 2:
+                if len(parts) >= 2:
                     code = parts[0].strip()
                     try:
                         score = float(parts[1].strip())

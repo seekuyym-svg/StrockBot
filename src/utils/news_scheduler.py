@@ -483,8 +483,8 @@ class NewsMonitorScheduler:
             
             logger.info(f"\n✅ 资讯获取完成，共 {total_count} 条")
             
-            # 发送大盘环境信号通知
-            self._send_market_signal_notification()
+            # 发送持仓收益率通知（最优先）
+            self._send_trade_return_notification()
             time.sleep(1.5)
 
             # 发送选股结果通知
@@ -989,6 +989,321 @@ class NewsMonitorScheduler:
             
         except Exception as e:
             logger.error(f"❌ 选股结果通知执行异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    # ==================== 持仓收益率推送 ====================
+
+    def _get_next_trading_day(self, target_date_str: str) -> str:
+        """获取指定日期之后的最近交易日（不含当天）"""
+        target_dt = pd.to_datetime(target_date_str)
+        if self.trading_days_cache:
+            trading_days = [d for d in self.trading_days_cache if d > target_dt]
+            if trading_days:
+                return trading_days[0].strftime('%Y%m%d')
+        # 降级：简单加1天
+        next_dt = target_dt + timedelta(days=1)
+        return next_dt.strftime('%Y%m%d')
+
+    def _get_nearest_trading_day_before(self, target_date_str: str) -> str:
+        """
+        获取指定日期之前的最近交易日
+
+        Args:
+            target_date_str: 目标日期 YYYY-MM-DD 或 YYYYMMDD
+
+        Returns:
+            str: 最近交易日日期 YYYYMMDD，失败时返回 target_date_str 往前推到交易日
+        """
+        target_dt = pd.to_datetime(target_date_str)
+
+        # 优先使用交易日历缓存
+        if self.trading_days_cache:
+            trading_days = [d for d in self.trading_days_cache if d <= target_dt]
+            if trading_days:
+                return max(trading_days).strftime('%Y%m%d')
+
+        # 降级：往前推到非周末
+        import time as _time
+        current = target_dt
+        for _ in range(10):
+            if current.weekday() < 5:
+                return current.strftime('%Y%m%d')
+            current -= timedelta(days=1)
+        return target_dt.strftime('%Y%m%d')
+
+    def _read_trade_file(self, trade_date: str) -> list:
+        """
+        读取交易日买入委托文件
+
+        Args:
+            trade_date: 交易日期 YYYYMMDD
+
+        Returns:
+            list: [{'code': '600593', 'market': 'sh', 'buy_price': 10.50, 'shares': 100, 'investment': 1050.00}, ...]
+                  文件不存在或格式异常时返回空列表
+        """
+        filename = f"trade_{trade_date}.txt"
+        filepath = project_root / "data" / filename
+
+        if not filepath.exists():
+            logger.warning(f"[WARN] 交易报告文件不存在: {filepath}")
+            return []
+
+        positions = []
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if len(lines) < 3:
+                logger.warning(f"[WARN] 交易报告文件格式错误: {filepath}")
+                return []
+
+            # 跳过第1行(数量)和第2行(表头)，从第3行开始解析
+            for line in lines[2:]:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(',')
+                if len(parts) < 4:
+                    continue
+
+                code = parts[0].strip()
+                buy_price = float(parts[1].strip())
+                shares = int(float(parts[2].strip()))
+                investment = float(parts[3].strip())
+
+                # 根据代码前缀确定市场
+                if code.startswith('6'):
+                    market = 'sh'
+                elif code.startswith(('0', '3')):
+                    market = 'sz'
+                else:
+                    market = 'sh'
+
+                positions.append({
+                    'code': code,
+                    'market': market,
+                    'buy_price': buy_price,
+                    'shares': shares,
+                    'investment': investment,
+                })
+
+            logger.info(f"[FILE] 读取交易报告: {filepath} ({len(positions)} 只持仓)")
+            return positions
+
+        except Exception as e:
+            logger.error(f"[ERROR] 读取交易报告失败: {e}")
+            return []
+
+    def _get_stock_close_price(self, code: str, market: str) -> float:
+        """
+        从腾讯财经获取股票当日收盘价
+
+        Args:
+            code: 股票代码（如 600593）
+            market: 市场标识（sh/sz）
+
+        Returns:
+            float: 收盘价，失败返回 0.0
+        """
+        try:
+            url = f"http://qt.gtimg.cn/q={market}{code}"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            resp = requests.get(url, headers=headers, timeout=5)
+            resp.encoding = 'gbk'
+
+            content = resp.text
+            import re
+            match = re.search(r'="([^"]+)"', content)
+            if match:
+                parts_data = match.group(1).split('~')
+                if len(parts_data) >= 4:
+                    return float(parts_data[3])
+        except Exception:
+            pass
+        return 0.0
+
+    def _send_trade_return_notification(self):
+        """
+        发送持仓收益率飞书通知
+
+        读取2个交易日前的买入委托文件，计算每只股票买入到今天收盘的收益率，
+        汇总后通过飞书推送。
+        """
+        try:
+            # 计算选股日(T)和买入日(T+1)
+            today = datetime.now().strftime('%Y-%m-%d')
+            two_days_ago = (datetime.now() - timedelta(days=2)).strftime('%Y%m%d')
+            stock_date = self._get_nearest_trading_day_before(two_days_ago)  # 选股日 T
+            buy_date = self._get_next_trading_day(stock_date)               # 买入日 T+1
+
+            logger.info(f"\n{'=' * 60}")
+            logger.info(f"📊 【持仓收益率】计算中...")
+            logger.info(f"   选股日: {stock_date} | 买入日: {buy_date}")
+            logger.info(f"{'=' * 60}")
+
+            # 读取持仓（trade文件按买入日命名）
+            positions = self._read_trade_file(buy_date)
+            if not positions:
+                logger.info("ℹ️ 无可用的持仓数据，跳过收益率推送")
+                return
+
+            # 计算每只股票收益
+            total_results = []
+            total_investment = 0.0
+            total_current_value = 0.0
+
+            for i, pos in enumerate(positions, 1):
+                code = pos['code']
+                market = pos['market']
+                buy_price = pos['buy_price']
+                shares = pos['shares']
+                investment = pos['investment']
+
+                # 获取当前收盘价
+                close_price = self._get_stock_close_price(code, market)
+
+                if close_price > 0 and buy_price > 0:
+                    return_pct = (close_price - buy_price) / buy_price * 100
+                    current_value = shares * close_price
+                    profit = current_value - investment
+                else:
+                    return_pct = 0.0
+                    current_value = 0.0
+                    profit = 0.0
+
+                total_investment += investment
+                total_current_value += current_value
+
+                total_results.append({
+                    'code': code,
+                    'buy_price': buy_price,
+                    'close_price': close_price,
+                    'shares': shares,
+                    'investment': investment,
+                    'current_value': current_value,
+                    'return_pct': round(return_pct, 2),
+                    'profit': round(profit, 2),
+                })
+
+                logger.info(f"   [{i}/{len(positions)}] {code}: 买入{buy_price:.2f}→收盘{close_price:.2f} ({return_pct:+.2f}%)")
+                import time as _t
+                _t.sleep(0.5)
+
+            # 总仓收益率
+            total_return_pct = round((total_current_value - total_investment) / total_investment * 100, 2) if total_investment > 0 else 0.0
+            total_profit = round(total_current_value - total_investment, 2)
+
+            logger.info(f"\n   总仓: 投入{total_investment:,.0f}元 → 当前{total_current_value:,.0f}元 ({total_return_pct:+.2f}%)")
+
+            # 构建飞书消息
+            notifier = get_feishu_notifier()
+            if not notifier.enabled:
+                logger.warning("⚠️ 飞书通知未启用，跳过持仓收益率推送")
+                return
+
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            profit_icon = "📈" if total_return_pct >= 0 else "📉"
+
+            # 卖出日 = 买入日的下一个交易日
+            sell_date = self._get_next_trading_day(buy_date)
+            content = f"**选股日期**: {stock_date[:4]}-{stock_date[4:6]}-{stock_date[6:]}\n"
+            content += f"**买入日期**: {buy_date[:4]}-{buy_date[4:6]}-{buy_date[6:]}\n"
+            content += f"**卖出日期**: {sell_date[:4]}-{sell_date[4:6]}-{sell_date[6:]}\n"
+            content += f"**持有天数**: 2 个交易日\n"
+            content += f"**持仓数量**: {len(positions)} 只\n\n"
+
+            # 收益率数字标颜色：负收益绿色、正收益红色、持平黑色
+            if total_return_pct < 0:
+                ret_color = "green"
+            elif total_return_pct > 0:
+                ret_color = "red"
+            else:
+                ret_color = "black"
+            content += f"**━━━━━━━━━━━━━━━**\n"
+            content += f"**{profit_icon} 总收益率**: <font color='{ret_color}'>{total_return_pct:+.2f}%</font>\n"
+            content += f"**总盈亏**: {total_profit:+,.0f}元\n"
+            content += f"**总投入**: {total_investment:,.0f}元\n"
+            content += f"**当前市值**: {total_current_value:,.0f}元\n"
+
+            # 根据收益率确定卡片颜色
+            if total_return_pct < 0:
+                card_color = "green"
+            elif total_return_pct > 0:
+                card_color = "red"
+            else:
+                card_color = "grey"
+            message = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"{profit_icon} 周期收益率"},
+                        "template": "red" if total_return_pct < 0 else "green"
+                    },
+                    "elements": [
+                        {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+                        {"tag": "hr"},
+                        {"tag": "note", "elements": [
+                            {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
+                        ]}
+                    ]
+                }
+            }
+
+            headers = {'Content-Type': 'application/json'}
+            response = requests.post(
+                notifier.webhook_url,
+                headers=headers,
+                data=json.dumps(message, ensure_ascii=False).encode('utf-8'),
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('StatusCode') == 0 or result.get('code') == 0:
+                    logger.success(f"📱 持仓收益率飞书通知发送成功")
+                else:
+                    logger.error(f"❌ 飞书API返回错误: {result.get('msg', '未知错误')}")
+            else:
+                logger.error(f"❌ 飞书通知发送失败，HTTP状态码: {response.status_code}")
+
+            logger.info("✅ 持仓收益率通知完成\n")
+
+            # ── 回填决策历史记录的实际收益率 ──
+            try:
+                hist_file = Path(__file__).parent.parent.parent / "data" / "buy_decision_history.txt"
+                if hist_file.exists():
+                    lines = open(hist_file, 'r', encoding='utf-8').readlines()
+                    if len(lines) >= 2:
+                        header = lines[0].strip()
+                        trade_date_compact = stock_date  # YYYYMMDD格式（选股日，用于匹配决策记录）
+                        # 转换为YYYY-MM-DD格式
+                        trade_date_fmt = f"{trade_date_compact[:4]}-{trade_date_compact[4:6]}-{trade_date_compact[6:8]}"
+                        updated = False
+                        for i in range(1, len(lines)):
+                            cols = lines[i].strip().split(',')
+                            if cols[0] == trade_date_fmt and (len(cols) < 12 or cols[11].strip() == ''):
+                                total_return = (total_current_value - total_investment) / total_investment * 100
+                                while len(cols) < 12:
+                                    cols.append('')
+                                cols[11] = f"{total_return:+.2f}"
+                                lines[i] = ','.join(cols) + '\n'
+                                updated = True
+                                logger.info(f"[HISTORY] 回填 {trade_date_fmt} 实际收益率: {total_return:+.2f}%")
+                                break
+                        if updated:
+                            with open(hist_file, 'w', encoding='utf-8') as f:
+                                f.writelines(lines)
+                            logger.info(f"[HISTORY] buy_decision_history.txt 已更新")
+                        else:
+                            logger.debug(f"[HISTORY] {trade_date_fmt} 无需更新（记录不存在或已填）")
+            except Exception as e2:
+                logger.warning(f"[HISTORY] 回填收益率失败: {e2}")
+
+        except Exception as e:
+            logger.error(f"❌ 持仓收益率通知异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
