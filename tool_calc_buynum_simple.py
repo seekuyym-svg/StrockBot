@@ -369,11 +369,11 @@ def calculate_buy_orders():
         open_price = realtime_data['open_price']
         change_pct = realtime_data['change_pct']
         
-        # 计算买入股数（使用当前价格）
-        shares_bought = calculate_buy_shares(current_price, investment_per_stock)
+        # 计算买入股数（使用开盘价，与回测保持一致）
+        shares_bought = calculate_buy_shares(open_price, investment_per_stock)
         
-        # 实际投入金额
-        actual_investment = shares_bought * current_price
+        # 实际投入金额（按开盘价计算）
+        actual_investment = shares_bought * open_price
         
         results.append({
             'code': code,

@@ -9,15 +9,81 @@ from typing import Dict, Optional, Tuple
 from pathlib import Path
 
 
+def _get_market_prefix(symbol: str) -> str:
+    """判断股票代码的市场前缀"""
+    if symbol.startswith(('6', '9')):
+        return 'sh'
+    return 'sz'
+
+
+def _get_market_id(symbol: str) -> str:
+    """东方财富使用的市场ID：1=上交所, 0=深交所"""
+    return '1' if symbol.startswith(('6', '9')) else '0'
+
+
+def _fetch_name_from_tencent(symbol: str) -> Optional[str]:
+    """从腾讯财经API获取股票名称"""
+    market_prefix = _get_market_prefix(symbol)
+    full_code = f"{market_prefix}{symbol}"
+    url = f"http://qt.gtimg.cn/q={full_code}"
+    response = requests.get(url, timeout=5)
+    response.encoding = 'gbk'
+    if response.status_code == 200:
+        data_str = response.text.strip()
+        if '=' in data_str:
+            content = data_str.split('=')[1].strip('"').strip(';')
+            parts = content.split('~')
+            if len(parts) >= 2:
+                name = parts[1]
+                if name and name != '':
+                    return name
+    return None
+
+
+def _fetch_name_from_sina(symbol: str) -> Optional[str]:
+    """从新浪财经API获取股票名称（第一降级方案）"""
+    market_prefix = _get_market_prefix(symbol)
+    full_code = f"{market_prefix}{symbol}"
+    url = f"http://hq.sinajs.cn/list={full_code}"
+    headers = {'Referer': 'https://finance.sina.com.cn'}
+    response = requests.get(url, headers=headers, timeout=5)
+    response.encoding = 'gbk'
+    if response.status_code == 200:
+        # 返回格式: var hq_str_sh600000="浦发银行,15.23,..."
+        text = response.text.strip()
+        if '"' in text:
+            quoted = text.split('"')[1]
+            fields = quoted.split(',')
+            if fields and fields[0]:
+                return fields[0]
+    return None
+
+
+def _fetch_name_from_eastmoney(symbol: str) -> Optional[str]:
+    """从东方财富API获取股票名称（第二降级方案）"""
+    market_id = _get_market_id(symbol)
+    url = "http://push2.eastmoney.com/api/qt/stock/get"
+    params = {"secid": f"{market_id}.{symbol}", "fields": "f58"}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    response = requests.get(url, params=params, headers=headers, timeout=5)
+    if response.status_code == 200:
+        data = response.json()
+        if data.get('data') and data['data'].get('f58'):
+            return data['data']['f58']
+    return None
+
+
 def get_stock_name(symbol: str) -> str:
     """
-    根据股票代码获取股票名称（使用腾讯财经API）
+    根据股票代码获取股票名称（多数据源降级获取）
+    
+    优先级: 腾讯财经 → 新浪财经 → 东方财富 → 返回code本身
     
     Args:
         symbol: 股票代码（不含市场前缀），如 '000526'
     
     Returns:
-        str: 股票名称，获取失败则返回股票代码本身
+        str: 股票名称，全部获取失败则返回股票代码本身
     
     Example:
         >>> get_stock_name('000526')
@@ -25,93 +91,100 @@ def get_stock_name(symbol: str) -> str:
         >>> get_stock_name('600963')
         '岳阳林纸'
     """
-    try:
-        # 判断市场前缀
-        if symbol.startswith('6') or symbol.startswith('9'):
-            market_prefix = 'sh'
-        else:
-            market_prefix = 'sz'
-        
-        # 构建完整代码
-        full_code = f"{market_prefix}{symbol}"
-        
-        # 调用腾讯财经API
-        url = f"http://qt.gtimg.cn/q={full_code}"
-        response = requests.get(url, timeout=5)
-        response.encoding = 'gbk'  # 腾讯财经返回GBK编码
-        
-        if response.status_code == 200:
-            data_str = response.text.strip()
-            if '=' in data_str:
-                content = data_str.split('=')[1].strip('"').strip(';')
-                parts = content.split('~')
-                if len(parts) >= 2:
-                    stock_name = parts[1]
-                    if stock_name and stock_name != '':
-                        return stock_name
-        
-        # 获取失败，返回股票代码
-        return symbol
-        
-    except Exception as e:
-        print(f"⚠️  获取股票 {symbol} 名称失败: {e}")
-        return symbol
+    # 一级：腾讯财经（主数据源）
+    name = _fetch_name_from_tencent(symbol)
+    if name:
+        return name
+    
+    # 二级：新浪财经（第一降级）
+    name = _fetch_name_from_sina(symbol)
+    if name:
+        return name
+    
+    # 三级：东方财富（第二降级）
+    name = _fetch_name_from_eastmoney(symbol)
+    if name:
+        return name
+    
+    # 全部失败，返回原始代码
+    return symbol
 
+
+# 模块级流通股本缓存（避免重复请求同一只股票）
+_CIRCULATING_SHARES_CACHE = {}
 
 def get_circulating_shares_from_tencent(market: str, code: str) -> Optional[float]:
     """
-    从腾讯财经API获取流通股本
+    获取流通股本（多数据源降级 + 缓存）
+    
+    数据源优先级：缓存 → 腾讯财经 → 东方财富
+    每个股票代码只请求一次，后续直接命中缓存。
     
     Args:
         market: 市场代码 ('sh' 或 'sz')
         code: 股票代码 (如 '002706')
         
     Returns:
-        float: 流通股本（股），失败返回None
+        float: 流通股本（股），全部失败返回None
     """
+    cache_key = f"{market}.{code}"
+    
+    # 查缓存（包括 None 也会缓存，避免反复请求失败的股票）
+    if cache_key in _CIRCULATING_SHARES_CACHE:
+        return _CIRCULATING_SHARES_CACHE[cache_key]
+    
+    shares = None
+    
+    # === 方案1：腾讯财经 ===
     try:
-        # 构建腾讯财经实时行情URL
         url = f"http://qt.gtimg.cn/q={market}{code}"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=3)
         response.raise_for_status()
         response.encoding = 'gbk'
-        
         content = response.text
         
-        # 解析数据
         if '~' in content and '=' in content:
             import re
             match = re.search(r'="([^"]+)"', content)
             if match:
                 data_str = match.group(1)
                 parts_data = data_str.split('~')
-                
-                # 尝试从多个可能的字段位置获取流通股本
-                circulating_shares = 0
-                
-                # 字段[72]和[76]通常是流通股本（股数）
                 for idx in [72, 76]:
                     if len(parts_data) > idx and parts_data[idx]:
                         try:
-                            shares = float(parts_data[idx])
-                            if shares > 0:
-                                circulating_shares = shares
+                            s = float(parts_data[idx])
+                            if s > 0:
+                                shares = s
                                 break
                         except ValueError:
                             continue
-                
-                if circulating_shares > 0:
-                    return circulating_shares
-        
-        return None
-        
-    except Exception as e:
-        print(f"⚠️  获取 {market}{code} 流通股本失败: {e}")
-        return None
+    except Exception:
+        pass  # 静默失败，尝试下一个数据源
+    
+    # === 方案2：东方财富（腾讯失败时的降级方案）===
+    if shares is None:
+        try:
+            # 东方财富 market_id: 1=上交所, 0=深交所
+            mkt_id = '1' if market == 'sh' else '0'
+            url = "http://push2.eastmoney.com/api/qt/stock/get"
+            params = {"secid": f"{mkt_id}.{code}", "fields": "f84"}
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, params=params, headers=headers, timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('data') and data['data'].get('f84'):
+                    shares = float(data['data']['f84'])
+        except Exception:
+            pass  # 静默失败，返回None
+    
+    # 缓存结果（None 也缓存，避免反复请求同一只失败的股票）
+    _CIRCULATING_SHARES_CACHE[cache_key] = shares
+    return shares
 
 
 # 模块级换手率评分缓存（只初始化一次）

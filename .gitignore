@@ -5,3 +5,4 @@ data/
 signal/
 config.yaml
 backtest/score_stockpool.py
+.reasonix/

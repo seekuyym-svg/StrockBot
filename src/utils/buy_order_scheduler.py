@@ -146,9 +146,15 @@ def send_index_snapshot():
         )
         data = resp.json()
         klines = data['data']['us.IXIC']['day']
-        if len(klines) >= 2:
-            last = klines[-1]
-            prev = klines[-2]
+        if len(klines) >= 3:
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            # 跳过今日不完整K线（如有）
+            if klines[-1][0] == today_str:
+                last = klines[-2]
+                prev = klines[-3]
+            else:
+                last = klines[-1]
+                prev = klines[-2]
             close_price = float(last[2])
             prev_close = float(prev[2])
             change_pct = (close_price - prev_close) / prev_close * 100
@@ -161,127 +167,130 @@ def send_index_snapshot():
     except Exception as e:
         logger.warning(f"[INDEX] 纳斯达克获取失败: {e}")
 
-    # ── 2. 日经225（东方财富接口，实时数据，价格÷100）──
+    # ── 2. 日经225（东方财富实时 → push2his日K线 → 新浪日K线）──
     nikkei_data = None
     headers_em = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                   'Referer': 'https://quote.eastmoney.com/'}
-    for attempt in range(2):  # 重试1次，提高实时数据获取率
-        try:
-            resp = requests.get(
-                'http://push2.eastmoney.com/api/qt/stock/get',
-                params={'secid': '100.N225', 'fields': 'f43,f44,f46,f170,f171'},
-                headers=headers_em, timeout=10
-            )
-            try:
-                data = resp.json() if resp.text and resp.text.strip() else {}
-            except Exception:
-                data = {}
-            if data.get('data'):
+    # ① 东方财富实时 push2
+    try:
+        resp = requests.get(
+            'http://push2.eastmoney.com/api/qt/stock/get',
+            params={'secid': '100.N225', 'fields': 'f43,f60'},
+            headers=headers_em, timeout=8
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('data') and data['data'].get('f43'):
                 d = data['data']
-                price = d.get('f43', 0) / 100.0
-                prev_close = d.get('f44', 0) / 100.0
-                if price and prev_close and prev_close > 0:
+                price = d['f43'] / 100.0
+                prev_close = d['f60'] / 100.0  # f60=昨收
+                if price and prev_close > 0:
                     change_pct = (price - prev_close) / prev_close * 100
-                    nikkei_data = {
-                        'name': '日经225',
-                        'price': f"{price:.2f}",
-                        'change_pct': f"{change_pct:+.2f}%",
-                        'flag': '🇯🇵',
-                    }
-                    break  # 成功则跳出重试
-            if nikkei_data is None and attempt == 0:
-                time.sleep(1)  # 重试前等1秒
-        except Exception:
-            if attempt == 0:
-                time.sleep(1)
+                    nikkei_data = {'name': '日经225', 'price': f"{price:.2f}",
+                                   'change_pct': f"{change_pct:+.2f}%", 'flag': '🇯🇵'}
+    except Exception:
+        pass
 
-    # ── 2b. 日经225降级方案：东方财富失败时走新浪历史K线取开盘价 ──
+    # ② push2his 日K线
+    if nikkei_data is None:
+        try:
+            resp = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get',
+                params={'secid':'100.N225','fields1':'f1,f2,f3,f4,f5,f6',
+                        'fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+                        'klt':'101','fqt':'1',
+                        'beg':(datetime.now()-timedelta(days=5)).strftime('%Y%m%d'),
+                        'end':datetime.now().strftime('%Y%m%d'),'lmt':'10'},
+                headers=headers_em, timeout=10)
+            klines = resp.json()['data']['klines']
+            if len(klines) >= 2:
+                last = klines[-1].split(','); prev = klines[-2].split(',')
+                close_p = float(last[2]); prev_c = float(prev[2])
+                nikkei_data = {'name':'日经225', 'price':f"{close_p:.2f}",
+                               'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇯🇵'}
+        except Exception:
+            pass
+
+    # ③ 新浪日K线（最后保底）
     if nikkei_data is None:
         try:
             import akshare as ak
             df = ak.index_global_hist_sina(symbol="日经225指数")
-            if df is not None and not df.empty:
-                latest = df.iloc[-1]
-                today = datetime.now().date()  # datetime.date类型，与新浪date列一致
-                # 找今天或最近一个交易日
-                row = df[df['date'] == today]
-                if row.empty:
-                    row = df.tail(1)
-                row = row.iloc[-1]
-                open_price = float(row['open'])
-                prev_close = float(row['close'])  # 用前一日close近似
-                # 从倒数第二行取前一日收盘价
-                if len(df) >= 2:
-                    prev_close = float(df.iloc[-2]['close'])
-                change_pct = (open_price - prev_close) / prev_close * 100
-                nikkei_data = {
-                    'name': '日经225',
-                    'price': f"{open_price:.2f}",
-                    'change_pct': f"{change_pct:+.2f}%",
-                    'flag': '🇯🇵',
-                }
-                logger.info("[INDEX] 日经225(新浪降级)获取成功")
+            if df is not None and len(df) >= 2:
+                row = df.iloc[-1]; d = row['date']
+                d_str = d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d)
+                # 检查日期有效性：数据需在今天或最近2个交易日以内
+                days_off = (datetime.now() - datetime.strptime(d_str, '%Y-%m-%d')).days
+                if days_off <= 3:  # 最多滞后3天（跨周末）
+                    close_p = float(row['close'])
+                    prev_c = float(df.iloc[-2]['close'])
+                    nikkei_data = {'name':'日经225', 'price':f"{close_p:.2f}",
+                                   'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇯🇵'}
+                    logger.info(f"[INDEX] 日经225(新浪) {d_str} 涨跌{(close_p-prev_c)/prev_c*100:+.2f}%")
+                else:
+                    logger.warning(f"[INDEX] 日经225新浪数据滞后({d_str})，已跳过")
         except Exception as e2:
-            logger.warning(f"[INDEX] 日经225新浪降级也失败: {e2}")
+            logger.warning(f"[INDEX] 日经225获取失败: {e2}")
 
-    # ── 3. KOSPI（东方财富接口，实时数据，价格÷100）──
+    # ── 3. KOSPI（东方财富实时 → push2his日K线 → 新浪日K线）──
     kospi_data = None
-    for attempt in range(2):  # 重试1次，提高实时数据获取率
-        try:
-            resp = requests.get(
-                'http://push2.eastmoney.com/api/qt/stock/get',
-                params={'secid': '100.KS11', 'fields': 'f43,f44,f46,f170,f171'},
-                headers=headers_em, timeout=10
-            )
-            try:
-                data = resp.json() if resp.text and resp.text.strip() else {}
-            except Exception:
-                data = {}
-            if data.get('data'):
+    # ① 东方财富实时 push2
+    try:
+        resp = requests.get(
+            'http://push2.eastmoney.com/api/qt/stock/get',
+            params={'secid': '100.KS11', 'fields': 'f43,f60'},
+            headers=headers_em, timeout=8
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('data') and data['data'].get('f43'):
                 d = data['data']
-                price = d.get('f43', 0) / 100.0
-                prev_close = d.get('f44', 0) / 100.0
-                if price and prev_close and prev_close > 0:
+                price = d['f43'] / 100.0
+                prev_close = d['f60'] / 100.0  # f60=昨收
+                if price and prev_close > 0:
                     change_pct = (price - prev_close) / prev_close * 100
-                    kospi_data = {
-                        'name': 'KOSPI',
-                        'price': f"{price:.2f}",
-                        'change_pct': f"{change_pct:+.2f}%",
-                        'flag': '🇰🇷',
-                    }
-                    break  # 成功则跳出重试
-            if kospi_data is None and attempt == 0:
-                time.sleep(1)
-        except Exception:
-            if attempt == 0:
-                time.sleep(1)
+                    kospi_data = {'name': 'KOSPI', 'price': f"{price:.2f}",
+                                  'change_pct': f"{change_pct:+.2f}%", 'flag': '🇰🇷'}
+    except Exception:
+        pass
 
-    # ── 3b. KOSPI降级方案：东方财富失败时走新浪历史K线取开盘价 ──
+    # ② push2his 日K线
+    if kospi_data is None:
+        try:
+            resp = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get',
+                params={'secid':'100.KS11','fields1':'f1,f2,f3,f4,f5,f6',
+                        'fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+                        'klt':'101','fqt':'1',
+                        'beg':(datetime.now()-timedelta(days=5)).strftime('%Y%m%d'),
+                        'end':datetime.now().strftime('%Y%m%d'),'lmt':'10'},
+                headers=headers_em, timeout=10)
+            klines = resp.json()['data']['klines']
+            if len(klines) >= 2:
+                last = klines[-1].split(','); prev = klines[-2].split(',')
+                close_p = float(last[2]); prev_c = float(prev[2])
+                kospi_data = {'name':'KOSPI', 'price':f"{close_p:.2f}",
+                              'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇰🇷'}
+        except Exception:
+            pass
+
+    # ③ 新浪日K线（最后保底）
     if kospi_data is None:
         try:
             import akshare as ak
             df = ak.index_global_hist_sina(symbol="首尔综合指数")
-            if df is not None and not df.empty:
-                today = datetime.now().date()  # datetime.date类型，与新浪date列一致
-                row = df[df['date'] == today]
-                if row.empty:
-                    row = df.tail(1)
-                row = row.iloc[-1]
-                open_price = float(row['open'])
-                if len(df) >= 2:
-                    prev_close = float(df.iloc[-2]['close'])
+            if df is not None and len(df) >= 2:
+                row = df.iloc[-1]; d = row['date']
+                d_str = d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d)
+                days_off = (datetime.now() - datetime.strptime(d_str, '%Y-%m-%d')).days
+                if days_off <= 3:
+                    close_p = float(row['close'])
+                    prev_c = float(df.iloc[-2]['close'])
+                    kospi_data = {'name':'KOSPI', 'price':f"{close_p:.2f}",
+                                  'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇰🇷'}
+                    logger.info(f"[INDEX] KOSPI(新浪) {d_str} 涨跌{(close_p-prev_c)/prev_c*100:+.2f}%")
                 else:
-                    prev_close = float(row['close'])
-                change_pct = (open_price - prev_close) / prev_close * 100
-                kospi_data = {
-                    'name': 'KOSPI',
-                    'price': f"{open_price:.2f}",
-                    'change_pct': f"{change_pct:+.2f}%",
-                    'flag': '🇰🇷',
-                }
-                logger.info("[INDEX] KOSPI(新浪降级)获取成功")
+                    logger.warning(f"[INDEX] KOSPI新浪数据滞后({d_str})，已跳过")
         except Exception as e2:
-            logger.warning(f"[INDEX] KOSPI新浪降级也失败: {e2}")
+            logger.warning(f"[INDEX] KOSPI获取失败: {e2}")
 
     # ── 4. 计算综合评分（量比+科创50+KOSPI）──
     buy_score = None
@@ -297,9 +306,15 @@ def send_index_snapshot():
         )
         data = resp.json()
         klines = data['data']['sh000001']['day']
-        if len(klines) >= 6:
-            y_vol = float(klines[-1][5])  # 昨日成交量（腾讯kline只返回已收盘日K线）
-            recent = [float(k[5]) for k in klines[-6:-1]]  # 前5日均量
+        if len(klines) >= 7:
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            # 检查最后一条是否为今天（交易时段可能已生成今日的不完整K线）
+            if klines[-1][0] == today_str:
+                y_vol = float(klines[-2][5])      # 跳过今日，取昨日
+                recent = [float(k[5]) for k in klines[-7:-2]]
+            else:
+                y_vol = float(klines[-1][5])      # 昨日
+                recent = [float(k[5]) for k in klines[-6:-1]]
             vol_ratio = round(y_vol / (sum(recent) / len(recent)), 2)
             logger.info(f"[SCORE] 前日量比: {vol_ratio}")
     except Exception as e:
@@ -331,18 +346,41 @@ def send_index_snapshot():
         except:
             pass
 
-    # 4d. 综合评分
+    # 4d. 前日沪深300健康度（从signal_history.json读取）
+    hs300_healthy = None
+    try:
+        import json as _json
+        signal_file = Path(__file__).parent.parent.parent / "data" / "signal_history.json"
+        if signal_file.exists():
+            with open(signal_file, 'r', encoding='utf-8') as _f:
+                history = _json.load(_f)
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            for record in reversed(history):
+                if record.get('date') == yesterday_str:
+                    for idx in record.get('indices', []):
+                        if idx.get('name') == '沪深300':
+                            hs300_healthy = idx.get('healthy', None)
+                            logger.info(f"[SCORE] 沪深300健康度({yesterday_str}): {hs300_healthy}")
+                            break
+                    break
+    except Exception as e:
+        logger.debug(f"[SCORE] 沪深300健康度获取失败: {e}")
+
+    # 4e. 综合评分（10分制：量比+科创50+KOSPI+沪深300健康）
     def _score_lb(v):
         return 3 if v is not None and v <= 1.00 else 2 if v is not None and v <= 1.10 else 1 if v is not None and v <= 1.15 else 0
     def _score_kc(v):
         return 3 if v is not None and v >= 2.0 else 2 if v is not None and v >= 0 else 1 if v is not None and v >= -2.0 else 0
     def _score_ks(v):
         return 3 if v is not None and v >= 1.0 else 2 if v is not None and v >= 0 else 1 if v is not None and v >= -1.0 else 0
+    def _score_hs(v):
+        return 1 if v is True else 0
 
     s_lb = _score_lb(vol_ratio)
     s_kc = _score_kc(kc_change)
     s_ks = _score_ks(kospi_pct)
-    raw_total = s_lb + s_kc + s_ks
+    s_hs = _score_hs(hs300_healthy)
+    raw_total = s_lb + s_kc + s_ks + s_hs  # 满分10分
 
     # 排除规则：前日科创50过热阶梯扣分（涨越多扣越多）
     if kc_change is not None:
@@ -358,15 +396,15 @@ def send_index_snapshot():
         penalty = 0
     final_total = raw_total - penalty
 
-    # 转为建议
-    if final_total >= 7:
+    # 转为建议（10分制）
+    if final_total >= 8:
         advice = "✅ 推荐买入"
         advice_color = "green"
-    elif final_total >= 5:
+    elif final_total >= 6:
         advice = "🟡 可买(控制仓位)"
         advice_color = "yellow"
-    elif final_total >= 3:
-        advice = "🟠 谨慎"
+    elif final_total >= 4:
+        advice = "🟠 谨慎(不建议买入)"
         advice_color = "orange"
     else:
         advice = "🔴 不买(观望)"
@@ -386,9 +424,10 @@ def send_index_snapshot():
         parts_info.append(f"KOSPI{kospi_pct:+.2f}% ({s_ks}分)")
     else:
         parts_info.append("KOSPI N/A")
+    parts_info.append(f"沪深300{'✅' if hs300_healthy else '❌'} ({s_hs}分)")
     score_detail = " | ".join(parts_info)
     if penalty:
-        score_detail += " (过热降级-1)"
+        score_detail += f" (过热降级-{penalty})"
 
     # ── 4e. 存入历史记录文件 ──
     try:
@@ -397,14 +436,14 @@ def send_index_snapshot():
         vol_str = f"{vol_ratio:.2f}" if vol_ratio is not None else "N/A"
         kc_str = f"{kc_change:+.2f}" if kc_change is not None else "N/A"
         ks_str = f"{kospi_pct:+.2f}" if kospi_pct is not None else "N/A"
-        # 格式: 日期,量比,科创50涨跌,KOSPI涨跌,量比分,科创分,KOSPI分,原始总分,降级,最终总分,建议,实际收益(待补)
         # 建议转纯文字（去掉表情符号）
         advice_text = advice.replace('✅ ','').replace('🟡 ','').replace('🟠 ','').replace('🔴 ','')
-        record = f"{date_str},{vol_str},{kc_str},{ks_str},{s_lb},{s_kc},{s_ks},{raw_total},{penalty},{final_total},{advice_text},\n"
+        # 格式: date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,final_total,advice,actual_return
+        record = f"{date_str},{vol_str},{kc_str},{ks_str},{s_lb},{s_kc},{s_ks},{s_hs},{raw_total},{penalty},{final_total},{advice_text},\n"
         # 文件不存在时写入表头
         if not hist_file.exists():
             with open(hist_file, 'w', encoding='utf-8') as f:
-                f.write("date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,raw_total,penalty,final_total,advice,actual_return\n")
+                f.write("date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,final_total,advice,actual_return\n")
         with open(hist_file, 'a', encoding='utf-8') as f:
             f.write(record)
         logger.info(f"[HISTORY] 已记录决策到 {hist_file.name}")
@@ -441,7 +480,7 @@ def send_index_snapshot():
     # 评分和建议
     content += f"\n\n**━━━ 综合评分 ━━━**\n"
     content += f"{score_detail}\n"
-    content += f"**总分**: {final_total}/9  **建议**: {advice}"
+    content += f"**总分**: {final_total}/10  **建议**: {advice}"
 
     content += f"\n\n_数据来源: 腾讯财经 / 东方财富 / 新浪_"
 

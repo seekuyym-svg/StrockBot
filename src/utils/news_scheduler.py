@@ -1005,6 +1005,17 @@ class NewsMonitorScheduler:
         next_dt = target_dt + timedelta(days=1)
         return next_dt.strftime('%Y%m%d')
 
+    def _get_n_trading_days_before(self, n: int) -> str:
+        """获取当前日期之前第N个交易日"""
+        today = datetime.now()
+        if self.trading_days_cache:
+            trading_days = sorted([d for d in self.trading_days_cache if d <= pd.to_datetime(today)], reverse=True)
+            if len(trading_days) > n:
+                return trading_days[n].strftime('%Y%m%d')
+        # 降级：减足够天数再找最近交易日
+        days_ago = (today - timedelta(days=n * 2 + 3)).strftime('%Y%m%d')
+        return self._get_nearest_trading_day_before(days_ago)
+
     def _get_nearest_trading_day_before(self, target_date_str: str) -> str:
         """
         获取指定日期之前的最近交易日
@@ -1134,8 +1145,7 @@ class NewsMonitorScheduler:
         try:
             # 计算选股日(T)和买入日(T+1)
             today = datetime.now().strftime('%Y-%m-%d')
-            two_days_ago = (datetime.now() - timedelta(days=2)).strftime('%Y%m%d')
-            stock_date = self._get_nearest_trading_day_before(two_days_ago)  # 选股日 T
+            stock_date = self._get_n_trading_days_before(2)  # 选股日 T（往前推2个交易日）
             buy_date = self._get_next_trading_day(stock_date)               # 买入日 T+1
 
             logger.info(f"\n{'=' * 60}")
@@ -1206,8 +1216,8 @@ class NewsMonitorScheduler:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             profit_icon = "📈" if total_return_pct >= 0 else "📉"
 
-            # 卖出日 = 买入日的下一个交易日
-            sell_date = self._get_next_trading_day(buy_date)
+            # 卖出日 = 今天（当前已收盘的交易日）
+            sell_date = datetime.now().strftime('%Y%m%d')
             content = f"**选股日期**: {stock_date[:4]}-{stock_date[4:6]}-{stock_date[6:]}\n"
             content += f"**买入日期**: {buy_date[:4]}-{buy_date[4:6]}-{buy_date[6:]}\n"
             content += f"**卖出日期**: {sell_date[:4]}-{sell_date[4:6]}-{sell_date[6:]}\n"
@@ -1284,11 +1294,11 @@ class NewsMonitorScheduler:
                         updated = False
                         for i in range(1, len(lines)):
                             cols = lines[i].strip().split(',')
-                            if cols[0] == trade_date_fmt and (len(cols) < 12 or cols[11].strip() == ''):
+                            if cols[0] == trade_date_fmt and (len(cols) < 13 or cols[12].strip() == ''):
                                 total_return = (total_current_value - total_investment) / total_investment * 100
-                                while len(cols) < 12:
+                                while len(cols) < 13:
                                     cols.append('')
-                                cols[11] = f"{total_return:+.2f}"
+                                cols[12] = f"{total_return:+.2f}"
                                 lines[i] = ','.join(cols) + '\n'
                                 updated = True
                                 logger.info(f"[HISTORY] 回填 {trade_date_fmt} 实际收益率: {total_return:+.2f}%")

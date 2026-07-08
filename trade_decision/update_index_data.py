@@ -21,6 +21,7 @@
     python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --out data/my_kc.csv
 """
 
+import time as _time
 import requests
 import pandas as pd
 from pathlib import Path
@@ -79,6 +80,139 @@ def fetch_data_from_api(secid: str, start_date: str, end_date: str) -> pd.DataFr
     if not df.empty:
         df = df.sort_values('date').reset_index(drop=True)
     return df
+
+
+# ==================== 腾讯财经降级源 ====================
+
+def _secid_to_tencent_code(secid: str) -> str:
+    """
+    将东方财富secid转为腾讯财经代码
+
+    映射规则:
+      1.000300  → sh000300（上证指数）
+      0.399001  → sz399001（深证指数）
+    """
+    if secid.startswith('1.'):
+        return 'sh' + secid[2:]
+    elif secid.startswith('0.'):
+        return 'sz' + secid[2:]
+    return 'sh' + secid
+
+
+def fetch_data_from_tencent(secid: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    从腾讯财经获取指数历史K线数据（东方财富的降级方案）
+
+    Args:
+        secid: 东方财富secid（自动转为腾讯代码）
+        start_date: 起始日期 (YYYY-MM-DD)
+        end_date: 结束日期 (YYYY-MM-DD)
+
+    Returns:
+        DataFrame，列: date, open, close, high, low, volume
+    """
+    tencent_code = _secid_to_tencent_code(secid)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+
+    try:
+        # 腾讯API只做增量兜底，请求近30天数据
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        resp = requests.get(
+            "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+            params={"param": f"{tencent_code},day,,,120,qfq"},
+            headers=headers,
+            timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get('code') != 0 or not data.get('data'):
+            return pd.DataFrame()
+
+        stock_data = data['data'].get(tencent_code, {})
+        klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
+        if not klines:
+            return pd.DataFrame()
+
+        all_records = []
+        for line in klines:
+            if not isinstance(line, (list, tuple)) or len(line) < 6:
+                continue
+            try:
+                dt = pd.to_datetime(line[0])
+                # 只保留请求日期范围内的数据
+                if start_dt <= dt <= end_dt:
+                    all_records.append({
+                        'date': dt,
+                        'open': float(line[1]),
+                        'close': float(line[2]),
+                        'high': float(line[3]),
+                        'low': float(line[4]),
+                        'volume': float(line[5]),
+                    })
+            except (ValueError, TypeError):
+                continue
+
+        if not all_records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_records)
+        df = df.sort_values('date').reset_index(drop=True)
+        return df
+
+    except Exception:
+        return pd.DataFrame()
+
+
+# ==================== 重试 + 降级获取 ====================
+
+def fetch_data_with_fallback(secid: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    获取指数数据：东方财富（主源）→ 重试3次 → 腾讯财经（备源）
+
+    Args:
+        secid: 东方财富secid
+        start_date: 起始日期 (YYYY-MM-DD)
+        end_date: 结束日期 (YYYY-MM-DD)
+
+    Returns:
+        DataFrame，全部失败时返回空DataFrame
+    """
+    # 第1层：东方财富（主源）
+    print(f"   [源1] 东方财富 ...")
+    try:
+        df = fetch_data_from_api(secid, start_date, end_date)
+        if not df.empty:
+            return df
+    except Exception as e:
+        print(f"   ⚠️ 东方财富失败: {e}")
+
+    # 重试3次
+    for attempt in range(1, 4):
+        wait = attempt * 2
+        print(f"   ⏳ 等待{wait}秒后第{attempt}次重试...")
+        _time.sleep(wait)
+        try:
+            df = fetch_data_from_api(secid, start_date, end_date)
+            if not df.empty:
+                print(f"   ✅ 重试第{attempt}次成功")
+                return df
+        except Exception as e:
+            print(f"   ⚠️ 重试第{attempt}次失败: {e}")
+
+    # 第2层：腾讯财经（备源）
+    print(f"   [源2] 切换到腾讯财经 ...")
+    df = fetch_data_from_tencent(secid, start_date, end_date)
+    if not df.empty:
+        print(f"   ✅ 腾讯财经降级成功")
+        return df
+
+    print(f"   ❌ 腾讯财经也失败，数据获取全部失败")
+    return pd.DataFrame()
 
 
 def update_index_data(index_name: str, secid: str, output_path: str = None,
@@ -145,11 +279,11 @@ def update_index_data(index_name: str, secid: str, output_path: str = None,
             return True
 
         # ========== 获取数据 ==========
-        print(f"\n[STEP 1] 正在从东方财富网获取数据 ({mode})...")
+        print(f"\n[STEP 1] 正在获取数据 ({mode})...")
         print(f"   secid: {secid}")
         print(f"   日期范围: {start_date} ~ {end_date}")
 
-        df = fetch_data_from_api(secid, start_date, end_date)
+        df = fetch_data_with_fallback(secid, start_date, end_date)
 
         if df.empty:
             print("⚠️  未获取到新数据")
