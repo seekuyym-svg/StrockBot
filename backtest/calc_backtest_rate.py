@@ -73,6 +73,8 @@ def load_stock_pool(pooldate: str) -> List[Dict[str, str]]:
     if not stockpool_file.exists():
         stockpool_file = DATA_DIR / f"stockpool_{pooldate}"
     if not stockpool_file.exists():
+        stockpool_file = DATA_DIR / f"stockpool_{pooldate}_new.txt"
+    if not stockpool_file.exists():
         raise FileNotFoundError(f"❌ 股票池文件不存在: {stockpool_file}")
     
     # 从配置文件读取最低评分阈值
@@ -203,6 +205,8 @@ def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, en
     if not stockpool_file.exists():
         stockpool_file = DATA_DIR / f"stockpool_{pooldate}"
     if not stockpool_file.exists():
+        stockpool_file = DATA_DIR / f"stockpool_{pooldate}_new.txt"
+    if not stockpool_file.exists():
         print(f"⚠️  股票池文件不存在，跳过回写: {stockpool_file}")
         return
     
@@ -238,7 +242,7 @@ def write_returns_to_stockpool(pooldate: str, results: list, start_date: str, en
     for line in lines:
         stripped = line.strip()
         
-        if stripped.startswith('# === 技术评分数据'):
+        if stripped.startswith('# === 技术评分数据') or stripped.startswith('# === 精选数据'):
             in_scored_section = True
         
         if in_scored_section and stripped.startswith('# 格式:'):

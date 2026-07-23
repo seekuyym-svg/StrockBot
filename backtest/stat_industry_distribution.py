@@ -40,6 +40,60 @@ def load_industry_cache() -> dict:
         return {}
 
 
+def save_industry_cache(cache: dict):
+    """将行业缓存写回文件"""
+    try:
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] 保存行业缓存失败: {e}")
+
+
+def fetch_industry_from_api(code: str) -> str:
+    """
+    通过东方财富接口获取股票行业（缓存未命中时降级）
+    
+    Args:
+        code: 6位股票代码
+    
+    Returns:
+        行业名称，失败返回 '未知'
+    """
+    import time
+    
+    # 方案1：东方财富HTTP接口
+    try:
+        import requests as req
+        
+        market_code = 'SZ' if not code.startswith('6') else 'SH'
+        url = "http://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/CompanySurveyAjax"
+        params = {"code": f"{market_code}{code}"}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'http://quote.eastmoney.com/'
+        }
+        time.sleep(0.3)
+        response = req.get(url, params=params, headers=headers, timeout=5)
+        data = response.json()
+        if data.get('jbzl') and data['jbzl'].get('sshy'):
+            return str(data['jbzl']['sshy'])
+    except Exception:
+        pass
+    
+    # 方案2：akshare降级
+    try:
+        import akshare as ak
+        info = ak.stock_individual_info_em(symbol=code)
+        if info is not None and not info.empty:
+            row = info[info['item'] == '行业']
+            if not row.empty:
+                return row['value'].iloc[0]
+    except Exception:
+        pass
+    
+    return '未知'
+
+
 def load_stock_codes(date_str: str, override_path: str = None) -> list:
     """
     加载股票池文件中的股票代码列表
@@ -190,15 +244,33 @@ def main():
         print("  [ERROR] 无股票数据，退出")
         return
 
-    # 3. 按行业汇总
+    # 3. 按行业汇总（缓存未命中的自动调API补充）
     industry_counter = Counter()
     unknown_codes = []
+    new_cache_entries = 0
 
-    for code in codes:
+    for idx, code in enumerate(codes, 1):
         industry = get_industry(code, cache)
         if industry == '未知':
-            unknown_codes.append(code)
+            # 缓存未命中 → 调API获取
+            industry = fetch_industry_from_api(code)
+            if industry != '未知':
+                market_prefix = 'sh' if code.startswith('6') or code.startswith('9') else 'sz'
+                cache[f"{market_prefix}.{code}"] = industry
+                new_cache_entries += 1
+            else:
+                unknown_codes.append(code)
+            # 进度提示（每20只显示一次）
+            if idx % 20 == 0 or idx == len(codes):
+                print(f"\r  [PROGRESS] 已处理 {idx}/{len(codes)} 只股票...", end='')
         industry_counter[industry] += 1
+    
+    print()  # 换行
+    
+    # 有新数据则写回文件缓存
+    if new_cache_entries > 0:
+        save_industry_cache(cache)
+        print(f"  [CACHE] 新增 {new_cache_entries} 条行业数据 → industry_cache.json")
 
     # 覆盖率统计
     known = len(codes) - len(unknown_codes)
@@ -223,11 +295,10 @@ def main():
 
     # 提示未知行业
     if unknown_codes:
-        print(f"\n  [WARN] {len(unknown_codes)} 只股票未查到行业:")
+        print(f"\n  [WARN] {len(unknown_codes)} 只股票仍未查到行业（可能已退市或代码无效）:")
         sample = ' '.join(unknown_codes[:10])
         suffix = ' ...' if len(unknown_codes) > 10 else ''
         print(f"         {sample}{suffix}")
-        print(f"         建议先运行 score_stockpool.py 补充行业缓存")
 
 
 if __name__ == "__main__":

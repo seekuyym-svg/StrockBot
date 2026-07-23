@@ -2,26 +2,20 @@
 """
 通用指数历史数据更新脚本（增量更新模式）
 
-从东方财富网获取指定指数历史K线数据，保存到本地CSV文件。
+从腾讯财经获取指定指数历史K线数据，保存到本地CSV文件。
 增量模式下只获取缺失数据并追加到文件末尾，不碰旧数据。
 
-支持任意东方财富指数（通过 --secid 指定）
-
 使用示例:
-    # 增量更新科创综指（从本地最新日期+1天到今天）
-    python trade_decision/update_index_data.py --name kc_index --secid 1.000680
+    # 增量更新科创综指
+    python trade_decision/update_index_data.py --name index_kc --secid 1.000680
     
     # 增量更新沪深300
-    python trade_decision/update_index_data.py --name hs300_eastmoney --secid 1.000300
+    python trade_decision/update_index_data.py --name index_hs300 --secid 1.000300
     
     # 全量更新（指定日期范围）
-    python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --start 2020-01-01
-    
-    # 重命名（可指定输出文件名，默认 data/{name}.csv）
-    python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --out data/my_kc.csv
+    python trade_decision/update_index_data.py --name index_kc --secid 1.000680 --start 2020-01-01
 """
 
-import time as _time
 import requests
 import pandas as pd
 from pathlib import Path
@@ -29,60 +23,12 @@ from datetime import datetime, timedelta
 import argparse
 
 
-def fetch_data_from_api(secid: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    从东方财富网获取指数历史K线数据
-
-    Args:
-        secid: 东方财富secid，如 "1.000300"（沪深300）、"1.000680"（科创综指）
-        start_date: 起始日期 (YYYY-MM-DD)
-        end_date: 结束日期 (YYYY-MM-DD)
-
-    Returns:
-        DataFrame，列: date, open, close, high, low, volume
-    """
-    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "secid": secid,
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": "101",   # 日K线
-        "fqt": "1",     # 前复权
-        "beg": start_date.replace('-', ''),
-        "end": end_date.replace('-', ''),
-        "lmt": "100000"
-    }
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-
-    response = requests.get(url, params=params, headers=headers, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get('data') or not data['data'].get('klines'):
-        return pd.DataFrame()
-
-    records = []
-    for line in data['data']['klines']:
-        parts = line.split(',')
-        if len(parts) >= 6:
-            records.append({
-                'date': pd.to_datetime(parts[0]),
-                'open': float(parts[1]),
-                'close': float(parts[2]),
-                'high': float(parts[3]),
-                'low': float(parts[4]),
-                'volume': float(parts[5]),
-            })
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.sort_values('date').reset_index(drop=True)
-    return df
-
-
-# ==================== 腾讯财经降级源 ====================
+# ============================================================
+# 东方财富接口（不稳定，暂时注释掉，改用腾讯财经）
+# ============================================================
+# def fetch_data_from_api(secid, start_date, end_date):
+#     ...（略）
+# ============================================================
 
 def _secid_to_tencent_code(secid: str) -> str:
     """
@@ -101,10 +47,10 @@ def _secid_to_tencent_code(secid: str) -> str:
 
 def fetch_data_from_tencent(secid: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
-    从腾讯财经获取指数历史K线数据（东方财富的降级方案）
+    从腾讯财经获取指数历史K线数据（主源）
 
     Args:
-        secid: 东方财富secid（自动转为腾讯代码）
+        secid: 东方财富格式secid（自动转为腾讯代码，如 1.000300 → sh000300）
         start_date: 起始日期 (YYYY-MM-DD)
         end_date: 结束日期 (YYYY-MM-DD)
 
@@ -168,64 +114,21 @@ def fetch_data_from_tencent(secid: str, start_date: str, end_date: str) -> pd.Da
         return pd.DataFrame()
 
 
-# ==================== 重试 + 降级获取 ====================
-
-def fetch_data_with_fallback(secid: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    获取指数数据：东方财富（主源）→ 重试3次 → 腾讯财经（备源）
-
-    Args:
-        secid: 东方财富secid
-        start_date: 起始日期 (YYYY-MM-DD)
-        end_date: 结束日期 (YYYY-MM-DD)
-
-    Returns:
-        DataFrame，全部失败时返回空DataFrame
-    """
-    # 第1层：东方财富（主源）
-    print(f"   [源1] 东方财富 ...")
-    try:
-        df = fetch_data_from_api(secid, start_date, end_date)
-        if not df.empty:
-            return df
-    except Exception as e:
-        print(f"   ⚠️ 东方财富失败: {e}")
-
-    # 重试3次
-    for attempt in range(1, 4):
-        wait = attempt * 2
-        print(f"   ⏳ 等待{wait}秒后第{attempt}次重试...")
-        _time.sleep(wait)
-        try:
-            df = fetch_data_from_api(secid, start_date, end_date)
-            if not df.empty:
-                print(f"   ✅ 重试第{attempt}次成功")
-                return df
-        except Exception as e:
-            print(f"   ⚠️ 重试第{attempt}次失败: {e}")
-
-    # 第2层：腾讯财经（备源）
-    print(f"   [源2] 切换到腾讯财经 ...")
-    df = fetch_data_from_tencent(secid, start_date, end_date)
-    if not df.empty:
-        print(f"   ✅ 腾讯财经降级成功")
-        return df
-
-    print(f"   ❌ 腾讯财经也失败，数据获取全部失败")
-    return pd.DataFrame()
+# 腾讯财经已是主源，不再需要降级/重试逻辑
+# （原东方财富重试降级代码已注释保留在文件末尾）
 
 
 def update_index_data(index_name: str, secid: str, output_path: str = None,
                       start_date: str = None, end_date: str = None) -> bool:
     """
-    从东方财富网获取指数数据并保存到本地（增量/全量更新模式）
+    从腾讯财经获取指数数据并保存到本地（增量/全量更新模式）
 
     增量模式：只获取缺失数据，直接追加到CSV末尾
     全量模式（指定 --start）：覆盖写入完整数据
 
     Args:
         index_name: 指数名称（仅用于显示）
-        secid: 东方财富secid
+        secid: 腾讯财经secid（兼容东方财富格式，自动转换）
         output_path: 输出CSV路径，默认 data/{name}.csv
         start_date: 起始日期，None=增量模式，指定=全量模式
         end_date: 结束日期，默认今天
@@ -283,7 +186,7 @@ def update_index_data(index_name: str, secid: str, output_path: str = None,
         print(f"   secid: {secid}")
         print(f"   日期范围: {start_date} ~ {end_date}")
 
-        df = fetch_data_with_fallback(secid, start_date, end_date)
+        df = fetch_data_from_tencent(secid, start_date, end_date)
 
         if df.empty:
             print("⚠️  未获取到新数据")
@@ -340,7 +243,7 @@ def main():
   # 自定义输出路径
   python trade_decision/update_index_data.py --name kc_index --secid 1.000680 --out data/my_kc.csv
 
-支持任意东方财富指数 secid:
+支持指数 secid（东方财富格式，自动转为腾讯代码）:
   1.000300  沪深300
   1.000001  上证指数
   1.000016  上证50
@@ -353,7 +256,7 @@ def main():
     parser.add_argument('--name', type=str, required=True,
                         help='指数名称标识（用于文件名和显示，如 kc_index）')
     parser.add_argument('--secid', type=str, required=True,
-                        help='东方财富secid，如 1.000680（科创综指）')
+                        help='指数代码，如 1.000680（兼容东方财富格式，自动转腾讯代码）')
     parser.add_argument('--out', type=str, default=None,
                         help='输出CSV路径（默认 data/{name}.csv）')
     parser.add_argument('--start', type=str, default=None,

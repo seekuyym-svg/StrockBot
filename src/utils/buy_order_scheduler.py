@@ -115,16 +115,17 @@ def execute_buy_calculation():
         return
     
     # 3. 发送国际市场早盘概览
+    final_total = None
     logger.info("\n[STEP 3] 发送国际市场早盘概览...")
     try:
-        send_index_snapshot()
+        final_total = send_index_snapshot()
     except Exception as e:
         logger.error(f"[STEP 3] 国际市场早盘概览发送异常: {e}")
     
     # 4. 读取交易报告文件并发送飞书通知
     logger.info("\n[STEP 4] 发送买入委托通知...")
     try:
-        send_trade_notification()
+        send_trade_notification(final_total_from_index=final_total)
     except Exception as e:
         logger.error(f"[STEP 4] 买入委托通知发送异常: {e}")
 
@@ -191,24 +192,33 @@ def send_index_snapshot():
     except Exception:
         pass
 
-    # ② push2his 日K线
+    # ② push2his 日K线（加日期检查，确保是今天或最近交易日）
     if nikkei_data is None:
-        try:
-            resp = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get',
-                params={'secid':'100.N225','fields1':'f1,f2,f3,f4,f5,f6',
-                        'fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
-                        'klt':'101','fqt':'1',
-                        'beg':(datetime.now()-timedelta(days=5)).strftime('%Y%m%d'),
-                        'end':datetime.now().strftime('%Y%m%d'),'lmt':'10'},
-                headers=headers_em, timeout=10)
-            klines = resp.json()['data']['klines']
-            if len(klines) >= 2:
-                last = klines[-1].split(','); prev = klines[-2].split(',')
-                close_p = float(last[2]); prev_c = float(prev[2])
-                nikkei_data = {'name':'日经225', 'price':f"{close_p:.2f}",
-                               'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇯🇵'}
-        except Exception:
-            pass
+        for _attempt in range(2):
+            try:
+                resp = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get',
+                    params={'secid':'100.N225','fields1':'f1,f2,f3,f4,f5,f6',
+                            'fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+                            'klt':'101','fqt':'1',
+                            'beg':(datetime.now()-timedelta(days=5)).strftime('%Y%m%d'),
+                            'end':datetime.now().strftime('%Y%m%d'),'lmt':'10'},
+                    headers=headers_em, timeout=10)
+                klines = resp.json()['data']['klines']
+                if len(klines) >= 2:
+                    last = klines[-1].split(','); prev = klines[-2].split(',')
+                    last_date = last[0]
+                    # 检查数据日期是否在最近3天内（跨周末）
+                    days_off = (datetime.now() - datetime.strptime(last_date, '%Y-%m-%d')).days
+                    if days_off <= 3:
+                        close_p = float(last[2]); prev_c = float(prev[2])
+                        nikkei_data = {'name':'日经225', 'price':f"{close_p:.2f}",
+                                       'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇯🇵'}
+                        break
+                if _attempt == 0:
+                    time.sleep(1)
+            except Exception:
+                if _attempt == 0:
+                    time.sleep(1)
 
     # ③ 新浪日K线（最后保底）
     if nikkei_data is None:
@@ -253,24 +263,32 @@ def send_index_snapshot():
     except Exception:
         pass
 
-    # ② push2his 日K线
+    # ② push2his 日K线（加日期检查，确保是今天或最近交易日）
     if kospi_data is None:
-        try:
-            resp = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get',
-                params={'secid':'100.KS11','fields1':'f1,f2,f3,f4,f5,f6',
-                        'fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
-                        'klt':'101','fqt':'1',
-                        'beg':(datetime.now()-timedelta(days=5)).strftime('%Y%m%d'),
-                        'end':datetime.now().strftime('%Y%m%d'),'lmt':'10'},
-                headers=headers_em, timeout=10)
-            klines = resp.json()['data']['klines']
-            if len(klines) >= 2:
-                last = klines[-1].split(','); prev = klines[-2].split(',')
-                close_p = float(last[2]); prev_c = float(prev[2])
-                kospi_data = {'name':'KOSPI', 'price':f"{close_p:.2f}",
-                              'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇰🇷'}
-        except Exception:
-            pass
+        for _attempt in range(2):
+            try:
+                resp = requests.get('https://push2his.eastmoney.com/api/qt/stock/kline/get',
+                    params={'secid':'100.KS11','fields1':'f1,f2,f3,f4,f5,f6',
+                            'fields2':'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+                            'klt':'101','fqt':'1',
+                            'beg':(datetime.now()-timedelta(days=5)).strftime('%Y%m%d'),
+                            'end':datetime.now().strftime('%Y%m%d'),'lmt':'10'},
+                    headers=headers_em, timeout=10)
+                klines = resp.json()['data']['klines']
+                if len(klines) >= 2:
+                    last = klines[-1].split(','); prev = klines[-2].split(',')
+                    last_date = last[0]
+                    days_off = (datetime.now() - datetime.strptime(last_date, '%Y-%m-%d')).days
+                    if days_off <= 3:
+                        close_p = float(last[2]); prev_c = float(prev[2])
+                        kospi_data = {'name':'KOSPI', 'price':f"{close_p:.2f}",
+                                      'change_pct':f"{(close_p-prev_c)/prev_c*100:+.2f}%", 'flag':'🇰🇷'}
+                        break
+                if _attempt == 0:
+                    time.sleep(1)
+            except Exception:
+                if _attempt == 0:
+                    time.sleep(1)
 
     # ③ 新浪日K线（最后保底）
     if kospi_data is None:
@@ -296,44 +314,44 @@ def send_index_snapshot():
     buy_score = None
     score_detail = ""
 
-    # 4a. 前日量比（腾讯上证成交量）
+    # 4a. 前日量比（从 signal_history.json 读取，自动跳过周末）
     vol_ratio = None
     try:
-        resp = requests.get(
-            'http://web.ifzq.gtimg.cn/appstock/app/kline/kline',
-            params={'p': 1, 'param': f'sh000001,day,{(datetime.now()-timedelta(days=20)).strftime("%Y-%m-%d")},{datetime.now().strftime("%Y-%m-%d")},20'},
-            headers={'User-Agent': 'Mozilla/5.0'}, timeout=10
-        )
-        data = resp.json()
-        klines = data['data']['sh000001']['day']
-        if len(klines) >= 7:
-            today_str = datetime.now().strftime('%Y-%m-%d')
-            # 检查最后一条是否为今天（交易时段可能已生成今日的不完整K线）
-            if klines[-1][0] == today_str:
-                y_vol = float(klines[-2][5])      # 跳过今日，取昨日
-                recent = [float(k[5]) for k in klines[-7:-2]]
-            else:
-                y_vol = float(klines[-1][5])      # 昨日
-                recent = [float(k[5]) for k in klines[-6:-1]]
-            vol_ratio = round(y_vol / (sum(recent) / len(recent)), 2)
-            logger.info(f"[SCORE] 前日量比: {vol_ratio}")
+        import json as _json
+        signal_file = Path(__file__).parent.parent.parent / "data" / "signal_history.json"
+        if signal_file.exists():
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            with open(signal_file, 'r', encoding='utf-8') as _f:
+                records = _json.load(_f)
+            for record in reversed(records):
+                if record.get('date') <= yesterday_str:
+                    vol_ratio = record.get('volume_ratio', None)
+                    logger.info(f"[SCORE] 前日量比({record.get('date')}): {vol_ratio}")
+                    break
+            if vol_ratio is None:
+                logger.warning(f"[SCORE] signal_history.json 中未找到 {yesterday_str} 之前的量比数据")
     except Exception as e:
         logger.warning(f"[SCORE] 量比获取失败: {e}")
 
-    # 4b. 前日科创50涨跌幅（本地CSV）
+    # 4b. 前日科创50涨跌幅（从 signal_history.json 读取，自动跳过周末）
     kc_change = None
     try:
-        import pandas as pd
-        csv_path = Path(__file__).parent.parent.parent / "data" / "index_kc.csv"
-        if csv_path.exists():
-            df = pd.read_csv(csv_path, parse_dates=['date'])
-            df = df.sort_values('date')
-            if len(df) >= 2:
-                y_kc = df.iloc[-2]  # 前天
-                t_kc = df.iloc[-1]  # 昨天（CSV每日16时更新，9:26时最后一条=昨日）
-                # 昨天相对于前天的涨跌幅
-                kc_change = (t_kc['close'] - y_kc['close']) / y_kc['close'] * 100
-                logger.info(f"[SCORE] 前日科创50涨跌: {kc_change:+.2f}%")
+        import json as _json
+        signal_file = Path(__file__).parent.parent.parent / "data" / "signal_history.json"
+        if signal_file.exists():
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            with open(signal_file, 'r', encoding='utf-8') as _f:
+                records = _json.load(_f)
+            for record in reversed(records):
+                if record.get('date') <= yesterday_str:
+                    for idx in record.get('indices', []):
+                        if idx.get('name') == '科创综指':
+                            kc_change = idx.get('change_pct', None)
+                            logger.info(f"[SCORE] 前日科创50涨跌({record.get('date')}): {kc_change:+.2f}%")
+                            break
+                    break
+            if kc_change is None:
+                logger.warning(f"[SCORE] signal_history.json 中未找到 {yesterday_str} 之前的科创综指数据")
     except Exception as e:
         logger.warning(f"[SCORE] 科创50获取失败: {e}")
 
@@ -346,7 +364,7 @@ def send_index_snapshot():
         except:
             pass
 
-    # 4d. 前日沪深300健康度（从signal_history.json读取）
+    # 4d. 前日沪深300健康度（从signal_history.json读取，自动跳过周末）
     hs300_healthy = None
     try:
         import json as _json
@@ -356,23 +374,47 @@ def send_index_snapshot():
                 history = _json.load(_f)
             yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
             for record in reversed(history):
-                if record.get('date') == yesterday_str:
+                if record.get('date') <= yesterday_str:
                     for idx in record.get('indices', []):
                         if idx.get('name') == '沪深300':
                             hs300_healthy = idx.get('healthy', None)
-                            logger.info(f"[SCORE] 沪深300健康度({yesterday_str}): {hs300_healthy}")
+                            logger.info(f"[SCORE] 沪深300健康度({record.get('date')}): {hs300_healthy}")
                             break
                     break
     except Exception as e:
         logger.debug(f"[SCORE] 沪深300健康度获取失败: {e}")
 
-    # 4e. 综合评分（10分制：量比+科创50+KOSPI+沪深300健康）
+    # 4f. 前日市场情绪评分（从signal_history.json读取，用于情绪正加权）
+    emotion_score = 5.0  # 默认中性
+    try:
+        import json as _json2
+        signal_file = Path(__file__).parent.parent.parent / "data" / "signal_history.json"
+        if signal_file.exists():
+            with open(signal_file, 'r', encoding='utf-8') as _f:
+                records = _json2.load(_f)
+            yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+            for record in reversed(records):
+                if record.get('date') <= yesterday_str:
+                    emotion_data = record.get('emotion')
+                    if emotion_data and emotion_data.get('score'):
+                        emotion_score = float(emotion_data['score'])
+                        logger.info(f"[SCORE] 前日情绪评分({record.get('date')}): {emotion_score}")
+                    break
+    except Exception as e:
+        logger.debug(f"[SCORE] 情绪评分获取失败: {e}")
+
+    # 4g. 综合评分（10分制：量比+科创50+KOSPI+沪深300健康+情绪加权）
     def _score_lb(v):
-        return 3 if v is not None and v <= 1.00 else 2 if v is not None and v <= 1.10 else 1 if v is not None and v <= 1.15 else 0
+        if v is None: return 0
+        if 0.85 <= v <= 1.05: return 3     # 健康区间：量能适中
+        if v < 0.85: return 2                # 明显缩量（无人气）
+        if v <= 1.15: return 2               # 小幅放量
+        if v <= 1.30: return 1               # 明显放量
+        return 0                              # 极度放量 >1.30
     def _score_kc(v):
         return 3 if v is not None and v >= 2.0 else 2 if v is not None and v >= 0 else 1 if v is not None and v >= -2.0 else 0
     def _score_ks(v):
-        return 3 if v is not None and v >= 1.0 else 2 if v is not None and v >= 0 else 1 if v is not None and v >= -1.0 else 0
+        return 3 if v is not None and v >= 5.0 else 2 if v is not None and v >= 3.0 else 1 if v is not None and v >= 0 else 0
     def _score_hs(v):
         return 1 if v is True else 0
 
@@ -394,7 +436,18 @@ def send_index_snapshot():
             penalty = 0
     else:
         penalty = 0
-    final_total = raw_total - penalty
+
+    # 情绪正加权：前日情绪好（≥7分）且无过热降级时加分，情绪极差（<3分）时减分
+    if emotion_score >= 7.0 and penalty == 0:
+        emotion_bonus = 1
+        logger.info(f"[SCORE] 情绪正加权: emotion_score={emotion_score} ≥7.0 → +1分")
+    elif emotion_score < 3.0:
+        emotion_bonus = -1
+        logger.info(f"[SCORE] 情绪负加权: emotion_score={emotion_score} <3.0 → -1分")
+    else:
+        emotion_bonus = 0
+
+    final_total = raw_total - penalty + emotion_bonus
 
     # 转为建议（10分制）
     if final_total >= 8:
@@ -425,9 +478,12 @@ def send_index_snapshot():
     else:
         parts_info.append("KOSPI N/A")
     parts_info.append(f"沪深300{'✅' if hs300_healthy else '❌'} ({s_hs}分)")
+    parts_info.append(f"情绪{emotion_score:.1f}分")
     score_detail = " | ".join(parts_info)
     if penalty:
         score_detail += f" (过热降级-{penalty})"
+    if emotion_bonus != 0:
+        score_detail += f" (情绪{'正' if emotion_bonus > 0 else '负'}加权{emotion_bonus:+.0f})"
 
     # ── 4e. 存入历史记录文件 ──
     try:
@@ -438,12 +494,12 @@ def send_index_snapshot():
         ks_str = f"{kospi_pct:+.2f}" if kospi_pct is not None else "N/A"
         # 建议转纯文字（去掉表情符号）
         advice_text = advice.replace('✅ ','').replace('🟡 ','').replace('🟠 ','').replace('🔴 ','')
-        # 格式: date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,final_total,advice,actual_return
-        record = f"{date_str},{vol_str},{kc_str},{ks_str},{s_lb},{s_kc},{s_ks},{s_hs},{raw_total},{penalty},{final_total},{advice_text},\n"
+        # 格式: date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return
+        record = f"{date_str},{vol_str},{kc_str},{ks_str},{s_lb},{s_kc},{s_ks},{s_hs},{raw_total},{penalty},{emotion_bonus},{final_total},{advice_text},\n"
         # 文件不存在时写入表头
         if not hist_file.exists():
             with open(hist_file, 'w', encoding='utf-8') as f:
-                f.write("date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,final_total,advice,actual_return\n")
+                f.write("date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return\n")
         with open(hist_file, 'a', encoding='utf-8') as f:
             f.write(record)
         logger.info(f"[HISTORY] 已记录决策到 {hist_file.name}")
@@ -518,8 +574,10 @@ def send_index_snapshot():
     except Exception as e:
         logger.error(f"[INDEX] 推送失败: {e}")
 
+    return final_total
 
-def send_trade_notification():
+
+def send_trade_notification(final_total_from_index=None):
     """
     读取交易报告文件并通过飞书发送通知
     """
@@ -550,37 +608,45 @@ def send_trade_notification():
             logger.info("[INFO] 今日没有可买入的股票")
             return
         
-        # 构建飞书消息内容
+        # 根据评分决定是否显示明细
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        content = f"**今日买入委托明细**\n"
-        content += f"**时间**: {current_time}\n"
-        content += f"**数量**: {stock_count} 只股票\n\n"
-        content += f"**━━━━━━━━━━━━━━━**\n\n"
+        if final_total_from_index is not None and final_total_from_index < 6:
+            content = f"**🔴 今日不买入，暂无买入委托，建议买防守ETF。**\n"
+            content += f"**时间**: {current_time}\n"
+            content += f"**原因**: 综合评分{final_total_from_index}/10，建议{'谨慎' if final_total_from_index >= 4 else '不买'}\n"
+            
+            logger.info(f"[TRADE] 评分{final_total_from_index}<6，跳过委托明细展示")
+        else:
+            content = f"**今日买入委托明细**\n"
+            content += f"**时间**: {current_time}\n"
+            content += f"**数量**: {stock_count} 只股票\n\n"
+            content += f"**━━━━━━━━━━━━━━━**\n\n"
         
-        # 解析每只股票的委托明细
-        for i, line in enumerate(lines[2:], 1):  # 从第3行开始（跳过表头）
-            line = line.strip()
-            if not line:
-                continue
-            
-            parts = line.split(',')
-            if len(parts) != 4:
-                continue
-            
-            code = parts[0].strip()
-            open_price = float(parts[1].strip())
-            shares = int(parts[2].strip())
-            amount = float(parts[3].strip())
-            
-            # 获取股票名称
-            stock_name = get_stock_name(code)
-            
-            # 格式化输出
-            content += f"**{i}. {stock_name} ({code})**\n"
-            content += f"   开盘价: ¥{open_price:.2f}\n"
-            content += f"   股数: {shares:,} 股\n"
-            content += f"   金额: ¥{amount:,.2f}\n\n"
+        # 仅评分≥6时才解析委托明细
+        if final_total_from_index is None or final_total_from_index >= 6:
+            for i, line in enumerate(lines[2:], 1):  # 从第3行开始（跳过表头）
+                line = line.strip()
+                if not line:
+                    continue
+                
+                parts = line.split(',')
+                if len(parts) != 4:
+                    continue
+                
+                code = parts[0].strip()
+                open_price = float(parts[1].strip())
+                shares = int(parts[2].strip())
+                amount = float(parts[3].strip())
+                
+                # 获取股票名称
+                stock_name = get_stock_name(code)
+                
+                # 格式化输出
+                content += f"**{i}. {stock_name} ({code})**\n"
+                content += f"   开盘价: ¥{open_price:.2f}\n"
+                content += f"   股数: {shares:,} 股\n"
+                content += f"   金额: ¥{amount:,.2f}\n\n"
         
         content += f"**━━━━━━━━━━━━━━━**\n"
         

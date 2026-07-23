@@ -1,21 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-股票池批量评分工具（历史回测版本）
+股票池批量评分工具（针对 _my.txt 自定义股票池 — 简洁版）
 
 功能：
-1. 批量读取指定日期范围内的股票池文件 (stockpool_YYYYMMDD.txt)
-2. 对股票池中的股票进行技术分析评分（基于历史指定日期的K线数据）
-3. 将评分结果追加到原股票池文件中
-4. 保留原文件备份以防数据丢失
-
-核心特性：
-- ✅ 完全独立实现，不依赖 local/calc_bb.py
-- ✅ 使用 mootdx Reader 直接读取本地通达信数据
-- ✅ 技术指标计算严格基于指定的历史日期（而非当前最新日期）
+1. 读取 _my.txt 股票池文件（仅有股票代码），计算综合评分 + 优选分
+2. 按综合评分降序排列，将所有结果写入文件
+3. 不做任何过滤：保留所有分值的股票
 
 使用方法：
-    python backtest/score_stockpool.py --date 2026-05-06
-    python backtest/score_stockpool.py --start-date 2024-01-01 --end-date 2024-01-10
+    python backtest/score_stockpool_my.py --date 2026-05-06
+    python backtest/score_stockpool_my.py --start-date 2024-01-01 --end-date 2024-01-10
 """
 
 import pandas as pd
@@ -40,7 +34,7 @@ except ImportError:
 
 
 class HistoricalStockScorer:
-    """历史股票评分器（独立实现）"""
+    """历史股票评分器（针对 _my.txt 自定义股票池 — 简洁版）"""
     
     def __init__(self, tdx_dir: str = None):
         """
@@ -49,151 +43,128 @@ class HistoricalStockScorer:
         Args:
             tdx_dir: 通达信安装目录，默认从环境变量或配置读取
         """
-        # 初始化 mootdx Reader
         if tdx_dir is None:
-            # 尝试从 config.yaml 读取，或使用默认路径
             try:
                 from src.utils.config import get_config
                 config = get_config()
-                # Pydantic模型使用属性访问，而非 .get() 方法
                 tdx_dir = getattr(config, 'tdx_dir', 'D:\\Install\\zd_zxzq_gm')
             except Exception as e:
                 logger.debug(f"⚠️ 读取配置失败: {e}，使用默认通达信目录")
                 tdx_dir = 'D:\\Install\\zd_zxzq_gm'
         
         self.reader = Reader.factory(market='std', tdxdir=tdx_dir)
+        # 优选分计算所需参数
+        self.pref_vol_ratio_threshold = 2.8
+        self.pref_vol_ratio_min = 1.2
+        self.pref_upper_shadow_threshold = 2.5
+        # 评分趋势缓存
+        self._score_trend_cache = {}
+        # 名称+行业信息缓存
+        self.info_cache = {}  # code -> {name, industry}
+        self.info_cache_file = Path(__file__).parent.parent / "data" / "stock_info_cache.json"
+        self._load_info_cache()
         logger.info(f"✅ 已初始化 mootdx Reader (通达信目录: {tdx_dir})")
+    
+    def _load_info_cache(self):
+        """从本地文件加载股票名称+行业信息缓存"""
+        try:
+            if self.info_cache_file.exists():
+                import json
+                with open(self.info_cache_file, 'r', encoding='utf-8') as f:
+                    self.info_cache = json.load(f)
+                logger.debug(f"[CACHE] 已加载 {len(self.info_cache)} 条名称+行业信息")
+        except Exception as e:
+            logger.debug(f"[CACHE] 加载信息缓存失败: {e}")
+    
+    def _save_info_cache(self):
+        """保存股票名称+行业信息缓存到本地文件"""
+        try:
+            import json
+            with open(self.info_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(self.info_cache, f, ensure_ascii=False, indent=2)
+            logger.debug(f"[CACHE] 已保存 {len(self.info_cache)} 条名称+行业信息")
+        except Exception as e:
+            logger.debug(f"[CACHE] 保存信息缓存失败: {e}")
+    
+    def _get_stock_info(self, symbol: str) -> Tuple[str, Optional[str]]:
+        """
+        获取股票名称和行业（带缓存）
+
+        名称复用 local/utils.py 的 get_stock_name（腾讯→新浪→东方财富多数据源降级），
+        行业通过东方财富公司概况接口获取，结果缓存到本地 JSON 文件。
+
+        Returns:
+            (股票名称, 行业名称)，获取失败时名称返回 code，行业返回 None
+        """
+        code = symbol.split('.')[1] if '.' in symbol else symbol
+
+        # 检查缓存
+        if code in self.info_cache:
+            info = self.info_cache[code]
+            return info.get('name', code), info.get('industry')
+
+        name = code
+        industry = None
+
+        # === 名称：复用 local/utils.py 的 get_stock_name ===
+        try:
+            from local.utils import get_stock_name as _get_name
+            fetched = _get_name(code)
+            if fetched and fetched != code:
+                name = fetched
+        except Exception as e:
+            logger.debug(f"[INFO] get_stock_name 获取 {code} 失败: {e}")
+
+        # === 行业：东方财富公司概况接口 ===
+        try:
+            import requests as req
+            market_code = 'SZ' if code.startswith(('0', '3')) else 'SH'
+            url = "http://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/CompanySurveyAjax"
+            params = {"code": f"{market_code}{code}"}
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'http://quote.eastmoney.com/'
+            }
+            time.sleep(0.25)
+            response = req.get(url, params=params, headers=headers, timeout=10)
+            data = response.json()
+            jbzl = data.get('jbzl')
+            if jbzl:
+                ind = jbzl.get('sshy')
+                if ind:
+                    industry = str(ind)
+        except Exception as e:
+            logger.debug(f"[INFO] 东方财富行业获取 {code} 失败: {e}")
+
+        # 缓存并保存
+        self.info_cache[code] = {'name': name, 'industry': industry}
+        self._save_info_cache()
+
+        return name, industry
     
     def _get_historical_klines(self, stock_code: str, analysis_date: str, days: int = 300) -> pd.DataFrame:
         """
         获取指定日期之前的历史K线数据
-        
-        Args:
-            stock_code: 股票代码（6位数字，不含市场前缀）
-            analysis_date: 分析日期 (格式: YYYY-MM-DD)
-            days: 需要获取的K线数量
-            
-        Returns:
-            DataFrame 包含日期索引和 OHLCV 数据，仅包含 analysis_date 及之前的数据
+        统一委托给 local/utils.py 的实现（本地通达信 → 腾讯API降级）
         """
-        try:
-            df = self.reader.daily(symbol=stock_code)
-            
-            if df is None or df.empty:
-                return pd.DataFrame()
-            
-            # 转换索引为 datetime
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
-            
-            # 关键：截断到 analysis_date 及之前的数据
-            analysis_dt = pd.to_datetime(analysis_date)
-            df_filtered = df[df.index <= analysis_dt]
-            
-            if len(df_filtered) < 60:
-                logger.debug(f"⚠️ {stock_code} 在 {analysis_date} 之前数据不足 ({len(df_filtered)}条)")
-                return pd.DataFrame()
-            
-            return df_filtered
-            
-        except Exception as e:
-            logger.debug(f"❌ 获取 {stock_code} K线数据失败: {e}")
-            return pd.DataFrame()
-    
-    def _calculate_ma(self, df: pd.DataFrame, periods: List[int] = [5, 10, 20, 60]) -> pd.DataFrame:
-        """计算移动平均线"""
-        for p in periods:
-            df[f'MA{p}'] = df['close'].rolling(window=p).mean()
-        return df
-    
-    def _check_trend_alignment(self, df: pd.DataFrame) -> Tuple[str, str]:
-        """
-        判断均线排列状态
-        
-        Returns:
-            (trend_type, message): 趋势类型和描述
-        """
-        latest = df.iloc[-1]
-        
-        # 检查数据完整性
-        if pd.isna(latest.get('MA5')) or pd.isna(latest.get('MA10')) or pd.isna(latest.get('MA20')):
-            return 'neutral', "数据不足，无法判断均线排列"
-        
-        ma5 = latest['MA5']
-        ma10 = latest['MA10']
-        ma20 = latest['MA20']
-        
-        # 多头排列: MA5 > MA10 > MA20
-        if ma5 > ma10 > ma20:
-            ratio = ma5 / ma20 if ma20 > 0 else 1
-            if ratio > 1.01:
-                return 'bullish', f"均线多头排列 (MA5>MA10>MA20)"
-            else:
-                return 'neutral', f"均线粘合略偏多 (差距<1%)"
-        
-        # 空头排列: MA5 < MA10 < MA20
-        if ma5 < ma10 < ma20:
-            ratio = ma20 / ma5 if ma5 > 0 else 1
-            if ratio > 1.01:
-                return 'bearish', f"均线空头排列 (MA5<MA10<MA20)"
-            else:
-                return 'neutral', f"均线粘合略偏空 (差距<1%)"
-        
-        return 'neutral', "均线相互缠绕，无明显趋势"
-    
-    def _compute_macd(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float]:
-        """计算MACD指标"""
-        ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
-        ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
-        dif = ema_fast - ema_slow
-        dea = dif.ewm(span=signal, adjust=False).mean()
-        macd_bar = (dif - dea) * 2
-        return dif.iloc[-1], dea.iloc[-1], macd_bar.iloc[-1]
-    
-    def _compute_rsi(self, df: pd.DataFrame, period: int = 14) -> float:
-        """计算RSI指标"""
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.iloc[-1]
-    
-    def _compute_bollinger(self, df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> Tuple[int, float, float]:
-        """
-        计算布林带位置
-        
-        Returns:
-            (position, upper, lower): 位置标识(1=突破上轨, 0=中轨附近, -1=跌破下轨)、上轨、下轨
-        """
-        ma = df['close'].rolling(window=period).mean()
-        std = df['close'].rolling(window=period).std()
-        upper = ma + std_dev * std
-        lower = ma - std_dev * std
-        latest_close = df['close'].iloc[-1]
-        
-        if latest_close > upper.iloc[-1]:
-            position = 1
-        elif latest_close < lower.iloc[-1]:
-            position = -1
+        if stock_code.startswith(('sh', 'sz', 'bj')):
+            market = stock_code[:2]
+            code = stock_code[2:]
         else:
-            position = 0
+            code = stock_code
+            market = 'sh' if code.startswith(('6', '9')) else 'sz'
         
-        return position, upper.iloc[-1], lower.iloc[-1]
+        from local.utils import _get_historical_klines as _get_data
+        return _get_data(market, code, days=days, end_date=analysis_date, min_data_length=60)
     
-    def analyze_stock(self, symbol: str, analysis_date: str) -> Optional[float]:
+    def analyze_stock(self, symbol: str, analysis_date: str) -> Optional[Tuple[float, float]]:
         """
         分析单只股票并返回评分（基于指定历史日期）
         
-        Args:
-            symbol: 股票代码 (格式: sh.600519 或 sz.000858)
-            analysis_date: 分析日期 (格式: YYYY-MM-DD)
-            
         Returns:
-            综合评分 (float)，如果分析失败返回 None（新版：0-100分制）
+            Tuple[综合评分(0-100), 优选分(0-25)]，失败返回 None
         """
         try:
-            # 解析股票代码
             parts = symbol.split('.')
             if len(parts) != 2:
                 return None
@@ -201,19 +172,162 @@ class HistoricalStockScorer:
             market = parts[0].lower()
             code = parts[1]
             
-            # 使用新版100分评分系统（传入历史日期）
             from local.utils import calculate_trend_score_v2
             score = calculate_trend_score_v2(market, code, days=300, end_date=analysis_date)
             
-            return score
+            if score is None:
+                return None
+            
+            pref_score = self._calc_pref_and_veto(market, code, analysis_date, current_score=score)
+            return (score, pref_score)
                 
         except Exception as e:
             logger.debug(f"❌ 分析 {symbol} 失败: {e}")
             return None
     
+    def _calc_pref_and_veto(self, market: str, code: str, 
+                            analysis_date: str, current_score: float = None) -> float:
+        """
+        计算优选分（0~25分）— 强势延续性评估
+        
+        五项评分：
+          ① 趋势疲劳度（连续上涨天数）→ 0~6分
+          ② 前高压力（距离60日最高价）→ 0~6分
+          ③ 当日强度（涨跌幅+量比配合）→ 0~4分
+          ④ 乖离率（偏离20日线幅度）→ 0~4分
+          ⑤ 评分趋势（历史综合评分走势）→ 0~5分
+        """
+        try:
+            df = self._get_historical_klines(f"{market}{code}", analysis_date, days=90)
+            if df.empty or len(df) < 30:
+                return 0
+            
+            closes = df['close'].values
+            latest_close = closes[-1]
+            total = 0.0
+            
+            # === ① 趋势疲劳度（6分） ===
+            consecutive_up = 0
+            for i in range(len(df)-1, max(0, len(df)-15), -1):
+                if df['close'].iloc[i] > df['open'].iloc[i]:
+                    consecutive_up += 1
+                else:
+                    break
+            
+            if consecutive_up <= 3:
+                total += 6.0
+            elif consecutive_up <= 5:
+                total += 4.0
+            elif consecutive_up <= 7:
+                total += 2.0
+            else:
+                total += 0.0
+            
+            # === ② 前高压力（6分） ===
+            lookback = min(60, len(df))
+            high_60d = df['high'].iloc[-lookback:].max()
+            distance_to_high = (latest_close - high_60d) / high_60d * 100 if high_60d > 0 else 0
+            
+            if distance_to_high > 5:
+                total += 2.0
+            elif distance_to_high > 0:
+                total += 4.0
+            elif distance_to_high > -5:
+                total += 2.0
+            elif distance_to_high > -10:
+                total += 4.0
+            else:
+                total += 6.0
+            
+            # === ③ 当日强度（4分） ===
+            prev_close = closes[-2] if len(closes) >= 2 else latest_close
+            change_pct = (latest_close - prev_close) / prev_close * 100 if prev_close > 0 else 0
+            
+            vol_ma20 = df['volume'].iloc[-20:].mean()
+            vol_ratio = df['volume'].iloc[-1] / vol_ma20 if vol_ma20 > 0 else 0
+            pr_min = self.pref_vol_ratio_min
+            pr_mid = (pr_min + self.pref_vol_ratio_threshold) / 2
+            
+            if 1 <= change_pct <= 3 and pr_min <= vol_ratio <= pr_mid:
+                total += 4.0
+            elif 0 <= change_pct <= 1 and pr_min * 0.7 <= vol_ratio <= pr_mid:
+                total += 2.0
+            elif -1 <= change_pct <= 0 and pr_min * 0.7 <= vol_ratio <= pr_mid:
+                total += 2.0
+            elif change_pct > 3:
+                total += 1.0
+            elif change_pct < -2:
+                total += 0.0
+            else:
+                total += 1.0
+            
+            # 上影线修正
+            upper_shadows = []
+            for i in range(3):
+                h = df['high'].iloc[-1-i]
+                c = df['close'].iloc[-1-i]
+                o = df['open'].iloc[-1-i]
+                if h > 0:
+                    upper_shadows.append((h - max(c, o)) / h * 100)
+            if len(upper_shadows) == 3 and sum(upper_shadows)/3 > self.pref_upper_shadow_threshold:
+                total -= 2.0
+            
+            # === ④ 乖离率（4分） ===
+            ma20 = df['close'].rolling(20).mean().iloc[-1]
+            if pd.notna(ma20) and ma20 > 0:
+                deviation = (latest_close - ma20) / ma20 * 100
+                if 2 <= deviation <= 4:
+                    total += 4.0
+                elif 4 < deviation <= 6:
+                    total += 2.0
+                elif 0 <= deviation < 2:
+                    total += 2.0
+                elif deviation > 6:
+                    total += 0.0
+                else:
+                    total += 0.0
+            
+            # === ⑤ 评分趋势（5分） ===
+            hist_scores = self._score_trend_cache.get(code) or []
+            if not hist_scores:
+                score_file = Path(__file__).parent.parent / "data" / "score" / f"{code}.txt"
+                if score_file.exists():
+                    for line in score_file.read_text(encoding='utf-8').splitlines():
+                        parts = line.strip().split(',')
+                        if len(parts) >= 2:
+                            try:
+                                hist_scores.append(float(parts[1]))
+                            except ValueError:
+                                continue
+                self._score_trend_cache[code] = hist_scores
+            
+            yesterday_score = hist_scores[-1] if len(hist_scores) >= 1 else None
+            day_before_score = hist_scores[-2] if len(hist_scores) >= 2 else None
+            
+            if current_score is not None:
+                from local.utils import calculate_trend_score_v2 as _calc_s
+                trade_dates = df.index[-3:]
+                if len(trade_dates) >= 2 and yesterday_score is None:
+                    yesterday_score = _calc_s(market, code, end_date=trade_dates[-2].strftime('%Y-%m-%d'))
+                if len(trade_dates) >= 3 and day_before_score is None:
+                    day_before_score = _calc_s(market, code, end_date=trade_dates[-3].strftime('%Y-%m-%d'))
+                
+                if day_before_score is not None and yesterday_score is not None:
+                    if day_before_score < yesterday_score < current_score:
+                        total += 5.0
+                    elif yesterday_score < current_score:
+                        total += 3.0
+                elif yesterday_score is not None and yesterday_score < current_score:
+                    total += 3.0
+            
+            return min(total, 25.0)
+            
+        except Exception:
+            return 0
+    
     def load_stock_pool(self, date_str: str) -> List[str]:
         """
-        加载指定日期的股票池
+        加载指定日期的 _my.txt 股票池
         
         Args:
             date_str: 日期字符串，格式为 YYYY-MM-DD
@@ -221,7 +335,6 @@ class HistoricalStockScorer:
         Returns:
             股票代码列表（带市场前缀）
         """
-        # 转换日期格式为 YYYYMMDD
         formatted_date = date_str.replace("-", "")
         filename = f"stockpool_{formatted_date}_my.txt"
         filepath = Path(__file__).parent.parent / "data" / filename
@@ -233,19 +346,15 @@ class HistoricalStockScorer:
         with open(filepath, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                # 跳过注释行、分隔线和空行
                 if not line or line.startswith('#') or line.startswith('-'):
                     continue
                 
-                # 处理已有评分的格式: 股票代码,评分
                 if ',' in line:
                     code = line.split(',')[0].strip()
                 else:
                     code = line
                 
-                # 如果代码没有市场前缀，自动添加
                 if not code.startswith(('sh.', 'sz.', 'bj.')):
-                    # 根据代码首位判断市场
                     if code.startswith('6'):
                         code = f'sh.{code}'
                     elif code.startswith(('0', '3')):
@@ -259,132 +368,76 @@ class HistoricalStockScorer:
         
         return stocks
     
-    def append_scores_to_file(self, date_str: str, scored_results: List[Tuple[str, float]], 
-                             backup: bool = False, min_score: float = 60.0, max_count: int = 10):
+    def append_scores_to_file(self, date_str: str, 
+                              scored_results: List[Tuple[str, float, int]], 
+                              backup: bool = False):
         """
-        将评分结果追加到股票池文件，并应用评分筛选和数量限制
+        将全部评分结果按综合分降序写入 _my.txt 文件，不做过滤
         
         Args:
             date_str: 日期字符串 (格式: YYYY-MM-DD)
-            scored_results: 评分结果列表 [(股票代码, 评分), ...]
-            backup: 是否创建备份文件（默认False）
-            min_score: 最低评分阈值（默认60）
-            max_count: 最多保留的股票数量（默认10）
+            scored_results: [(股票代码, 评分, 优选分), ...]
+            backup: 是否创建备份文件
         """
-        # 转换日期格式为 YYYYMMDD
         formatted_date = date_str.replace("-", "")
         filename = f"stockpool_{formatted_date}_my.txt"
         filepath = Path(__file__).parent.parent / "data" / filename
         
-        if not filepath.exists():
+        if not scored_results:
+            logger.warning(f"[WARN] {date_str}: 无评分结果，跳过保存")
             return
         
-        # === 第一步：按评分筛选 ===
-        min_score = 10.0
-        filtered_results = [(symbol, score) for symbol, score in scored_results if score >= min_score]
+        # 读取原始文件中的注释/表头
+        original_lines = []
+        has_original = filepath.exists()
+        if has_original:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith('#') or stripped.startswith('-') or stripped == '':
+                        original_lines.append(line.rstrip('\n'))
         
-        original_count = len(scored_results)
-        after_filter_count = len(filtered_results)
+        # 按综合评分降序排列（综合分相同则优选分高的在前）
+        sorted_results = sorted(scored_results, key=lambda x: (x[1], x[2]), reverse=True)
         
-        logger.info(f"[FILTER] {date_str}: 原始 {original_count} 只 -> 评分>= {min_score} 筛选后 {after_filter_count} 只")
-        
-        if not filtered_results:
-            logger.warning(f"[WARN] {date_str}: 无股票满足评分要求（>= {min_score}），跳过保存")
-            return
-        
-        # === 第二步：按评分降序排序，取Top N ===
-        sorted_results = sorted(filtered_results, key=lambda x: x[1], reverse=True)
-        top_results = sorted_results[:max_count]
-        
-        final_count = len(top_results)
-        logger.info(f"[TOP] {date_str}: 保留评分最高的 {final_count} 只股票")
-        
-        # 根据参数决定是否创建备份文件
-        if backup:
+        # 备份
+        if backup and has_original:
             backup_path = filepath.with_suffix('.txt.bak')
             if not backup_path.exists():
                 shutil.copy(filepath, backup_path)
                 logger.debug(f"💾 已创建备份文件: {backup_path.name}")
         
-        # 读取原始文件内容（保留注释和表头）
-        original_lines = []
-        with open(filepath, 'r', encoding='utf-8') as f:
-            for line in f:
-                stripped = line.strip()
-                # 保留注释行、分隔线和空行
-                if stripped.startswith('#') or stripped.startswith('-') or stripped == '':
-                    original_lines.append(line.rstrip('\n'))
-        
-        # 重新写入文件：原始内容 + 新评分数据
+        # 写入文件：原始注释 + 评分数据（全部保留，不做过滤）
         with open(filepath, 'w', encoding='utf-8') as f:
-            # 写入原始注释和表头
             for line in original_lines:
                 f.write(line + '\n')
             
-            # 添加评分数据标识
             f.write(f"\n# === 技术评分数据 (自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
-            f.write(f"# 筛选条件: 评分 >= {min_score}, 最多保留 {max_count} 只\n")
-            f.write(f"# 原始数量: {original_count}, 筛选后: {after_filter_count}, 最终保留: {final_count}\n")
+            f.write(f"# 格式: 股票代码,综合评分,优选分,行业,股票名称[,[可能超跌]]  | 共 {len(sorted_results)} 只\n")
+            f.write(f"# 已按综合评分降序排列\n")
+            f.write(f"# [\u53ef\u80fd\u8d85\u8dcc] = \u7efc\u5408\u5206\u226410\uff0c\u610f\u5473\u6781\u5ea6\u4f4e\u5206\uff0c\u53ef\u80fd\u5c5e\u4e8e\u8d85\u8dcc\u53cd\u5f39\u5019\u9009\n")
             
-            # 写入评分数据（不带市场前缀，保持与原文件格式一致）
-            for symbol, score in top_results:
-                # 移除市场前缀以保持与原文件格式一致
-                code_without_prefix = symbol.split('.')[1] if '.' in symbol else symbol
-                f.write(f"{code_without_prefix},{score:.1f}\n")
+            for symbol, score, pref in sorted_results:
+                code = symbol.split('.')[1] if '.' in symbol else symbol
+                name, industry = self._get_stock_info(symbol)
+                ind_str = industry if industry else ''
+                # \u53ef\u80fd\u8d85\u8dcc\u6807\u8bb0\uff1a\u7efc\u5408\u5206\u226410\uff0c\u610f\u5473\u6781\u5ea6\u4f4e\u5206\uff0c\u53ef\u80fd\u5c5e\u4e8e\u8d85\u8dcc\u53cd\u5f39\u5019\u9009
+                oversold = score <= 10
+                tag = ',[\u53ef\u80fd\u8d85\u8dcc]' if oversold else ''
+                f.write(f"{code},{score:.0f},{pref},{ind_str},{name}{tag}\n")
+        
+        scores_range = f"{sorted_results[-1][1]:.0f}~{sorted_results[0][1]:.0f}"
+        logger.info(f"[SAVE] {date_str}: 已保存 {len(sorted_results)} 只股票 (评分区间 {scores_range}) 到 {filename}")
     
-    def batch_process(self, start_date: str, end_date: str, backup: bool = False, 
-                     min_score: float = None, max_score: float = None, max_stocks: int = None):
+    def batch_process(self, start_date: str, end_date: str, backup: bool = False):
         """
-        批量处理日期范围内的所有股票池
+        批量处理日期范围内的所有 _my.txt 股票池
         
         Args:
             start_date: 开始日期 (格式: YYYY-MM-DD)
             end_date: 结束日期 (格式: YYYY-MM-DD)
-            backup: 是否创建备份文件（默认False）
-            min_score: 最低评分阈值（None则从配置文件读取）
-            max_score: 最高评分阈值（None则从配置文件读取）
-            max_stocks: 最多保留的股票数量（None则从配置文件读取）
+            backup: 是否创建备份文件
         """
-        # 从 config.yaml 读取评分配置（命令行参数优先）
-        try:
-            import yaml
-            # 使用绝对路径，基于当前文件位置定位项目根目录
-            config_path = Path(__file__).parent.parent / 'config.yaml'
-            
-            if not config_path.exists():
-                logger.warning(f"[WARN] 配置文件不存在: {config_path}，使用默认值")
-                if min_score is None:
-                    min_score = 60.0
-                if max_score is None:
-                    max_score = 100.0
-                if max_stocks is None:
-                    max_stocks = 10
-                return
-            
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            
-            backtest_config = config.get('backtest', {})
-            
-            # 优先级：命令行参数 > 配置文件 > 默认值
-            if min_score is None:
-                min_score = backtest_config.get('min_score', 60.0)
-            if max_score is None:
-                max_score = backtest_config.get('max_score', 100.0)
-            if max_stocks is None:
-                max_stocks = backtest_config.get('max_stocks_per_cycle', 10)
-            
-            logger.info(f"[CONFIG] 评分区间: [{min_score}-{max_score}], 最大选股数: {max_stocks}")
-        except Exception as e:
-            logger.warning(f"[WARN] 读取配置文件失败: {e}，使用默认值")
-            # 如果配置文件读取失败，使用硬编码默认值
-            if min_score is None:
-                min_score = 60.0
-            if max_score is None:
-                max_score = 100.0
-            if max_stocks is None:
-                max_stocks = 10
-        
         current = datetime.strptime(start_date, '%Y-%m-%d')
         end = datetime.strptime(end_date, '%Y-%m-%d')
         
@@ -409,15 +462,24 @@ class HistoricalStockScorer:
             
             for symbol in stocks:
                 stock_index += 1
-                score = self.analyze_stock(symbol, date_str)
-                if score is not None:
-                    scored_results.append((symbol, score))
+                result = self.analyze_stock(symbol, date_str)
+                if result is not None:
+                    score, pref_score = result
+                    scored_results.append((symbol, score, pref_score))
                     scored_count += 1
+                    
+                    # 写入个股评分记录
+                    code = symbol.split('.')[1] if '.' in symbol else symbol
+                    score_file = Path(__file__).parent.parent / "data" / "score" / f"{code}.txt"
+                    score_file.parent.mkdir(parents=True, exist_ok=True)
+                    already_exists = (score_file.exists() and 
+                        any(line.startswith(date_str) for line in score_file.read_text(encoding='utf-8').splitlines()))
+                    if not already_exists:
+                        with open(score_file, 'a', encoding='utf-8') as f:
+                            f.write(f"{date_str},{score},{pref_score}\n")
                 
-                # 避免请求过快
                 time.sleep(0.1)
                 
-                # 每10只股票或最后一只时更新进度
                 if stock_index % 10 == 0 or stock_index == len(stocks):
                     elapsed = time.time() - day_start_time
                     progress_pct = (stock_index / len(stocks)) * 100
@@ -427,42 +489,29 @@ class HistoricalStockScorer:
             
             total_stocks += len(stocks)
             
-            # 3. 保存结果（应用筛选和限制）
+            # 3. 保存全部结果
             if scored_results:
-                self.append_scores_to_file(date_str, scored_results, backup=backup, 
-                                          min_score=min_score, max_count=max_stocks)
+                self.append_scores_to_file(date_str, scored_results, backup=backup)
                 processed_count += 1
             
-            # 4. 打印完成信息并换行
-            formatted_date = date_str.replace("-", "")
             print(f"\n[{processed_count}/{total_days}] {date_str} ({len(stocks)}只股票) - 完成")
             
             current += timedelta(days=1)
         
-        # 打印最终汇总（移除emoji以兼容Windows GBK编码）
         print(f"\n[SUCCESS] 批量评分完成！处理了 {processed_count} 个交易日，共 {total_stocks} 只股票，成功评分 {scored_count} 只")
 
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="股票池批量评分工具（历史回测版本）")
+    parser = argparse.ArgumentParser(description="股票池批量评分工具（针对 _my.txt 自定义股票池）")
     parser.add_argument('--date', type=str, help='指定日期 (格式: YYYY-MM-DD)')
     parser.add_argument('--start-date', type=str, help='开始日期 (格式: YYYY-MM-DD)')
     parser.add_argument('--end-date', type=str, help='结束日期 (格式: YYYY-MM-DD)')
     parser.add_argument('--tdx-dir', type=str, help='通达信安装目录（可选）')
     parser.add_argument('--backup', action='store_true', help='是否创建备份文件（默认不创建）')
     
-    # 新增：评分筛选参数（优先级高于配置文件）
-    parser.add_argument('--min-score', type=float, default=None, 
-                       help='最低评分阈值（100分制，默认从配置文件读取）')
-    parser.add_argument('--max-score', type=float, default=None, 
-                       help='最高评分阈值（100分制，默认从配置文件读取）')
-    parser.add_argument('--max-stocks', type=int, default=None, 
-                       help='最多保留的股票数量（默认从配置文件读取）')
-    
     args = parser.parse_args()
     
-    # 参数验证
     if args.date:
         if args.start_date or args.end_date:
             print("错误: 不能同时指定 --date 和 --start-date/--end-date")
@@ -476,13 +525,8 @@ def main():
         print("错误: 请指定 --date 或 --start-date 和 --end-date")
         return
     
-    # 创建评分器
     scorer = HistoricalStockScorer(tdx_dir=args.tdx_dir)
-    
-    # 执行批量评分（传递命令行参数，None表示使用配置文件值）
-    scorer.batch_process(start_date, end_date, backup=args.backup,
-                        min_score=args.min_score, max_score=args.max_score, 
-                        max_stocks=args.max_stocks)
+    scorer.batch_process(start_date, end_date, backup=args.backup)
 
 
 if __name__ == "__main__":

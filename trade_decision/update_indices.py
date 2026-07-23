@@ -201,7 +201,6 @@ def _scheduled_update():
     except Exception as e:
         print(f"\n[ERROR] 生成大盘信号失败: {e}\n")
 
-
 def start_daemon():
     """
     启动守护模式：注册定时任务，每交易日 20:50 自动更新

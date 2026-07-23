@@ -483,6 +483,10 @@ class NewsMonitorScheduler:
             
             logger.info(f"\n✅ 资讯获取完成，共 {total_count} 条")
             
+            # 发送大盘环境信号通知
+            self._send_market_signal_notification()
+            time.sleep(1.5)
+
             # 发送持仓收益率通知（最优先）
             self._send_trade_return_notification()
             time.sleep(1.5)
@@ -491,21 +495,8 @@ class NewsMonitorScheduler:
             self._send_stockpool_notification()
             time.sleep(1.5)
 
-            # 再发送资讯日报通知
-            if total_count > 0:
-                news_data = {
-                    'stock_pool': all_news,
-                    'fetch_time': current_time,
-                    'total_count': total_count
-                }
-                
-                success = send_news_notification(news_data)
-                if success:
-                    logger.success(f"📱 飞书通知发送成功")
-                else:
-                    logger.error(f"❌ 飞书通知发送失败")
-            else:
-                logger.info(f"ℹ️ 今日暂无新资讯，跳过通知")
+            # 资讯日报已暂停
+            logger.info(f"ℹ️ 资讯日报推送已暂停")
             
             logger.info(f"✅ 本轮资讯监控完成\n")
             
@@ -734,6 +725,37 @@ class NewsMonitorScheduler:
                 content += f"**📕 不通过原因**:\n"
                 for r in reasons:
                     content += f"   • {r}\n"
+
+            # ── 情绪开关（从 signal_history.json 读取）──
+            emotion_safe = None
+            em = {}
+            try:
+                signal_file = Path(__file__).parent.parent.parent / "data" / "signal_history.json"
+                if signal_file.exists():
+                    with open(signal_file, 'r', encoding='utf-8') as _f:
+                        history = json.loads(_f.read())
+                    if isinstance(history, list):
+                        for entry in reversed(history):
+                            if entry.get('date') == signal_date:
+                                em = entry.get('emotion', {}) or {}
+                                emotion_safe = em.get('emotion_pass')
+                                emotion_reason = em.get('emotion_reason', '')
+                                break
+
+                    # 展示大盘评分 + 涨跌比（如有）
+                    em_score = em.get('score', '') if em else ''
+                    em_ratio = em.get('ratio', '') if em else ''
+                    parts = []
+                    if em_score:
+                        parts.append(f"评分{em_score}分")
+                    if em_ratio:
+                        parts.append(f"涨跌比: {em_ratio}")
+                    if parts:
+                        content += f"**⭐ 大盘**: {' | '.join(parts)}\n"
+                else:
+                    logger.debug("[EMOTION] signal_history.json 不存在")
+            except Exception as e:
+                logger.debug(f"[EMOTION] 情绪开关读取失败: {e}")
 
             # 发送飞书通知
             notifier = get_feishu_notifier()
@@ -1294,11 +1316,11 @@ class NewsMonitorScheduler:
                         updated = False
                         for i in range(1, len(lines)):
                             cols = lines[i].strip().split(',')
-                            if cols[0] == trade_date_fmt and (len(cols) < 13 or cols[12].strip() == ''):
+                            if cols[0] == trade_date_fmt and (len(cols) < 14 or cols[13].strip() == ''):
                                 total_return = (total_current_value - total_investment) / total_investment * 100
-                                while len(cols) < 13:
+                                while len(cols) < 14:
                                     cols.append('')
-                                cols[12] = f"{total_return:+.2f}"
+                                cols[13] = f"{total_return:+.2f}"
                                 lines[i] = ','.join(cols) + '\n'
                                 updated = True
                                 logger.info(f"[HISTORY] 回填 {trade_date_fmt} 实际收益率: {total_return:+.2f}%")
