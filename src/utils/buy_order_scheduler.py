@@ -176,7 +176,8 @@ def generate_etf_trade_file() -> bool:
         logger.info(f"[ETF] {code}({stock['name']}) 开盘{open_price:.3f} 买入{shares}股 金额{actual_investment:,.2f}元")
 
     if results:
-        buy_module.save_trade_report(results, total_investment)
+        # ETF价格保留3位小数
+        buy_module.save_trade_report(results, total_investment, price_decimals=3)
         logger.info(f"[ETF] trade 文件已生成（{len(results)}只ETF，总投入{total_investment:,.2f}元）")
         return True
     else:
@@ -239,6 +240,19 @@ def execute_buy_calculation():
                 # 生成失败已推送告警，跳过推送（避免读取残留的旧trade文件）
                 return
             logger.success("[OK] 防守ETF买入委托计算完成")
+
+            # 补充生成股票池trade文件（trade_YYYYMMDD_2.txt），保证委托全面性
+            logger.info("补充生成股票池买入委托（trade_YYYYMMDD_2.txt）...")
+            if check_stockpool_file():
+                try:
+                    buy_module.calculate_buy_orders(output_suffix="_2")
+                    logger.success("[OK] 股票池买入委托已生成（trade_2）")
+                except Exception as e:
+                    logger.error(f"[ERROR] 补充生成股票池委托失败: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            else:
+                logger.warning("[SKIP] 股票池文件不存在，跳过补充生成")
         except Exception as e:
             logger.error(f"[ERROR] 执行ETF买入计算失败: {e}")
             import traceback
@@ -553,8 +567,10 @@ def send_index_snapshot():
         if nasdaq_data:
             try: nasdaq_pct_str = f"{float(nasdaq_data['change_pct'].replace('%','')):+.2f}"
             except: pass
-        # 建议转纯文字（去掉表情符号）
+        # 建议转纯文字（去掉表情符号和括号内容，只保留主词）
         advice_text = advice.replace('✅ ','').replace('🟡 ','').replace('🟠 ','').replace('🔴 ','')
+        if '(' in advice_text:
+            advice_text = advice_text.split('(')[0]
         # 格式: date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return,nikkei_pct,nasdaq_pct
         record = f"{date_str},{vol_str},{kc_str},{ks_str},{s_lb},{s_kc},{s_ks},{s_hs},{raw_total},{penalty},{emotion_bonus},{final_total},{advice_text},,{nikkei_pct_str},{nasdaq_pct_str}\n"
         # 文件不存在时写入表头
@@ -712,9 +728,13 @@ def send_trade_notification(final_total_from_index=None):
             # 获取股票名称（已批量预取，命中缓存）
             stock_name = get_stock_name(code)
             
+            # 价格小数位：ETF（5开头）保留3位，个股保留2位
+            price_decimals = 3 if code.startswith('5') else 2
+            price_fmt = f".{price_decimals}f"
+            
             # 格式化输出
             content += f"**{i}. {stock_name} ({code})**\n"
-            content += f"   开盘价: ¥{open_price:.2f}\n"
+            content += f"   开盘价: ¥{open_price:{price_fmt}}\n"
             content += f"   股数: {shares:,} 股\n"
             content += f"   金额: ¥{amount:,.2f}\n\n"
         

@@ -292,13 +292,16 @@ def ensure_data_dir():
         os.makedirs(DATA_DIR)
         print(f"✅ 创建目录: {DATA_DIR}")
 
-def save_trade_report(results: list, total_investment: float):
+def save_trade_report(results: list, total_investment: float, price_decimals: int = 2,
+                      file_suffix: str = ""):
     """
     保存简化的交易报告到文件
     
     Args:
         results: 买入结果列表
         total_investment: 总委托金额
+        price_decimals: 买入价格保留小数位数（个股2位，ETF 3位）
+        file_suffix: 文件名后缀，如 "_2" 生成 trade_YYYYMMDD_2.txt
     
     Returns:
         bool: 保存是否成功
@@ -306,9 +309,9 @@ def save_trade_report(results: list, total_investment: float):
     try:
         ensure_data_dir()
         
-        # 生成文件名：trade_YYYYMMDD.txt
+        # 生成文件名：trade_YYYYMMDD.txt（可带后缀如 _2）
         date_str = datetime.now().strftime('%Y%m%d')
-        filename = f"trade_{date_str}.txt"
+        filename = f"trade_{date_str}{file_suffix}.txt"
         filepath = DATA_DIR / filename
         
         # 统计可买入股票数量
@@ -321,10 +324,11 @@ def save_trade_report(results: list, total_investment: float):
             # 写入委托明细表头
             f.write("股票代码,开盘价,股数,金额\n")
             
-            # 写入每只股票的委托明细
+            # 写入每只股票的委托明细（价格小数位可配：个股2位，ETF 3位）
+            price_fmt = f".{price_decimals}f"
             for r in results:
                 if r['shares'] > 0:  # 只写入可买入的股票
-                    f.write(f"{r['code']},{r['open_price']:.2f},{r['shares']},{r['investment']:.2f}\n")
+                    f.write(f"{r['code']},{r['open_price']:{price_fmt}},{r['shares']},{r['investment']:.2f}\n")
         
         print(f"\n💾 交易报告已保存至: {filepath}")
         print(f"📊 共 {len(can_buy)} 只可买入股票")
@@ -336,9 +340,12 @@ def save_trade_report(results: list, total_investment: float):
         traceback.print_exc()
         return False
 
-def calculate_buy_orders():
+def calculate_buy_orders(output_suffix: str = ""):
     """
     计算买入委托股数和金额（基于选股结果文件）
+
+    Args:
+        output_suffix: 输出文件名后缀，如 "_2" 生成 trade_YYYYMMDD_2.txt
     """
     print("=" * 80)
     print(f"📊 买入委托计算工具（基于选股结果）")
@@ -451,8 +458,8 @@ def calculate_buy_orders():
             shares_str = f"{r['shares']}" if r['shares'] > 0 else "0 (不足)"
             print(f"{r['code']:<10} {r['name']:<12} {r['score']:>+5.1f} {r['current_price']:>8.2f} {r['open_price']:>8.2f} {r['change_pct']:>+7.2f}% {shares_str:>8} {r['investment']:>11,.2f}")
         
-        # 保存简化交易报告
-        save_trade_report(results, total_investment)
+        # 保存简化交易报告（可带文件名后缀）
+        save_trade_report(results, total_investment, file_suffix=output_suffix)
     
     print("\n" + "=" * 80)
     print("✅ 计算完成！")
