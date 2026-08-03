@@ -15,6 +15,7 @@
 
 import sys
 import json
+import random
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -216,6 +217,31 @@ def get_industry(code: str, cache: dict) -> str:
     return cache.get(key, '未知')
 
 
+def load_bak_codes(date_str: str) -> list:
+    """
+    加载当日选股原池（.bak 文件）中的股票代码
+
+    Args:
+        date_str: 日期字符串 (YYYY-MM-DD 或 YYYYMMDD)
+
+    Returns:
+        6位数字代码列表；.bak 文件不存在返回空列表
+    """
+    if '-' in date_str:
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        formatted = dt.strftime('%Y%m%d')
+    else:
+        formatted = date_str
+
+    bak_path = DATA_DIR / f"stockpool_{formatted}.txt.bak"
+    if not bak_path.exists():
+        return []
+
+    codes = _parse_codes_from(bak_path)
+    print(f"  [INFO] 选股原池(.bak): {bak_path.name}, 共 {len(codes)} 只股票")
+    return codes
+
+
 def main():
     import argparse
 
@@ -246,6 +272,7 @@ def main():
 
     # 3. 按行业汇总（缓存未命中的自动调API补充）
     industry_counter = Counter()
+    selected_by_industry = {}   # industry -> [选中的股票代码]
     unknown_codes = []
     new_cache_entries = 0
 
@@ -264,6 +291,7 @@ def main():
             if idx % 20 == 0 or idx == len(codes):
                 print(f"\r  [PROGRESS] 已处理 {idx}/{len(codes)} 只股票...", end='')
         industry_counter[industry] += 1
+        selected_by_industry.setdefault(industry, []).append(code)
     
     print()  # 换行
     
@@ -277,20 +305,45 @@ def main():
     coverage = known / len(codes) * 100 if codes else 0
     print(f"  [INFO] 行业覆盖率: {known}/{len(codes)} ({coverage:.1f}%)\n")
 
+    # 相关个股候选池：优先当日选股原池(.bak)，没有则降级到当前股票池
+    bak_codes = load_bak_codes(args.date)
+    related_pool = bak_codes if bak_codes else codes
+    if not bak_codes:
+        print(f"  [WARN] 未找到当日 .bak 选股原池，相关个股降级到当前股票池")
+
+    # 构建行业 → 股票代码 反查表（仅限相关个股候选池，行业用缓存判断）
+    industry_to_codes = {}
+    for code in related_pool:
+        industry = get_industry(code, cache)
+        if industry != '未知':
+            industry_to_codes.setdefault(industry, []).append(code)
+
     # 4. 排序输出（按选中个数降序）
     sorted_industries = industry_counter.most_common(args.top if args.top > 0 else None)
 
-    print(f"  {'排名':<6} {'行业':<18} {'选中个数':>10} {'占比':>8}")
-    print("  " + "-" * 76)
+    print(f"  {'排名':<6} {'行业':<16} {'选中个数':>8}   {'相关个股':<37} {'占比':>8}")
+    print("  " + "-" * 96)
 
     max_count = max(c for _, c in sorted_industries) if sorted_industries else 1
     for rank, (industry, count) in enumerate(sorted_industries, 1):
         pct = count / len(codes) * 100
         bar_len = int(count / max_count * 40)
         bar = '█' * bar_len
-        print(f"  {rank:<6} {industry:<18} {count:>10}  {pct:>6.1f}%  {bar}")
 
-    print("  " + "=" * 76)
+        # 相关个股：优先同行业未选中的，不足5个时从同行业全部随机补足
+        industry_all = industry_to_codes.get(industry, [])
+        selected = set(selected_by_industry.get(industry, []))
+        others = [c for c in industry_all if c not in selected]
+        random.shuffle(others)
+        if len(others) < 5:
+            fill = [c for c in industry_all if c not in others]
+            random.shuffle(fill)
+            others += fill
+        related = ' '.join(others[:5]) if others else '-'
+
+        print(f"  {rank:<6} {industry:<16} {count:>8}   {related:<37} {pct:>6.1f}%  {bar}")
+
+    print("  " + "=" * 96)
     print(f"  合计: {len(codes)} 只股票, {len(sorted_industries)} 个行业")
 
     # 提示未知行业

@@ -313,12 +313,18 @@ def load_market_emotion(check_date: str) -> Optional[dict]:
                         emotion_safe = False
                         emotion_reason = f"昨涨停今均{zt_pct:+.2f}%，接力亏钱"
 
+                    # 沪深港通数据（可能为空，历史数据无此列）
+                    north_total = row.get('north_total', '').strip()
+                    south_net = row.get('south_net', '').strip()
+
                     return {
                         'date': check_date,
                         'ratio': ratio,
                         'score': score,
                         'emotion_pass': emotion_safe,
                         'emotion_reason': emotion_reason,
+                        'north_total': float(north_total) if north_total else None,
+                        'south_net': float(south_net) if south_net else None,
                     }
 
         return None

@@ -428,6 +428,24 @@ class HistoricalStockScorer:
         
         scores_range = f"{sorted_results[-1][1]:.0f}~{sorted_results[0][1]:.0f}"
         logger.info(f"[SAVE] {date_str}: 已保存 {len(sorted_results)} 只股票 (评分区间 {scores_range}) 到 {filename}")
+        
+        # ── 额外保存：触发[可能超跌]的个股单独存为 _low.txt（暂不启用）──
+        if False:
+            low_stocks = [(s, sc, pf) for s, sc, pf in sorted_results if sc <= 10]
+            if low_stocks:
+                low_filepath = filepath.with_name(f"stockpool_{formatted_date}_low.txt")
+                with open(low_filepath, 'w', encoding='utf-8') as f:
+                    f.write(f"# === [可能超跌] 个股 (自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
+                    f.write(f"# 数据源: {filename} | 综合评分≤10\n")
+                    f.write(f"# 格式: 股票代码,综合评分,优选分  | 共 {len(low_stocks)} 只\n")
+                    f.write(f"# 已按综合评分升序排列（最低的排最前）\n")
+                    low_sorted = sorted(low_stocks, key=lambda x: x[1])
+                    for symbol, score, pref in low_sorted:
+                        code = symbol.split('.')[1] if '.' in symbol else symbol
+                        f.write(f"{code},{score:.0f},{pref}\n")
+                logger.info(f"[LOW] 已保存 {len(low_stocks)} 只 [可能超跌] 个股到 stockpool_{formatted_date}_low.txt")
+            else:
+                logger.warning(f"[LOW] {date_str}: 无触发 [可能超跌] 的个股（综合评分≤10）")
     
     def batch_process(self, start_date: str, end_date: str, backup: bool = False):
         """

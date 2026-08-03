@@ -27,6 +27,35 @@ DATA_DIR = Path(__file__).parent / "data"  # 报告输出目录（项目根目�
 # 从配置文件读取最低综合评分阈值，优先从buy_order_scheduler.min_score读取，如果不存在则使用默认值0.5
 MIN_SCORE = config.get('buy_order_scheduler', {}).get('min_score', 0.5)
 
+
+def _get_previous_trading_day() -> str:
+    """
+    获取最近一个交易日（YYYYMMDD），使用akshare交易日历
+
+    与 buy_order_scheduler 中的逻辑保持一致，正确跳过法定节假日。
+    失败时降级为手动周末回溯。
+    """
+    try:
+        import akshare as ak
+        df = ak.tool_trade_date_hist_sina()
+        if df is not None and not df.empty:
+            today = datetime.now().strftime('%Y-%m-%d')
+            dates = [str(d)[:10] for d in df['trade_date'].tolist()]
+            prev = [d for d in dates if d < today]
+            if prev:
+                return max(prev).replace('-', '')
+    except Exception:
+        pass
+
+    # 降级：手动周末回溯
+    yesterday = datetime.now() - timedelta(days=1)
+    if yesterday.weekday() == 6:  # 周日
+        yesterday -= timedelta(days=2)
+    elif yesterday.weekday() == 5:  # 周六
+        yesterday -= timedelta(days=1)
+    return yesterday.strftime('%Y%m%d')
+
+
 def load_stock_pool_from_file():
     """
     从选股结果文件中读取股票列表和评分
@@ -36,16 +65,8 @@ def load_stock_pool_from_file():
               [{'code': '000526', 'name': '学大教育', 'score': 3.5}, ...]
     """
     try:
-        # 计算前一天的日期
-        yesterday = datetime.now() - timedelta(days=1)
-        
-        # 如果是周一，前一日是周日，需要追溯到周五
-        if yesterday.weekday() == 6:  # 周日
-            yesterday = yesterday - timedelta(days=2)
-        elif yesterday.weekday() == 5:  # 周六
-            yesterday = yesterday - timedelta(days=1)
-        
-        date_str = yesterday.strftime('%Y%m%d')
+        # 获取最近交易日（用akshare，跳过法定节假日；失败降级周末回溯）
+        date_str = _get_previous_trading_day()
         filename = f"stockpool_{date_str}.txt"
         filepath = DATA_DIR / filename
         
