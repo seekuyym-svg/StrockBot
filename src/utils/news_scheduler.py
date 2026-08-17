@@ -1244,7 +1244,16 @@ class NewsMonitorScheduler:
             content += f"**买入日期**: {buy_date[:4]}-{buy_date[4:6]}-{buy_date[6:]}\n"
             content += f"**卖出日期**: {sell_date[:4]}-{sell_date[4:6]}-{sell_date[6:]}\n"
             content += f"**持有天数**: 2 个交易日\n"
-            content += f"**持仓数量**: {len(positions)} 只\n\n"
+
+            # 持仓明细：按收益率从高到低排序，格式 代码(收益率)
+            # 颜色：正收益（含0）红色，负收益绿色（A股红涨绿跌）
+            def _color_ret(ret):
+                color = 'red' if ret >= 0 else 'green'
+                return f"<font color='{color}'>{ret:+.2f}%</font>"
+
+            sorted_results = sorted(total_results, key=lambda r: r['return_pct'], reverse=True)
+            hold_detail = '/'.join([f"{r['code']}({_color_ret(r['return_pct'])})" for r in sorted_results])
+            content += f"**持仓数量**: {len(positions)} 只，{hold_detail}\n\n"
 
             # 收益率数字标颜色：负收益绿色、正收益红色、持平黑色
             if total_return_pct < 0:

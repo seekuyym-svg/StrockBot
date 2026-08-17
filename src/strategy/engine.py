@@ -233,15 +233,21 @@ class MartingaleEngine:
                 )
     
     def _check_buy_conditions(self, position: Position, market_data: MarketData) -> bool:
-        """检查是否满足买入条件（T+0优化）"""
+        """检查是否满足买入条件（T+0优化，简单过滤避免无条件建仓）"""
         # T+0可以更加灵活，主要关注价格位置和RSI
         
-        # 检查RSI是否处于低位（超卖反弹机会）
+        # 0. 硬性前置条件：买入价格必须在 MA20 之上（含MA20）
+        #    MA20获取失败(None)时放行（避免接口异常导致永久无法建仓），日志记录
+        if market_data.ma_20 is not None and market_data.current_price < market_data.ma_20:
+            logger.info(f"⚠️ [{market_data.symbol}] 价格¥{market_data.current_price:.3f} < MA20 ¥{market_data.ma_20:.3f}，不建仓")
+            return False
+        
+        # 1. 检查RSI是否处于低位（超卖反弹机会）
         if market_data.rsi:
             if market_data.rsi < 40:  # T+0可以放宽到40
                 return True
         
-        # 检查价格是否在支撑位
+        # 2. 检查价格是否在当日区间低位（支撑位）
         if market_data.low_price and market_data.current_price:
             price_range = market_data.high_price - market_data.low_price
             if price_range > 0:
@@ -249,12 +255,14 @@ class MartingaleEngine:
                 if position_ratio < 0.4:  # T+0可以放宽到40%
                     return True
         
-        # 如果涨跌幅较大，可能是好的入场点
-        if abs(market_data.change_pct) > 2:
-            return True
+        # 3. 当日涨跌幅在合理区间才建仓（避免追高/接飞刀）：
+        #    涨幅>+1%不追高，跌幅<-5%不接飞刀
+        if market_data.change_pct is not None:
+            if -5.0 <= market_data.change_pct <= 1.0:
+                return True
         
-        # 默认允许建仓（T+0更灵活）
-        return True
+        # 默认不建仓（等待择时条件，不再无条件买入）
+        return False
     
     def _check_add_or_sell(self, position: Position, market_data: MarketData, strategy_config: StrategyConfig = None) -> Signal:
         """检查加仓或止盈（T+0优化）"""

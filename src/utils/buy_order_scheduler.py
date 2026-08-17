@@ -88,7 +88,23 @@ def check_stockpool_file() -> bool:
 
 
 # 大盘评分<6时使用的防守ETF列表（沪市）
-DEFENSIVE_ETFS = ['513850', '513050', '513120', '516310', '515170']
+# 从 config.yaml 的 buy_order_scheduler.defensive_etfs 读取，可配置
+_DEFAULT_DEFENSIVE_ETFS = ['513850', '513050', '513120', '516310', '515170']
+
+
+def _load_defensive_etfs() -> list:
+    """从config读取防守ETF列表，失败时用默认值"""
+    try:
+        from src.utils.config import get_config
+        etfs = get_config().buy_order_scheduler.defensive_etfs
+        if etfs:
+            return list(etfs)
+    except Exception as e:
+        logger.warning(f"[ETF] 读取防守ETF配置失败({e})，使用默认列表")
+    return _DEFAULT_DEFENSIVE_ETFS
+
+
+DEFENSIVE_ETFS = _load_defensive_etfs()
 
 # 大盘综合评分买入阈值（10分制）：≥此分从股票池选股，<此分用防守ETF
 SCORE_BUY_THRESHOLD = 6
@@ -160,7 +176,7 @@ def generate_etf_trade_file() -> bool:
             logger.warning(f"[ETF] {code} 无法获取实时数据，跳过")
             continue
         open_price = realtime['open_price']
-        shares = buy_module.calculate_buy_shares(open_price, investment_per_stock)
+        shares = buy_module.calculate_buy_shares(open_price, investment_per_stock, code)
         actual_investment = shares * open_price
         results.append({
             'code': code,
@@ -187,6 +203,175 @@ def generate_etf_trade_file() -> bool:
             "**大盘评分 < 6，本应使用防守ETF生成买入委托，但5只ETF行情全部获取失败。**\n"
             f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**ETF列表**: {', '.join(DEFENSIVE_ETFS)}"
+        )
+        return False
+
+
+def _is_open_limit_up(code: str, open_price: float, prev_close: float) -> bool:
+    """
+    判断股票开盘价是否已涨停（一字板，开盘即买不进）
+
+    涨停幅度：创业板(300/301)/科创板(688) 为20%，其余主板为10%。
+    以开盘涨幅达到涨停幅度（留0.3%容差，容忍价格四舍五入误差）为准。
+
+    Args:
+        code: 股票代码
+        open_price: 今开价
+        prev_close: 昨收价
+
+    Returns:
+        bool: True=开盘即涨停
+    """
+    if prev_close <= 0 or open_price <= 0:
+        return False
+    open_pct = (open_price - prev_close) / prev_close * 100
+    limit = 20.0 if code.startswith(('300', '301', '688')) else 10.0
+    return open_pct >= limit - 0.3
+
+
+def _get_ma20(code: str, market: str) -> float:
+    """
+    从腾讯K线获取最近20个交易日收盘价均值（MA20）
+
+    Args:
+        code: 股票代码
+        market: 市场标识（sh/sz）
+
+    Returns:
+        float: MA20，获取失败返回 None
+    """
+    try:
+        resp = requests.get(
+            'http://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
+            params={'param': f'{market}{code},day,,,20,qfq'},
+            headers={'User-Agent': 'Mozilla/5.0'}, timeout=10
+        )
+        data = resp.json()
+        stock_data = data.get('data', {}).get(f'{market}{code}', {})
+        klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
+        if not klines:
+            return None
+        closes = [float(k[2]) for k in klines if isinstance(k, (list, tuple)) and len(k) >= 3]
+        if not closes:
+            return None
+        return sum(closes) / len(closes)
+    except Exception:
+        return None
+
+
+def generate_offensive_trade_file() -> bool:
+    """
+    评分≥阈值且开启进攻模式时，按 offensive_stks 生成买入委托 trade 文件
+
+    选股规则：
+      - 先从 offensive_stks 获取全部行情，过滤掉"开盘即涨停"（一字板买不进）的股票
+      - 从剩余股票随机抽取 offensive_random_count（8）只
+      - 加上必选ETF 588080（硬编码），共9个标的
+    市场按代码自动判断（6/9/5→sh，其余→sz），
+    价格小数位自动判断（5开头ETF→3位，其他→2位）。
+
+    Returns:
+        bool: True=生成成功，False=全部失败（已推送告警）
+    """
+    import random
+    import tool_calc_buynum_simple as buy_module
+
+    from src.utils.config import get_config
+    cfg = get_config().buy_order_scheduler
+    all_stocks = list(cfg.offensive_stks)
+    random_count = cfg.offensive_random_count
+    always_etf = '588080'  # 必选ETF（硬编码）
+
+    def _market_of(code: str) -> str:
+        return 'sh' if code.startswith(('6', '9', '5')) else 'sz'
+
+    # 1. 获取全部股票行情 + MA20，过滤开盘即涨停（一字板买不进）
+    buyable = []  # (code, realtime, ma20)
+    limit_up_skipped = []
+    for code in all_stocks:
+        realtime = buy_module.get_stock_realtime_data(code, _market_of(code))
+        if realtime is None:
+            logger.warning(f"[OFFENSIVE] {code} 无法获取实时数据，跳过")
+            continue
+        if _is_open_limit_up(code, realtime['open_price'], realtime['prev_close']):
+            limit_up_skipped.append(f"{code}({realtime['name']})")
+            logger.info(f"[OFFENSIVE] {code} 开盘即涨停，过滤: 开{realtime['open_price']:.2f}/昨收{realtime['prev_close']:.2f}")
+            continue
+        ma20 = _get_ma20(code, _market_of(code))
+        buyable.append((code, realtime, ma20))
+
+    if limit_up_skipped:
+        logger.info(f"[OFFENSIVE] 过滤涨停 {len(limit_up_skipped)} 只: {limit_up_skipped}")
+
+    # 2. 分优先/次选池：开盘价 > MA20 优先，否则次选
+    #    MA20获取失败(None)视为无法确认，放次选池
+    above_ma20 = [x for x in buyable if x[2] is not None and x[1]['open_price'] > x[2]]
+    below_ma20 = [x for x in buyable if x not in above_ma20]
+    logger.info(f"[OFFENSIVE] 开盘>MA20: {len(above_ma20)}只 / 开盘<=MA20或未知: {len(below_ma20)}只")
+    for code, rt, ma in above_ma20:
+        logger.info(f"   ✅ {code}({rt['name']}) 开{rt['open_price']:.3f} > MA20 {ma:.3f}")
+    for code, rt, ma in below_ma20:
+        ma_str = f"{ma:.3f}" if ma is not None else "N/A"
+        logger.info(f"   ⬇️ {code}({rt['name']}) 开{rt['open_price']:.3f} <= MA20 {ma_str}")
+
+    # 3. 优先从"开盘>MA20"池随机选，不足从次选池补足
+    picked = random.sample(above_ma20, min(random_count, len(above_ma20)))
+    if len(picked) < random_count:
+        need = random_count - len(picked)
+        picked_codes_now = {c for c, _, _ in picked}
+        remaining = [x for x in buyable if x[0] not in picked_codes_now]
+        picked += random.sample(remaining, min(need, len(remaining)))
+
+    picked_codes = [c for c, _, _ in picked]
+    stocks = picked_codes + [always_etf]  # 随机股票 + 必选ETF
+
+    logger.info(f"[OFFENSIVE] 可买{len(buyable)}只，最终选{picked_codes} + 必选[{always_etf}] = {len(stocks)}个标的")
+
+    watchlist = []
+    for code in stocks:
+        # 名称用本模块 get_stock_name（带缓存，支持5开头ETF）
+        name = get_stock_name(code)
+        watchlist.append({'code': code, 'market': _market_of(code), 'name': name, 'score': 0.0})
+
+    results = []
+    total_investment = 0
+    investment_per_stock = buy_module.INITIAL_CAPITAL / len(watchlist)
+    logger.info(f"[OFFENSIVE] 每只分配资金: {investment_per_stock:,.2f} 元")
+
+    for stock in watchlist:
+        code = stock['code']
+        realtime = buy_module.get_stock_realtime_data(code, stock['market'])
+        if realtime is None:
+            logger.warning(f"[OFFENSIVE] {code} 无法获取实时数据，跳过")
+            continue
+        open_price = realtime['open_price']
+        shares = buy_module.calculate_buy_shares(open_price, investment_per_stock, code)
+        actual_investment = shares * open_price
+        results.append({
+            'code': code,
+            'name': stock['name'],
+            'score': 0.0,
+            'current_price': realtime['current_price'],
+            'open_price': open_price,
+            'change_pct': realtime['change_pct'],
+            'shares': shares,
+            'investment': actual_investment,
+        })
+        total_investment += actual_investment
+        logger.info(f"[OFFENSIVE] {code}({stock['name']}) 开盘{open_price:.3f} 买入{shares}股 金额{actual_investment:,.2f}元")
+
+    if results:
+        # 混合列表：价格小数位自动判断（ETF 3位/股票 2位）
+        buy_module.save_trade_report(results, total_investment, auto_price=True)
+        logger.info(f"[OFFENSIVE] trade 文件已生成（{len(results)}只，总投入{total_investment:,.2f}元）")
+        return True
+    else:
+        logger.warning("[OFFENSIVE] 所有代码行情获取失败，未生成 trade 文件")
+        _send_alert_notification(
+            "⚠️ 买入委托计算失败",
+            "**评分≥阈值且开启进攻模式，但所有进攻标的行情获取失败。**\n"
+            f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**代码列表**: {', '.join(stocks)}"
         )
         return False
 
@@ -240,19 +425,6 @@ def execute_buy_calculation():
                 # 生成失败已推送告警，跳过推送（避免读取残留的旧trade文件）
                 return
             logger.success("[OK] 防守ETF买入委托计算完成")
-
-            # 补充生成股票池trade文件（trade_YYYYMMDD_2.txt），保证委托全面性
-            logger.info("补充生成股票池买入委托（trade_YYYYMMDD_2.txt）...")
-            if check_stockpool_file():
-                try:
-                    buy_module.calculate_buy_orders(output_suffix="_2")
-                    logger.success("[OK] 股票池买入委托已生成（trade_2）")
-                except Exception as e:
-                    logger.error(f"[ERROR] 补充生成股票池委托失败: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-            else:
-                logger.warning("[SKIP] 股票池文件不存在，跳过补充生成")
         except Exception as e:
             logger.error(f"[ERROR] 执行ETF买入计算失败: {e}")
             import traceback
@@ -261,21 +433,45 @@ def execute_buy_calculation():
                                      f"**大盘评分{final_total}<{SCORE_BUY_THRESHOLD}，改用防守ETF时执行异常**: {e}")
             return
     else:
-        logger.info("\n[STEP 2] 检查选股结果文件...")
-        if not check_stockpool_file():
-            logger.warning("[SKIP] 未找到前一日的选股结果文件，跳过本次执行")
-            logger.info("[TIP] 提示：请确保已运行 select_stocks_volume.py 生成选股结果")
-            return
-        
-        logger.info("执行买入委托计算（股票池）...")
+        # 评分≥阈值：按开关选择选股方式
+        # use_offensive_stocks=1 → 按offensive_stks生成；0 → 读股票池文件
+        use_offensive = 0
         try:
-            buy_module.calculate_buy_orders()
-            logger.success("[OK] 买入委托计算完成")
-        except Exception as e:
-            logger.error(f"[ERROR] 执行买入计算失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return
+            from src.utils.config import get_config
+            use_offensive = get_config().buy_order_scheduler.use_offensive_stocks
+        except Exception:
+            pass
+
+        if use_offensive == 1:
+            logger.info("\n[STEP 2] 开启进攻模式，按 offensive_stks 生成买入委托...")
+            try:
+                if not generate_offensive_trade_file():
+                    # 生成失败已推送告警，跳过推送
+                    return
+                logger.success("[OK] 进攻模式买入委托计算完成")
+            except Exception as e:
+                logger.error(f"[ERROR] 执行进攻模式买入计算失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                _send_alert_notification("⚠️ 买入委托计算失败",
+                                         f"**评分≥{SCORE_BUY_THRESHOLD}，进攻模式执行异常**: {e}")
+                return
+        else:
+            logger.info("\n[STEP 2] 检查选股结果文件...")
+            if not check_stockpool_file():
+                logger.warning("[SKIP] 未找到前一日的选股结果文件，跳过本次执行")
+                logger.info("[TIP] 提示：请确保已运行 select_stocks_volume.py 生成选股结果")
+                return
+            
+            logger.info("执行买入委托计算（股票池）...")
+            try:
+                buy_module.calculate_buy_orders()
+                logger.success("[OK] 买入委托计算完成")
+            except Exception as e:
+                logger.error(f"[ERROR] 执行买入计算失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                return
     
     # 3. 读取交易报告文件并发送飞书通知
     logger.info("\n[STEP 3] 发送买入委托通知...")
@@ -285,13 +481,14 @@ def execute_buy_calculation():
         logger.error(f"[STEP 3] 买入委托通知发送异常: {e}")
 
 
-def _fetch_global_index(secid: str, sina_symbol: str, name: str, flag: str) -> dict:
+def _fetch_global_index(secid: str, sina_symbol: str, sina_rt_code: str, name: str, flag: str) -> dict:
     """
-    获取全球指数数据：东方财富实时 → push2his日K线 → 新浪日K线（保底）
+    获取全球指数数据：新浪实时 → 东方财富实时 → push2his日K线 → 新浪日K线（保底）
 
     Args:
         secid: 东方财富secid，如 '100.N225'（日经225）
-        sina_symbol: akshare新浪指数名称，如 '日经225指数'
+        sina_symbol: akshare新浪指数名称（日K线保底），如 '日经225指数'
+        sina_rt_code: 新浪实时行情代码，如 'znb_NKY'（日经225）、'znb_KOSPI'
         name: 显示名称，如 '日经225'
         flag: 国旗emoji
 
@@ -300,6 +497,8 @@ def _fetch_global_index(secid: str, sina_symbol: str, name: str, flag: str) -> d
     """
     headers_em = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                   'Referer': 'https://quote.eastmoney.com/'}
+    headers_sina = {'User-Agent': 'Mozilla/5.0',
+                    'Referer': 'https://finance.sina.com.cn/'}
 
     def _build(price, prev_close):
         if price and prev_close and prev_close > 0:
@@ -310,22 +509,42 @@ def _fetch_global_index(secid: str, sina_symbol: str, name: str, flag: str) -> d
 
     result = None
 
-    # ① 东方财富实时 push2
+    # ① 新浪实时行情（最稳定，盘中实时价）
+    # 格式: var hq_str_znb_NKY="日经225,63228.54,-526.14,-0.83,时间,时间戳,日期,时刻,今开,昨收,最高,最低,成交量";
     try:
-        resp = requests.get(
-            'http://push2.eastmoney.com/api/qt/stock/get',
-            params={'secid': secid, 'fields': 'f43,f60'},
-            headers=headers_em, timeout=8
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get('data') and data['data'].get('f43'):
-                d = data['data']
-                result = _build(d['f43'] / 100.0, d['f60'] / 100.0)
-    except Exception:
-        pass
+        resp = requests.get(f'https://hq.sinajs.cn/list={sina_rt_code}',
+                            headers=headers_sina, timeout=8)
+        resp.encoding = 'gbk'
+        if '="' in resp.text:
+            content = resp.text.split('="')[1].strip('";')
+            parts = content.split(',')
+            # parts[1]=最新价, parts[3]=涨跌幅%
+            if len(parts) >= 4 and parts[1]:
+                price = float(parts[1])
+                change_pct = float(parts[3])
+                result = {'name': name, 'price': f"{price:.2f}",
+                          'change_pct': f"{change_pct:+.2f}%", 'flag': flag}
+                logger.info(f"[INDEX] {name}(新浪实时) {price:.2f} ({change_pct:+.2f}%)")
+    except Exception as e:
+        logger.debug(f"[INDEX] {name}新浪实时获取失败: {e}")
 
-    # ② push2his 日K线（加日期检查，确保最近3天内）
+    # ② 东方财富实时 push2
+    if result is None:
+        try:
+            resp = requests.get(
+                'http://push2.eastmoney.com/api/qt/stock/get',
+                params={'secid': secid, 'fields': 'f43,f60'},
+                headers=headers_em, timeout=8
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('data') and data['data'].get('f43'):
+                    d = data['data']
+                    result = _build(d['f43'] / 100.0, d['f60'] / 100.0)
+        except Exception:
+            pass
+
+    # ③ push2his 日K线（加日期检查，确保最近3天内）
     if result is None:
         for _attempt in range(2):
             try:
@@ -349,7 +568,7 @@ def _fetch_global_index(secid: str, sina_symbol: str, name: str, flag: str) -> d
                 if _attempt == 0:
                     time.sleep(1)
 
-    # ③ 新浪日K线（最后保底）
+    # ④ 新浪日K线（最后保底）
     if result is None:
         try:
             import akshare as ak
@@ -407,9 +626,10 @@ def send_index_snapshot():
     except Exception as e:
         logger.warning(f"[INDEX] 纳斯达克获取失败: {e}")
 
-    # ── 2/3. 日经225、KOSPI（三层获取逻辑已抽公共函数 _fetch_global_index）──
-    nikkei_data = _fetch_global_index('100.N225', '日经225指数', '日经225', '🇯🇵')
-    kospi_data = _fetch_global_index('100.KS11', '首尔综合指数', 'KOSPI', '🇰🇷')
+    # ── 2/3. 日经225、KOSPI（四层获取逻辑已抽公共函数 _fetch_global_index）──
+    # 新浪实时代码: znb_NKY(日经225)、znb_KOSPI
+    nikkei_data = _fetch_global_index('100.N225', '日经225指数', 'znb_NKY', '日经225', '🇯🇵')
+    kospi_data = _fetch_global_index('100.KS11', '首尔综合指数', 'znb_KOSPI', 'KOSPI', '🇰🇷')
 
     # ── 4. 计算综合评分（量比+科创50+KOSPI）──
     buy_score = None
@@ -491,12 +711,13 @@ def send_index_snapshot():
     raw_total = s_lb + s_kc + s_ks + s_hs  # 满分10分
 
     # 排除规则：前日科创50过热阶梯扣分（涨越多扣越多）
+    # 阈值：>4%扣1分，>5%扣2分，>6%扣3分
     if kc_change is not None:
-        if kc_change > 5.0:
+        if kc_change > 6.0:
             penalty = 3
-        elif kc_change > 4.0:
+        elif kc_change > 5.0:
             penalty = 2
-        elif kc_change > 3.0:
+        elif kc_change > 4.0:
             penalty = 1
         else:
             penalty = 0
@@ -685,60 +906,58 @@ def send_trade_notification(final_total_from_index=None):
             logger.info("[INFO] 今日没有可买入的股票")
             return
         
-        # 统一展示委托明细（评分<阈值时为防守ETF委托，≥阈值为股票池委托）
+        # 评分<阈值（防守ETF）：仅提示一句话，不展示明细
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # 标题区分：评分<阈值时是防守ETF
         if final_total_from_index is not None and final_total_from_index < SCORE_BUY_THRESHOLD:
-            content = f"**今日买入委托（防守ETF）**\n"
+            content = f"**今日买入防守型ETF，如银行/红利/食饮/医药等ETF，尽量选择低位。**\n"
             content += f"**时间**: {current_time}\n"
-            content += f"**数量**: {stock_count} 只ETF\n\n"
-            content += f"**━━━━━━━━━━━━━━━**\n\n"
-            logger.info(f"[TRADE] 评分{final_total_from_index}<{SCORE_BUY_THRESHOLD}，展示防守ETF委托明细")
+            logger.info(f"[TRADE] 评分{final_total_from_index}<{SCORE_BUY_THRESHOLD}，仅提示防守ETF买入")
         else:
+            # 股票池委托：展示明细
             content = f"**今日买入委托明细**\n"
             content += f"**时间**: {current_time}\n"
             content += f"**数量**: {stock_count} 只股票\n\n"
             content += f"**━━━━━━━━━━━━━━━**\n\n"
         
-        # 解析委托明细（逐行容错：单行格式异常只跳过该行，不影响整条消息）
-        detail_codes = []
-        detail_lines = []
-        for line in lines[2:]:  # 从第3行开始（跳过表头）
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(',')
-            if len(parts) == 4:
-                detail_lines.append(parts)
-                detail_codes.append(parts[0].strip())
-        # 批量获取名称（一次请求，减少腾讯API调用）
-        _batch_fetch_stock_names(detail_codes)
+            # 解析委托明细（逐行容错：单行格式异常只跳过该行，不影响整条消息）
+            detail_codes = []
+            detail_lines = []
+            for line in lines[2:]:  # 从第3行开始（跳过表头）
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(',')
+                if len(parts) == 4:
+                    detail_lines.append(parts)
+                    detail_codes.append(parts[0].strip())
+            # 批量获取名称（一次请求，减少腾讯API调用）
+            _batch_fetch_stock_names(detail_codes)
 
-        for i, parts in enumerate(detail_lines, 1):
-            code = parts[0].strip()
-            try:
-                open_price = float(parts[1].strip())
-                shares = int(parts[2].strip())
-                amount = float(parts[3].strip())
-            except (ValueError, TypeError):
-                logger.warning(f"[TRADE] 跳过格式异常行: {','.join(parts)}")
-                continue
+            for i, parts in enumerate(detail_lines, 1):
+                code = parts[0].strip()
+                try:
+                    open_price = float(parts[1].strip())
+                    shares = int(parts[2].strip())
+                    amount = float(parts[3].strip())
+                except (ValueError, TypeError):
+                    logger.warning(f"[TRADE] 跳过格式异常行: {','.join(parts)}")
+                    continue
+                
+                # 获取股票名称（已批量预取，命中缓存）
+                stock_name = get_stock_name(code)
+                
+                # 价格小数位：ETF（5开头）保留3位，个股保留2位
+                price_decimals = 3 if code.startswith('5') else 2
+                price_fmt = f".{price_decimals}f"
+                
+                # 格式化输出
+                content += f"**{i}. {stock_name} ({code})**\n"
+                content += f"   开盘价: ¥{open_price:{price_fmt}}\n"
+                content += f"   股数: {shares:,} 股\n"
+                content += f"   金额: ¥{amount:,.2f}\n\n"
             
-            # 获取股票名称（已批量预取，命中缓存）
-            stock_name = get_stock_name(code)
-            
-            # 价格小数位：ETF（5开头）保留3位，个股保留2位
-            price_decimals = 3 if code.startswith('5') else 2
-            price_fmt = f".{price_decimals}f"
-            
-            # 格式化输出
-            content += f"**{i}. {stock_name} ({code})**\n"
-            content += f"   开盘价: ¥{open_price:{price_fmt}}\n"
-            content += f"   股数: {shares:,} 股\n"
-            content += f"   金额: ¥{amount:,.2f}\n\n"
-        
-        content += f"**━━━━━━━━━━━━━━━**\n"
+            content += f"**━━━━━━━━━━━━━━━**\n"
         
         # 获取飞书通知器
         notifier = get_feishu_notifier()

@@ -53,6 +53,10 @@ class Signal(BaseModel):
     # RSI指标
     rsi: Optional[float] = None  # RSI值
 
+    # 价格监控提醒类型（SELL_ALERT=卖出提醒/BUY_ALERT=买入提醒），
+    # 用于替代通过reason字符串判断，非价格监控信号为None
+    alert_type: Optional[str] = None
+
 
 class Position(BaseModel):
     """持仓信息"""
@@ -85,6 +89,7 @@ class MarketData(BaseModel):
     ema_20: Optional[float] = None
     ema_60: Optional[float] = None
     ma_5: Optional[float] = None
+    ma_20: Optional[float] = None
     volume_ma5: Optional[float] = None
     rsi: Optional[float] = None
     capital_flow: Optional[float] = None

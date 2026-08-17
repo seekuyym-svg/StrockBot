@@ -166,6 +166,7 @@ class EastMoneyWebScraper:
                     ema_20=indicators.get('ema_20'),
                     ema_60=indicators.get('ema_60'),
                     ma_5=indicators.get('ma_5'),
+                    ma_20=indicators.get('ma_20'),
                     volume_ma5=indicators.get('volume_ma5'),
                     rsi=indicators.get('rsi'),
                     capital_flow=0.0,
@@ -317,6 +318,7 @@ class EastMoneyWebScraper:
                 ema_20=indicators.get('ema_20'),
                 ema_60=indicators.get('ema_60'),
                 ma_5=indicators.get('ma_5'),
+                ma_20=indicators.get('ma_20'),
                 volume_ma5=indicators.get('volume_ma5'),
                 rsi=indicators.get('rsi'),
                 capital_flow=0.0
@@ -386,6 +388,7 @@ class EastMoneyWebScraper:
                 ema_20=indicators.get('ema_20'),
                 ema_60=indicators.get('ema_60'),
                 ma_5=indicators.get('ma_5'),
+                ma_20=indicators.get('ma_20'),
                 volume_ma5=indicators.get('volume_ma5'),
                 rsi=indicators.get('rsi'),
                 capital_flow=0.0,
@@ -449,6 +452,7 @@ class EastMoneyWebScraper:
             'ema_20': None,
             'ema_60': None,
             'ma_5': None,
+            'ma_20': None,
             'volume_ma5': None,
             'rsi': None,
             'boll_up': None,
@@ -476,6 +480,10 @@ class EastMoneyWebScraper:
             # 计算MA5
             if len(close_prices) >= 5:
                 indicators['ma_5'] = close_prices.rolling(window=5).mean().iloc[-1]
+            
+            # 计算MA20
+            if len(close_prices) >= 20:
+                indicators['ma_20'] = close_prices.rolling(window=20).mean().iloc[-1]
             
             # 计算成交量MA5
             if '成交量' in klines.columns and len(klines) >= 5:
@@ -547,6 +555,7 @@ class EastMoneyWebScraper:
                     ema_20=indicators.get('ema_20'),
                     ema_60=indicators.get('ema_60'),
                     ma_5=indicators.get('ma_5'),
+                    ma_20=indicators.get('ma_20'),
                     volume_ma5=indicators.get('volume_ma5'),
                     rsi=indicators.get('rsi'),
                     capital_flow=0.0,

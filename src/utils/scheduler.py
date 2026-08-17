@@ -56,7 +56,23 @@ class SignalScheduler:
         self.sessions = self._parse_sessions(trading_hours.sessions)
         
         # 价格监控状态 {symbol: monitor_state}
-        self.price_monitors = {}
+        # 持久化到文件，避免重启后丢失（买入/卖出价、监控极值跨重启保留）
+        self.price_monitor_file = project_root / "data" / "price_monitors.json"
+        self.price_monitors = self._load_price_monitors()
+
+        # 首次运行（无持久化文件）：预初始化所有标的的监控状态并生成json，
+        # 保证启动即有监控基线；建仓操作提醒由策略引擎BUY信号负责（启动时立即检查一次）
+        if not self.price_monitor_file.exists() and not self.price_monitors:
+            today_init = datetime.now().strftime("%Y-%m-%d")
+            for sym in self.symbols:
+                self.price_monitors[sym] = {
+                    'day': today_init,
+                    'sell': {'active': False, 'trigger_price': 0.0, 'highest_price': 0.0, 'last_notify_date': None},
+                    'buy': {'active': False, 'trigger_price': 0.0, 'lowest_price': 0.0, 'last_notify_date': None,
+                            'sell_price': 0.0}
+                }
+            self._save_price_monitors()
+            logger.info(f"📄 首次运行：已为 {len(self.symbols)} 个标的生成价格监控持久化文件 {self.price_monitor_file.name}")
         
         logger.info(f"信号调度器已初始化")
         logger.info(f"  交易时间检查间隔: {self.config.scheduler.trading_check_interval}分钟 ({self.trading_check_interval_seconds}秒)")
@@ -420,6 +436,54 @@ class SignalScheduler:
         logger.debug(f"🔧 [DEBUG] {symbol} 最终配置: {config_result}")
         return config_result
     
+    def _load_price_monitors(self) -> dict:
+        """从持久化文件加载价格监控状态"""
+        try:
+            if self.price_monitor_file.exists():
+                import json
+                with open(self.price_monitor_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                logger.info(f"💾 已加载价格监控状态: {len(data)} 个标的")
+                return data
+        except Exception as e:
+            logger.warning(f"⚠️ 加载价格监控状态失败: {e}")
+        return {}
+
+    def _save_price_monitors(self):
+        """保存价格监控状态到持久化文件"""
+        try:
+            import json
+            self.price_monitor_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.price_monitor_file, 'w', encoding='utf-8') as f:
+                json.dump(self.price_monitors, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"⚠️ 保存价格监控状态失败: {e}")
+
+    def _ensure_new_trading_day(self, symbol: str, monitor: dict, today: str):
+        """
+        跨天重置监控状态：
+        - 新交易日（含周末/节假日间隔）清空 active、触发价、最高/最低价
+        - 保留结构，使监控从当天重新开始（触发条件基于当日涨跌幅，天然按日）
+
+        Returns:
+            bool: True=发生了跨天重置
+        """
+        if monitor.get('day') != today:
+            logger.info(f"📅 [{symbol}] 跨天检测({monitor.get('day')} -> {today})，重置监控状态")
+            monitor['day'] = today
+            for side in ('sell', 'buy'):
+                monitor[side]['active'] = False
+                monitor[side]['trigger_price'] = 0.0
+                monitor[side]['highest_price'] = 0.0
+                monitor[side]['lowest_price'] = 0.0
+                # last_notify_date 保留（按日期比较，跨天后自然失效）
+            # 卖出价记录跨天清除（新交易日重新记录）
+            if 'sell_price' in monitor['buy']:
+                monitor['buy']['sell_price'] = 0.0
+            self._save_price_monitors()
+            return True
+        return False
+
     def _check_price_monitor(self, symbol: str, market_data, current_signal):
         """
         检查价格极值监控（仅在WAIT信号时调用）
@@ -447,15 +511,22 @@ class SignalScheduler:
         # 获取或初始化监控状态
         if symbol not in self.price_monitors:
             logger.debug(f"🔧 [DEBUG] 初始化 {symbol} 的监控状态")
+            today_init = datetime.now().strftime("%Y-%m-%d")
             self.price_monitors[symbol] = {
+                'day': today_init,
                 'sell': {'active': False, 'trigger_price': 0.0, 'highest_price': 0.0, 'last_notify_date': None},
-                'buy': {'active': False, 'trigger_price': 0.0, 'lowest_price': 0.0, 'last_notify_date': None}
+                'buy': {'active': False, 'trigger_price': 0.0, 'lowest_price': 0.0, 'last_notify_date': None,
+                        'sell_price': 0.0}  # 卖出提醒时记录卖出价，买入需回落≥1%才提醒
             }
+            self._save_price_monitors()
         
         monitor = self.price_monitors[symbol]
         current_price = market_data.current_price
         change_pct = market_data.change_pct
         today = datetime.now().strftime("%Y-%m-%d")
+
+        # 跨天重置：新交易日清空 active/触发价/极值（避免基于昨日极值误报）
+        self._ensure_new_trading_day(symbol, monitor, today)
         
         logger.debug(f"🔧 [DEBUG] 当前监控状态:")
         logger.debug(f"   卖出监控: active={monitor['sell']['active']}, highest_price={monitor['sell']['highest_price']:.3f}, last_notify_date={monitor['sell'].get('last_notify_date')}")
@@ -464,6 +535,7 @@ class SignalScheduler:
         # === 卖出监控逻辑 ===
         logger.debug(f"\n📈 [DEBUG] === 开始检查卖出监控 ===")
         sell_state = monitor['sell']
+        buy_state = monitor['buy']  # 提前定义：卖出分支需记录卖出价到 buy.sell_price
         sell_trigger = monitor_config['sell_trigger_rise_pct']
         sell_pullback = monitor_config['sell_pullback_pct']
         
@@ -480,6 +552,7 @@ class SignalScheduler:
                 sell_state['active'] = True
                 sell_state['trigger_price'] = current_price
                 sell_state['highest_price'] = current_price
+                self._save_price_monitors()
                 logger.info(f"📈 [{symbol}] 卖出监控已激活 | 涨幅:{change_pct:+.2f}% | 触发价:¥{current_price:.3f}")
             else:
                 logger.debug(f"❌ [DEBUG] 不满足触发条件，跳过")
@@ -489,6 +562,7 @@ class SignalScheduler:
             if current_price > sell_state['highest_price']:
                 old_highest = sell_state['highest_price']
                 sell_state['highest_price'] = current_price
+                self._save_price_monitors()
                 logger.debug(f"📈 [DEBUG] 更新最高价: {old_highest:.3f} -> {current_price:.3f}")
                 logger.debug(f"📈 [{symbol}] 更新最高价: ¥{current_price:.3f}")
             
@@ -503,7 +577,7 @@ class SignalScheduler:
                 alert_signal = self._create_price_alert_signal(
                     symbol, market_data, 
                     signal_type="SELL_ALERT",
-                    reason=f"价格监控：从最高点¥{sell_state['highest_price']:.3f}回落{pullback_pct:.2f}%"
+                    reason=f"价格监控：从最高点¥{sell_state['highest_price']:.3f}回落{pullback_pct:.2f}%（触发价¥{sell_state['trigger_price']:.3f}）"
                 )
                 
                 # 发送飞书通知（传递 Signal 对象，而非 dict）
@@ -515,12 +589,15 @@ class SignalScheduler:
                 logger.debug(f"🔧 [DEBUG] 重置卖出监控状态，标记今日已提醒")
                 sell_state['active'] = False
                 sell_state['last_notify_date'] = today
+                # 记录卖出价：买入提醒需等价格回落≥1%才触发（防止卖出后立即买回）
+                buy_state['sell_price'] = current_price
+                logger.info(f"🔴 [{symbol}] 记录卖出价: ¥{current_price:.3f}，后续买入需回落≥1%")
+                self._save_price_monitors()
             else:
                 logger.debug(f"❌ [DEBUG] 不满足回落条件，继续监控")
         
         # === 买入监控逻辑 ===
         logger.debug(f"\n📉 [DEBUG] === 开始检查买入监控 ===")
-        buy_state = monitor['buy']
         buy_trigger = monitor_config['buy_trigger_drop_pct']
         buy_rebound = monitor_config['buy_rebound_pct']
         
@@ -537,6 +614,7 @@ class SignalScheduler:
                 buy_state['active'] = True
                 buy_state['trigger_price'] = current_price
                 buy_state['lowest_price'] = current_price
+                self._save_price_monitors()
                 logger.info(f"📉 [{symbol}] 买入监控已激活 | 跌幅:{change_pct:+.2f}% | 触发价:¥{current_price:.3f}")
             else:
                 logger.debug(f"❌ [DEBUG] 不满足触发条件，跳过")
@@ -546,6 +624,7 @@ class SignalScheduler:
             if current_price < buy_state['lowest_price']:
                 old_lowest = buy_state['lowest_price']
                 buy_state['lowest_price'] = current_price
+                self._save_price_monitors()
                 logger.debug(f"📉 [DEBUG] 更新最低价: {old_lowest:.3f} -> {current_price:.3f}")
                 logger.debug(f"📉 [{symbol}] 更新最低价: ¥{current_price:.3f}")
             
@@ -555,23 +634,32 @@ class SignalScheduler:
             logger.debug(f"🔧 [DEBUG] 检查反弹条件: {rebound_pct:.2f}% >= {buy_rebound}%")
             
             if rebound_pct >= buy_rebound:
-                logger.debug(f"✅ [DEBUG] 满足反弹条件！准备发送飞书通知")
-                # 构建买入提醒信号
-                alert_signal = self._create_price_alert_signal(
-                    symbol, market_data,
-                    signal_type="BUY_ALERT",
-                    reason=f"价格监控：从最低价¥{buy_state['lowest_price']:.3f}反弹{rebound_pct:.2f}%"
-                )
-                
-                # 发送飞书通知（传递 Signal 对象，而非 dict）
-                logger.debug(f"📱 [DEBUG] 调用 _send_feishu_notification...")
-                self._send_feishu_notification(alert_signal)
-                logger.success(f"🟢 [{symbol}] 买入提醒 | 最低价:¥{buy_state['lowest_price']:.3f} | 当前价:¥{current_price:.3f} | 反弹:{rebound_pct:.2f}%")
-                
-                # 重置监控状态并记录今日已提醒
-                logger.debug(f"🔧 [DEBUG] 重置买入监控状态，标记今日已提醒")
-                buy_state['active'] = False
-                buy_state['last_notify_date'] = today
+                # 卖出后需回落≥1%才允许买入（防止卖出后立即买回）
+                # 加1e-9容差：恰好回落1%时放行（避免浮点边界抖动）
+                sell_price = buy_state.get('sell_price', 0.0)
+                if sell_price > 0 and current_price > sell_price * 0.99 + 1e-9:
+                    logger.info(f"🟡 [{symbol}] 卖出价¥{sell_price:.3f}，当前¥{current_price:.3f}未回落1%，暂不发买入提醒（反弹{rebound_pct:.2f}%）")
+                    # 继续监控最低点（不重置状态，等待价格回落）
+                else:
+                    logger.debug(f"✅ [DEBUG] 满足反弹条件且已回落（或无卖出记录），准备发送飞书通知")
+                    # 构建买入提醒信号
+                    alert_signal = self._create_price_alert_signal(
+                        symbol, market_data,
+                        signal_type="BUY_ALERT",
+                        reason=f"价格监控：从最低价¥{buy_state['lowest_price']:.3f}反弹{rebound_pct:.2f}%（触发价¥{buy_state['trigger_price']:.3f}）"
+                    )
+                    
+                    # 发送飞书通知（传递 Signal 对象，而非 dict）
+                    logger.debug(f"📱 [DEBUG] 调用 _send_feishu_notification...")
+                    self._send_feishu_notification(alert_signal)
+                    logger.success(f"🟢 [{symbol}] 买入提醒 | 最低价:¥{buy_state['lowest_price']:.3f} | 当前价:¥{current_price:.3f} | 反弹:{rebound_pct:.2f}%")
+                    
+                    # 重置监控状态并记录今日已提醒
+                    logger.debug(f"🔧 [DEBUG] 重置买入监控状态，标记今日已提醒")
+                    buy_state['active'] = False
+                    buy_state['last_notify_date'] = today
+                    buy_state['sell_price'] = 0.0  # 买入提醒已发出，清除卖出价记录
+                    self._save_price_monitors()
             else:
                 logger.debug(f"❌ [DEBUG] 不满足反弹条件，继续监控")
         
@@ -595,7 +683,8 @@ class SignalScheduler:
         return Signal(
             symbol=symbol,
             name=market_data.name,
-            signal_type=SignalType.WAIT,  # 仍使用WAIT类型，但通过reason区分
+            signal_type=SignalType.WAIT,  # 仍使用WAIT类型，通过 alert_type 区分
+            alert_type=signal_type,       # SELL_ALERT / BUY_ALERT（显式字段，不再靠reason字符串）
             price=market_data.current_price,
             change_pct=market_data.change_pct,
             reason=reason,

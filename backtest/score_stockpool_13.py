@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-股票池913精选工具
+股票池13精选工具
 
 功能：
 1. 读取 _all.txt（当日全部评分结果）
-2. 优先选优选分9和13分的股票
+2. 优先选优选分13分的股票
 3. 不足5只时从其他分中按综合评分补足至5只
-4. 输出 stockpool_YYYYMMDD_913.txt
+4. 输出 stockpool_YYYYMMDD.txt（直接作为选股池）
 
 使用方法：
     python backtest/score_stockpool_913.py --date 2026-07-14
@@ -20,7 +20,7 @@ from collections import defaultdict
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-PREF_PRIORITY = [{9, 13}, {12}, {10, 11, 14}]
+PREF_PRIORITY = [{13}, {9, 12}, {10, 11, 14}]
 
 def sort_key(pref: float, score: int) -> tuple:
     p = int(pref)
@@ -60,8 +60,8 @@ def process_date(date_str: str):
                 except:
                     pass
     
-    # 第一步：优先选优选分9或13
-    filtered = [r for r in records if int(r['pref']) in (9, 13)]
+    # 第一步：优先选优选分13分
+    filtered = [r for r in records if int(r['pref']) == 13]
     filtered.sort(key=lambda r: sort_key(r['pref'], r['score']))
     
     # 第二步：不足5只时从其他分补足（按综合评分降序）
@@ -72,7 +72,7 @@ def process_date(date_str: str):
         filtered.extend(others[:needed])
     
     # 输出结果
-    print(f"\n  📅 {date_str}  —  原始{len(records)}只 → 913精选{len(filtered)}只")
+    print(f"\n  📅 {date_str}  —  原始{len(records)}只 → 13精选{len(filtered)}只")
     
     if not filtered:
         print(f"     没有符合条件的股票（优选分全部≤8）")
@@ -90,7 +90,7 @@ def process_date(date_str: str):
     out_path = DATA_DIR / f"stockpool_{dc}.txt"
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(f"# 优选分过滤结果 (生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})\n")
-        f.write(f"# 筛选规则: 优先9/13分, 不足5只从其他分补至5只, 同组按综合评分降序\n")
+        f.write(f"# 筛选规则: 优先13分, 不足5只从其他分补至5只, 同组按综合评分降序\n")
         f.write(f"# 格式: 股票代码,综合评分,优选分\n")
         f.write("# === 精选数据 ===\n")
         for r in filtered:

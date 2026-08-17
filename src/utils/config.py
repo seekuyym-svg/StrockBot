@@ -172,6 +172,15 @@ class BuyOrderSchedulerConfig(BaseModel):
     hour: int = 9  # 执行小时（24小时制）
     minute: int = 26  # 执行分钟
     min_score: float = 1.0  # 最低综合评分阈值
+    # 大盘评分<阈值时买入的防守ETF列表（沪市）
+    defensive_etfs: List[str] = ["513850", "513050", "513120", "516310", "515170"]
+    # 进攻股票列表（评分≥阈值时从中随机选 offensive_random_count 个）
+    offensive_stks: List[str] = ["600206", "600397", "002056", "002156", "002636",
+                                 "002674", "003043", "300649", "688141"]
+    # 进攻模式从 offensive_stks 随机抽取的数量
+    offensive_random_count: int = 7
+    # 评分≥阈值时选股方式：0=读股票池文件（默认），1=按offensive_stks生成
+    use_offensive_stocks: int = 0
 
 
 class FeishuNotificationConfig(BaseModel):

@@ -34,26 +34,27 @@ class FeishuNotifier:
         else:
             logger.info("ℹ️ 飞书通知未启用")
     
-    def should_notify(self, signal_type: str, reason: str = "") -> bool:
+    def should_notify(self, signal_type: str, reason: str = "", alert_type: str = "") -> bool:
         """
         判断是否应该发送通知
         
         Args:
             signal_type: 信号类型（BUY/SELL/ADD/STOP/WAIT）
-            reason: 信号原因（用于判断是否为价格监控提醒）
+            reason: 信号原因
+            alert_type: 价格监控提醒类型（SELL_ALERT/BUY_ALERT），非价格监控为空串
             
         Returns:
             bool: 是否应该发送通知
         """
-        logger.debug(f"🔧 [DEBUG-Notify] should_notify 检查: signal_type='{signal_type}', reason='{reason[:50]}...'")
+        logger.debug(f"🔧 [DEBUG-Notify] should_notify 检查: signal_type='{signal_type}', alert_type='{alert_type}', reason='{reason[:50]}...'")
         
         if not self.enabled:
             logger.debug(f"❌ [DEBUG-Notify] 飞书通知未启用，返回False")
             return False
         
-        # 如果是价格监控提醒，即使类型为WAIT也发送
-        if signal_type == "WAIT" and "价格监控" in reason:
-            logger.debug(f"✅ [DEBUG-Notify] 检测到价格监控提醒，允许发送")
+        # 如果是价格监控提醒（显式alert_type），即使类型为WAIT也发送
+        if signal_type == "WAIT" and alert_type in ("SELL_ALERT", "BUY_ALERT"):
+            logger.debug(f"✅ [DEBUG-Notify] 检测到价格监控提醒({alert_type})，允许发送")
             return True
         
         result = signal_type in self.notify_signals
@@ -82,14 +83,17 @@ class FeishuNotifier:
         symbol = signal_data.get('symbol', '')
         signal_type = signal_data.get('signal_type', '')
         reason = signal_data.get('reason', '')
-        symbol_signal_type = f"{symbol}_{signal_type}"
+        alert_type = signal_data.get('alert_type', '')  # SELL_ALERT / BUY_ALERT（价格监控）
+        # 频率控制键：价格监控提醒按alert_type独立限频（SELL_ALERT/BUY_ALERT不互相干扰），
+        # 普通信号用 symbol_信号类型
+        symbol_signal_type = f"{symbol}_{signal_type}_{alert_type}" if alert_type else f"{symbol}_{signal_type}"
         
-        logger.debug(f"🔧 [DEBUG-Notify] symbol={symbol}, signal_type={signal_type}, reason='{reason[:50]}...'")
+        logger.debug(f"🔧 [DEBUG-Notify] symbol={symbol}, signal_type={signal_type}, alert_type={alert_type}, reason='{reason[:50]}...'")
         logger.debug(f"🔧 [DEBUG-Notify] 频率控制键名: {symbol_signal_type}")
         
-        # 检查是否需要通知该类型的信号（传入reason用于价格监控判断）
+        # 检查是否需要通知该类型的信号（传入alert_type用于价格监控判断）
         logger.debug(f"🔧 [DEBUG-Notify] 调用 should_notify...")
-        should_send = self.should_notify(signal_type, reason)
+        should_send = self.should_notify(signal_type, reason, alert_type)
         logger.debug(f"🔧 [DEBUG-Notify] should_notify 返回: {should_send}")
         
         if not should_send:
@@ -231,16 +235,16 @@ class FeishuNotifier:
             'STOP': '止损信号'
         }
         
-        # 检测是否为价格监控提醒
-        is_price_alert = "价格监控" in reason
+        # 检测是否为价格监控提醒（显式alert_type字段，不再依赖reason字符串）
+        is_price_alert = alert_type in ("SELL_ALERT", "BUY_ALERT")
         
         if is_price_alert:
-            # 根据reason内容设置不同的颜色和标题
-            if "卖出提醒" in reason or "回落" in reason:
+            # 根据alert_type设置不同的颜色和标题
+            if alert_type == "SELL_ALERT":
                 color = "red"
                 emoji = "🔴"
                 title = "卖出提醒（价格监控）"
-            elif "买入提醒" in reason or "反弹" in reason:
+            elif alert_type == "BUY_ALERT":
                 color = "green"
                 emoji = "🟢"
                 title = "买入提醒（价格监控）"
