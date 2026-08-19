@@ -179,6 +179,34 @@ def fetch_market_volume(check_date: str) -> Optional[dict]:
 
     import re as _re
 
+    # ========== 优先从 signal_history.json 读取当天真实成交额 ==========
+    try:
+        signal_file = project_root / "data" / "signal_history.json"
+        if signal_file.exists():
+            with open(signal_file, 'r', encoding='utf-8') as _f:
+                records = json.load(_f)
+            for record in reversed(records):
+                if record.get('date') == check_date:  # 只精确匹配当天记录
+                    mv = record.get('market_volume')
+                    if mv is not None:
+                        result = {
+                            'current': round(float(mv), 0),
+                            'avg_5': record.get('volume_avg_5'),
+                            'ratio': record.get('volume_ratio'),
+                            'trend': record.get('volume_trend'),
+                        }
+                        print(f"   ✅ signal_history.json: 成交额{result['current']:.0f}亿" +
+                              (f", 5日均量≈{result['avg_5']:.0f}亿" if result['avg_5'] else ""))
+                        return result
+                    break
+            # 无当天记录且非当日：无法获取该历史日期数据
+            if check_date != datetime.now().strftime('%Y-%m-%d'):
+                print(f"   ⚠️ {check_date} 无存档记录且非当日，无法获取成交额")
+                return None
+            print(f"   ⚠️ signal_history.json 无 {check_date} 当天记录，改用腾讯实时行情")
+    except Exception as e:
+        print(f"   ⚠️ signal_history.json 读取失败({e})，降级腾讯行情")
+
     # ========== 获取成交额（腾讯财经主源） ==========
     current_yuan = 0.0
     try:
@@ -358,7 +386,8 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
     cfg = load_config()
     ma_short = cfg.get('ma_short', 20)
     ma_long = cfg.get('ma_long', 60)
-    min_volume = cfg.get('min_market_volume', 25000)
+    min_volume = cfg.get('min_market_volume', 25000)       # 活跃度充足线
+    min_volume_low = cfg.get('min_market_volume_low', 20000)  # 活跃度及格线
     indices_cfg = cfg.get('indices', [])
     mode = pass_mode or cfg.get('pass_mode', 'dual_consensus')
     flex_count = cfg.get('flexible_pass_count', 3)
@@ -399,8 +428,15 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
 
     if market_volume is not None:
         vol_current = market_volume['current']
-        cond_vol_pass = vol_current >= min_volume
-        cond_vol_desc = f"全市场成交额 {vol_current:.0f}亿 >= {min_volume}亿?"
+        # 三层活跃度：<20000亿不足 | 20000~25000还行 | >=25000充足
+        cond_vol_pass = vol_current >= min_volume_low
+        if vol_current >= min_volume:
+            vol_level = "充足"
+        elif vol_current >= min_volume_low:
+            vol_level = "还行"
+        else:
+            vol_level = "不足"
+        cond_vol_desc = f"全市场成交额 {vol_current:.0f}亿（活跃度{vol_level}）"
     else:
         cond_vol_pass = True  # 获取失败时不阻挡
         cond_vol_desc = "全市场成交额 获取失败（跳过此条件）"
@@ -448,7 +484,7 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
                         unhealthy_parts.append(f"{ma_short}日线({ir[f'ma{ma_short}']:.0f}) < {ma_long}日线({ir[f'ma{ma_long}']:.0f})")
                     reasons.append(f"{ir['name']}不健康: {'; '.join(unhealthy_parts)}")
         if not cond_vol_pass and market_volume is not None:
-            reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume}亿，市场活跃度不足")
+            reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume_low}亿，市场活跃度不足")
         if not cond_emotion_pass and emotion is not None:
             reasons.append(f"情绪禁止开仓: {emotion['emotion_reason']}")
 
@@ -461,7 +497,7 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
             if not ir['cond2'][0]:
                 reasons.append(f"{ir['name']}{ma_short}日线({ir[f'ma{ma_short}']:.0f}) < {ma_long}日线({ir[f'ma{ma_long}']:.0f})")
         if not cond_vol_pass and market_volume is not None:
-            reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume}亿，市场活跃度不足")
+            reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume_low}亿，市场活跃度不足")
 
     else:  # 'flexible'
         passed = passed_count >= flex_count
@@ -473,7 +509,7 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
                 if not ir['cond2'][0]:
                     reasons.append(f"{ir['name']}{ma_short}日线({ir[f'ma{ma_short}']:.0f}) < {ma_long}日线({ir[f'ma{ma_long}']:.0f})")
             if not cond_vol_pass and market_volume is not None:
-                reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume}亿，市场活跃度不足")
+                reasons.append(f"成交额({market_volume['current']:.0f}亿) < {min_volume_low}亿，市场活跃度不足")
 
     # ========== 构建结果 ==========
     # 扁平化条件编号（cond1 ~ condN）用于输出
@@ -504,6 +540,7 @@ def check_market_signal(check_date: str = None, pass_mode: str = None) -> Dict:
         'volume_avg_5': vol_avg_5,
         'volume_ratio': vol_ratio,
         'volume_trend': vol_trend,
+        'volume_level': vol_level if market_volume is not None else None,
         'cond_volume': (cond_vol_pass, cond_vol_desc),
         'emotion': emotion,
         'cond_emotion': (cond_emotion_pass, cond_emotion_desc),
@@ -724,6 +761,7 @@ def save_signal_history(result: Dict):
         'volume_avg_5': mv['avg_5'] if mv else None,
         'volume_ratio': mv['ratio'] if mv else None,
         'volume_trend': mv['trend'] if mv else None,
+        'volume_level': result.get('volume_level'),
         'volume_pass': bool(result['cond_volume'][0]),
         'emotion': result.get('emotion'),
         'reasons': result.get('reasons', []),

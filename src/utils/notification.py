@@ -212,6 +212,7 @@ class FeishuNotifier:
         reason = signal_data.get('reason', '')
         target_shares = signal_data.get('target_shares', 0)
         avg_cost = signal_data.get('avg_cost', 0)
+        alert_type = signal_data.get('alert_type', '')  # SELL_ALERT / BUY_ALERT（价格监控）
         
         # 根据信号类型设置颜色和标题
         color_map = {

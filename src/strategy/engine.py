@@ -236,10 +236,10 @@ class MartingaleEngine:
         """检查是否满足买入条件（T+0优化，简单过滤避免无条件建仓）"""
         # T+0可以更加灵活，主要关注价格位置和RSI
         
-        # 0. 硬性前置条件：买入价格必须在 MA20 之上（含MA20）
-        #    MA20获取失败(None)时放行（避免接口异常导致永久无法建仓），日志记录
-        if market_data.ma_20 is not None and market_data.current_price < market_data.ma_20:
-            logger.info(f"⚠️ [{market_data.symbol}] 价格¥{market_data.current_price:.3f} < MA20 ¥{market_data.ma_20:.3f}，不建仓")
+        # 0. 硬性前置条件：买入价格必须在 MA5 之上（含MA5）
+        #    MA5获取失败(None)时放行（避免接口异常导致永久无法建仓），日志记录
+        if market_data.ma_5 is not None and market_data.current_price < market_data.ma_5:
+            logger.info(f"⚠️ [{market_data.symbol}] 价格¥{market_data.current_price:.3f} < MA5 ¥{market_data.ma_5:.3f}，不建仓")
             return False
         
         # 1. 检查RSI是否处于低位（超卖反弹机会）
@@ -256,7 +256,7 @@ class MartingaleEngine:
                     return True
         
         # 3. 当日涨跌幅在合理区间才建仓（避免追高/接飞刀）：
-        #    涨幅>+1%不追高，跌幅<-5%不接飞刀
+        #    涨跌幅区间 -5.0% ~ +1.0%（温和），不追高、不接飞刀
         if market_data.change_pct is not None:
             if -5.0 <= market_data.change_pct <= 1.0:
                 return True

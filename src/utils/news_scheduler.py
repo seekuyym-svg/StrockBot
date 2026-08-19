@@ -711,14 +711,17 @@ class NewsMonitorScheduler:
             content += f"**结果**: {result_icon}\n"
             content += f"**模式**: {mode}\n"
 
-            # 沪深市场成交额
+            # 沪深市场成交额（含活跃度分层）
             if market_volume is not None:
                 vol_icon = "✅" if volume_pass else "❌"
                 vol_trend = signal.get('volume_trend', '')
                 vol_avg = signal.get('volume_avg_5')
+                vol_level = signal.get('volume_level')
                 vol_detail = f"5日均量: {vol_avg:.0f}亿, {vol_trend}" if vol_avg and vol_trend else vol_trend
+                level_str = f"活跃度{vol_level}" if vol_level else ""
                 detail_str = f" ({vol_detail})" if vol_detail else ""
-                content += f"**沪深市场成交额**: {market_volume:.0f}亿{detail_str}\n\n"
+                level_part = f" | {level_str}" if level_str else ""
+                content += f"**沪深市场成交额**: {market_volume:.0f}亿{level_part}{detail_str}\n\n"
 
             # 不通过原因
             if reasons:

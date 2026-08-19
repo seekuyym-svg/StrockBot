@@ -229,21 +229,22 @@ def _is_open_limit_up(code: str, open_price: float, prev_close: float) -> bool:
     return open_pct >= limit - 0.3
 
 
-def _get_ma20(code: str, market: str) -> float:
+def _get_ma(code: str, market: str, days: int) -> float:
     """
-    从腾讯K线获取最近20个交易日收盘价均值（MA20）
+    从腾讯K线获取最近days个交易日收盘价均值（MA）
 
     Args:
         code: 股票代码
         market: 市场标识（sh/sz）
+        days: 均线周期（如5、10、20）
 
     Returns:
-        float: MA20，获取失败返回 None
+        float: MA，获取失败返回 None
     """
     try:
         resp = requests.get(
             'http://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
-            params={'param': f'{market}{code},day,,,20,qfq'},
+            params={'param': f'{market}{code},day,,,{days},qfq'},
             headers={'User-Agent': 'Mozilla/5.0'}, timeout=10
         )
         data = resp.json()
@@ -259,13 +260,25 @@ def _get_ma20(code: str, market: str) -> float:
         return None
 
 
-def generate_offensive_trade_file() -> bool:
+def _get_ma5(code: str, market: str) -> float:
+    """最近5个交易日收盘价均值（MA5）"""
+    return _get_ma(code, market, 5)
+
+
+def _get_ma10(code: str, market: str) -> float:
+    """最近10个交易日收盘价均值（MA10）"""
+    return _get_ma(code, market, 10)
+
+
+def generate_offensive_trade_file() -> str:
     """
     评分≥阈值且开启进攻模式时，按 offensive_stks 生成买入委托 trade 文件
 
     选股规则：
       - 先从 offensive_stks 获取全部行情，过滤掉"开盘即涨停"（一字板买不进）的股票
-      - 从剩余股票随机抽取 offensive_random_count（8）只
+      - MA5/MA10两级分层：开盘>MA5且>MA10最优先，其次>MA5，再其次≤MA5
+      - 弱势检测：MA5之上≤2只 → 市场短期弱势，降级为防守ETF买入
+      - 从优先池随机抽取 offensive_random_count（8）只
       - 加上必选ETF 588080（硬编码），共9个标的
     市场按代码自动判断（6/9/5→sh，其余→sz），
     价格小数位自动判断（5开头ETF→3位，其他→2位）。
@@ -285,8 +298,8 @@ def generate_offensive_trade_file() -> bool:
     def _market_of(code: str) -> str:
         return 'sh' if code.startswith(('6', '9', '5')) else 'sz'
 
-    # 1. 获取全部股票行情 + MA20，过滤开盘即涨停（一字板买不进）
-    buyable = []  # (code, realtime, ma20)
+    # 1. 获取全部股票行情 + MA5/MA10，过滤开盘即涨停（一字板买不进）
+    buyable = []  # (code, realtime, ma5, ma10)
     limit_up_skipped = []
     for code in all_stocks:
         realtime = buy_module.get_stock_realtime_data(code, _market_of(code))
@@ -297,32 +310,54 @@ def generate_offensive_trade_file() -> bool:
             limit_up_skipped.append(f"{code}({realtime['name']})")
             logger.info(f"[OFFENSIVE] {code} 开盘即涨停，过滤: 开{realtime['open_price']:.2f}/昨收{realtime['prev_close']:.2f}")
             continue
-        ma20 = _get_ma20(code, _market_of(code))
-        buyable.append((code, realtime, ma20))
+        ma5 = _get_ma5(code, _market_of(code))
+        ma10 = _get_ma10(code, _market_of(code))
+        buyable.append((code, realtime, ma5, ma10))
 
     if limit_up_skipped:
         logger.info(f"[OFFENSIVE] 过滤涨停 {len(limit_up_skipped)} 只: {limit_up_skipped}")
 
-    # 2. 分优先/次选池：开盘价 > MA20 优先，否则次选
-    #    MA20获取失败(None)视为无法确认，放次选池
-    above_ma20 = [x for x in buyable if x[2] is not None and x[1]['open_price'] > x[2]]
-    below_ma20 = [x for x in buyable if x not in above_ma20]
-    logger.info(f"[OFFENSIVE] 开盘>MA20: {len(above_ma20)}只 / 开盘<=MA20或未知: {len(below_ma20)}只")
-    for code, rt, ma in above_ma20:
-        logger.info(f"   ✅ {code}({rt['name']}) 开{rt['open_price']:.3f} > MA20 {ma:.3f}")
-    for code, rt, ma in below_ma20:
-        ma_str = f"{ma:.3f}" if ma is not None else "N/A"
-        logger.info(f"   ⬇️ {code}({rt['name']}) 开{rt['open_price']:.3f} <= MA20 {ma_str}")
+    # 2. 三级分层：
+    #    Tier1（强中强）：开盘价 > MA5 且 > MA10（短期均线多头排列）
+    #    Tier2（较 强）：开盘价 > MA5 但 <= MA10（或MA10未知，保守降级）
+    #    Tier3（次 选）：开盘价 <= MA5（或MA5未知）
+    def _open(x):
+        return x[1]['open_price']
 
-    # 3. 优先从"开盘>MA20"池随机选，不足从次选池补足
-    picked = random.sample(above_ma20, min(random_count, len(above_ma20)))
-    if len(picked) < random_count:
+    tier1 = [x for x in buyable if x[2] is not None and _open(x) > x[2] and x[3] is not None and _open(x) > x[3]]
+    tier2 = [x for x in buyable if x not in tier1 and x[2] is not None and _open(x) > x[2]]
+    tier3 = [x for x in buyable if x not in tier1 and x not in tier2]
+
+    logger.info(f"[OFFENSIVE] Tier1(开>MA5且>MA10): {len(tier1)}只 | Tier2(开>MA5): {len(tier2)}只 | Tier3(开<=MA5): {len(tier3)}只")
+    for code, rt, ma5, ma10 in tier1:
+        logger.info(f"   ✅ {code}({rt['name']}) 开{_open([code, rt, ma5, ma10]):.3f} > MA5 {ma5:.3f} > MA10 {ma10:.3f}")
+    for code, rt, ma5, ma10 in tier2:
+        ma10_str = f"{ma10:.3f}" if ma10 is not None else "N/A"
+        logger.info(f"   ⬆️ {code}({rt['name']}) 开{_open([code, rt, ma5, ma10]):.3f} > MA5 {ma5:.3f} 但 <= MA10 {ma10_str}")
+    for code, rt, ma5, ma10 in tier3:
+        ma5_str = f"{ma5:.3f}" if ma5 is not None else "N/A"
+        logger.info(f"   ⬇️ {code}({rt['name']}) 开{_open([code, rt, ma5, ma10]):.3f} <= MA5 {ma5_str}")
+
+    # 3. 弱势市场检测：MA5之上不超过2只 → 短期弱势，降级为防守ETF买入
+    #    即使大盘评分≥阈值，个股普遍跌破5日线说明市场弱，应谨慎
+    above_ma5_count = len(tier1) + len(tier2)
+    if above_ma5_count <= 2:
+        logger.warning(f"[OFFENSIVE] 市场短期弱势：MA5之上仅{above_ma5_count}只（≤2），降级为防守ETF买入")
+        if generate_etf_trade_file():
+            return "DEFENSIVE"
+        return "FAILED"
+
+    # 4. 依次从 Tier1 → Tier2 → Tier3 随机选，直至凑够 random_count 只
+    picked = []
+    for tier in (tier1, tier2, tier3):
+        if len(picked) >= random_count:
+            break
         need = random_count - len(picked)
-        picked_codes_now = {c for c, _, _ in picked}
-        remaining = [x for x in buyable if x[0] not in picked_codes_now]
-        picked += random.sample(remaining, min(need, len(remaining)))
+        picked_codes_now = {c for c, _, _, _ in picked}
+        candidates = [x for x in tier if x[0] not in picked_codes_now]
+        picked += random.sample(candidates, min(need, len(candidates)))
 
-    picked_codes = [c for c, _, _ in picked]
+    picked_codes = [c for c, _, _, _ in picked]
     stocks = picked_codes + [always_etf]  # 随机股票 + 必选ETF
 
     logger.info(f"[OFFENSIVE] 可买{len(buyable)}只，最终选{picked_codes} + 必选[{always_etf}] = {len(stocks)}个标的")
@@ -364,7 +399,7 @@ def generate_offensive_trade_file() -> bool:
         # 混合列表：价格小数位自动判断（ETF 3位/股票 2位）
         buy_module.save_trade_report(results, total_investment, auto_price=True)
         logger.info(f"[OFFENSIVE] trade 文件已生成（{len(results)}只，总投入{total_investment:,.2f}元）")
-        return True
+        return "OK"
     else:
         logger.warning("[OFFENSIVE] 所有代码行情获取失败，未生成 trade 文件")
         _send_alert_notification(
@@ -373,7 +408,7 @@ def generate_offensive_trade_file() -> bool:
             f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**代码列表**: {', '.join(stocks)}"
         )
-        return False
+        return "FAILED"
 
 
 def execute_buy_calculation():
@@ -418,8 +453,10 @@ def execute_buy_calculation():
     
     # 2. 根据评分决定买入委托生成方式
     #   ≥SCORE_BUY_THRESHOLD：从股票池生成；<阈值：从防守ETF生成
+    defensive_mode = False  # 是否降级为防守ETF（弱势市场）
     if final_total is not None and final_total < SCORE_BUY_THRESHOLD:
         logger.info(f"\n[STEP 2] 大盘评分{final_total}<{SCORE_BUY_THRESHOLD}，使用防守ETF生成买入委托...")
+        defensive_mode = True
         try:
             if not generate_etf_trade_file():
                 # 生成失败已推送告警，跳过推送（避免读取残留的旧trade文件）
@@ -445,10 +482,16 @@ def execute_buy_calculation():
         if use_offensive == 1:
             logger.info("\n[STEP 2] 开启进攻模式，按 offensive_stks 生成买入委托...")
             try:
-                if not generate_offensive_trade_file():
+                result = generate_offensive_trade_file()
+                if result == "FAILED":
                     # 生成失败已推送告警，跳过推送
                     return
-                logger.success("[OK] 进攻模式买入委托计算完成")
+                if result == "DEFENSIVE":
+                    # 市场短期弱势（MA5之上≤2只），已降级为防守ETF买入
+                    defensive_mode = True
+                    logger.warning("[STEP 2] ⚠️ 市场短期弱势，降级为防守ETF买入")
+                else:
+                    logger.success("[OK] 进攻模式买入委托计算完成")
             except Exception as e:
                 logger.error(f"[ERROR] 执行进攻模式买入计算失败: {e}")
                 import traceback
@@ -476,7 +519,7 @@ def execute_buy_calculation():
     # 3. 读取交易报告文件并发送飞书通知
     logger.info("\n[STEP 3] 发送买入委托通知...")
     try:
-        send_trade_notification(final_total_from_index=final_total)
+        send_trade_notification(final_total_from_index=final_total, defensive_mode=defensive_mode)
     except Exception as e:
         logger.error(f"[STEP 3] 买入委托通知发送异常: {e}")
 
@@ -875,9 +918,13 @@ def send_index_snapshot():
     return final_total
 
 
-def send_trade_notification(final_total_from_index=None):
+def send_trade_notification(final_total_from_index=None, defensive_mode: bool = False):
     """
     读取交易报告文件并通过飞书发送通知
+
+    Args:
+        final_total_from_index: 大盘综合评分（10分制）
+        defensive_mode: 是否防守ETF模式（评分<阈值 或 弱势市场降级）
     """
     try:
         # 读取今天的交易报告文件
@@ -906,13 +953,13 @@ def send_trade_notification(final_total_from_index=None):
             logger.info("[INFO] 今日没有可买入的股票")
             return
         
-        # 评分<阈值（防守ETF）：仅提示一句话，不展示明细
+        # 防守ETF模式（评分<阈值 或 弱势市场降级）：仅提示一句话，不展示明细
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        if final_total_from_index is not None and final_total_from_index < SCORE_BUY_THRESHOLD:
+        if defensive_mode or (final_total_from_index is not None and final_total_from_index < SCORE_BUY_THRESHOLD):
             content = f"**今日买入防守型ETF，如银行/红利/食饮/医药等ETF，尽量选择低位。**\n"
             content += f"**时间**: {current_time}\n"
-            logger.info(f"[TRADE] 评分{final_total_from_index}<{SCORE_BUY_THRESHOLD}，仅提示防守ETF买入")
+            logger.info(f"[TRADE] 防守ETF模式（评分{final_total_from_index}，降级={defensive_mode}），仅提示")
         else:
             # 股票池委托：展示明细
             content = f"**今日买入委托明细**\n"
@@ -966,9 +1013,14 @@ def send_trade_notification(final_total_from_index=None):
             logger.warning("[WARN] 飞书通知未启用，跳过发送")
             return
         
-        # 卡片颜色随评分动态：<4红、4-阈值橙、≥阈值绿（无评分保持绿色）
-        # 语义：低分为防守ETF买入（橙/红提示谨慎），高分为股票池买入（绿）
-        if final_total_from_index is not None:
+        # 卡片颜色：防守模式（评分<阈值 或 弱势降级）→ 橙/红提示谨慎；正常买入 → 绿
+        if defensive_mode:
+            # 弱势/低分降级为防守ETF：橙色提示谨慎（评分极低<4时红色）
+            if final_total_from_index is not None and final_total_from_index < 4:
+                card_template = "red"
+            else:
+                card_template = "orange"
+        elif final_total_from_index is not None:
             if final_total_from_index < 4:
                 card_template = "red"
             elif final_total_from_index < SCORE_BUY_THRESHOLD:

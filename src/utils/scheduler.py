@@ -179,6 +179,11 @@ class SignalScheduler:
                 self._log_important_signal(signal, current_time)
                 self._save_signal(signal)
                 
+                # ✨ 建仓/加仓后：更新价格监控BUY节点（记录最新买入价，重置监控基线，
+                #    使日内低吸监控从最新持仓成本重新开始）
+                if signal.signal_type in (SignalType.BUY, SignalType.ADD):
+                    self._update_price_monitor_on_buy(symbol, signal.price, signal.signal_type.value)
+                
             elif signal.signal_type == SignalType.WAIT:
                 # 等待信号：仅打印
                 self._log_wait_signal(signal, current_time)
@@ -471,18 +476,53 @@ class SignalScheduler:
         if monitor.get('day') != today:
             logger.info(f"📅 [{symbol}] 跨天检测({monitor.get('day')} -> {today})，重置监控状态")
             monitor['day'] = today
-            for side in ('sell', 'buy'):
-                monitor[side]['active'] = False
-                monitor[side]['trigger_price'] = 0.0
-                monitor[side]['highest_price'] = 0.0
-                monitor[side]['lowest_price'] = 0.0
-                # last_notify_date 保留（按日期比较，跨天后自然失效）
+            # 按方向分别重置各自追踪的字段（避免冗余字段）
+            sell = monitor['sell']
+            sell['active'] = False
+            sell['trigger_price'] = 0.0
+            sell['highest_price'] = 0.0
+            buy = monitor['buy']
+            buy['active'] = False
+            buy['trigger_price'] = 0.0
+            buy['lowest_price'] = 0.0
+            # last_notify_date 保留（按日期比较，跨天后自然失效）
             # 卖出价记录跨天清除（新交易日重新记录）
             if 'sell_price' in monitor['buy']:
                 monitor['buy']['sell_price'] = 0.0
             self._save_price_monitors()
             return True
         return False
+
+    def _update_price_monitor_on_buy(self, symbol: str, price: float, signal_type: str = "BUY"):
+        """
+        建仓(BUY)/加仓(ADD)后更新价格监控BUY节点：
+        - 记录最新买入价（buy_price）供追溯
+        - 重置监控基线：trigger_price/lowest_price 以最新买入价为起点，active重置，
+          使日内低吸监控从最新持仓成本重新开始（继续下跌会刷新最低价并触发反弹提醒）
+        """
+        try:
+            # 懒初始化：文件缺失/未跟踪该标的时先初始化（与 _check_price_monitor 结构一致）
+            if symbol not in self.price_monitors:
+                today_init = datetime.now().strftime("%Y-%m-%d")
+                self.price_monitors[symbol] = {
+                    'day': today_init,
+                    'sell': {'active': False, 'trigger_price': 0.0, 'highest_price': 0.0, 'last_notify_date': None},
+                    'buy': {'active': False, 'trigger_price': 0.0, 'lowest_price': 0.0, 'last_notify_date': None,
+                            'sell_price': 0.0}
+                }
+            monitor = self.price_monitors[symbol]
+            monitor['day'] = datetime.now().strftime("%Y-%m-%d")
+            buy = monitor['buy']
+            buy['active'] = False
+            buy['trigger_price'] = price   # 监控触发基线 = 建仓价
+            buy['lowest_price'] = price    # 最低价基线 = 建仓价（继续下跌会自动刷新）
+            buy['sell_price'] = 0.0        # 无卖出记录
+            buy['last_notify_date'] = None # 建仓后当日仍可触发低吸提醒
+            buy['buy_price'] = price       # 记录建仓价，便于追溯
+            self._save_price_monitors()
+            logger.info(f"🟢 [{symbol}] {'建仓' if signal_type == 'BUY' else '加仓'}¥{price:.3f}，已更新价格监控BUY节点（监控基线=最新买入价）")
+        except Exception as e:
+            logger.warning(f"⚠️ 建仓后更新价格监控状态失败: {e}")
 
     def _check_price_monitor(self, symbol: str, market_data, current_signal):
         """
