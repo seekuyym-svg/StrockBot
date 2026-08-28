@@ -6,3 +6,6 @@ signal/
 config.yaml
 backtest/score_stockpool.py
 .reasonix/
+docs/
+# DSH 插件依赖链接（junction 指向全局 dsh 的 node_modules，避免卷入仓库）
+node_modules/

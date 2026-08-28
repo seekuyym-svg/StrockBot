@@ -1,0 +1,15 @@
+# stock-scorer 插件挂载配置（DSH）
+#
+# ⚠️ 插件路径必须使用绝对路径 —— 把下面的 /absolute/path/to/project
+#    改成你的项目真实根目录（含 backtest/ local/ config.yaml 的那个目录）。
+#
+# 启动方式：
+#   pnpm dsh web --patch ./plugin/cordis.yml
+#
+# 环境变量（可选）：
+#   STOCK_SCORE_PYTHON   Python 解释器路径（默认 python）
+#   STOCK_SCORE_ROOT     项目根目录（默认取插件文件上级上级）
+
+- insert:
+  - id: stock-scorer
+    name: 'file:///E:/LearnPY/Projects/StockBot/plugin/src/score-stock.ts'

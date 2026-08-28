@@ -148,21 +148,25 @@ def generate_etf_trade_file() -> bool:
     """
     大盘评分<6时，用防守ETF生成买入委托 trade 文件
 
-    与股票池版生成逻辑一致：INITIAL_CAPITAL 平分给5只ETF，
-    每只按开盘价计算100股整数倍的买入数量，保存到 trade_今日.txt。
+    与股票池版生成逻辑一致：INITIAL_CAPITAL 平分给所有防守ETF，
+    每只按开盘价计算买入数量，保存到 trade_今日.txt。
+    市场按代码自动判断：6/9/5开头→sh（沪市ETF），16开头→sz（深市LOF）。
 
     Returns:
         bool: True=生成成功，False=全部失败（已推送告警）
     """
     import tool_calc_buynum_simple as buy_module
 
+    def _market_of(code: str) -> str:
+        return 'sh' if code.startswith(('6', '9', '5')) else 'sz'
+
     logger.info(f"[ETF] 使用防守ETF生成买入委托: {DEFENSIVE_ETFS}")
 
     watchlist = []
     for code in DEFENSIVE_ETFS:
-        # 用本模块 get_stock_name（支持5开头沪市ETF，带缓存）
+        # 用本模块 get_stock_name（带缓存，支持5开头沪市ETF/16开头深市LOF）
         name = get_stock_name(code)
-        watchlist.append({'code': code, 'market': 'sh', 'name': name, 'score': 0.0})
+        watchlist.append({'code': code, 'market': _market_of(code), 'name': name, 'score': 0.0})
 
     results = []
     total_investment = 0
@@ -171,7 +175,7 @@ def generate_etf_trade_file() -> bool:
 
     for stock in watchlist:
         code = stock['code']
-        realtime = buy_module.get_stock_realtime_data(code, 'sh')
+        realtime = buy_module.get_stock_realtime_data(code, stock['market'])
         if realtime is None:
             logger.warning(f"[ETF] {code} 无法获取实时数据，跳过")
             continue
@@ -270,6 +274,151 @@ def _get_ma10(code: str, market: str) -> float:
     return _get_ma(code, market, 10)
 
 
+def _is_prev_day_offensive() -> bool:
+    """
+    判断上一交易日（t-1日）是否也是进攻日（评分≥6）
+
+    读取 buy_decision_history.txt，精确匹配"上一交易日"日期的记录，
+    其 final_total >= SCORE_BUY_THRESHOLD 则为进攻日。
+
+    Returns:
+        bool: True=上一交易日是进攻日
+    """
+    try:
+        hist_file = project_root / "data" / "buy_decision_history.txt"
+        if not hist_file.exists():
+            return False
+        prev_ymd = get_previous_trading_day()  # YYYYMMDD
+        prev_date_str = f"{prev_ymd[:4]}-{prev_ymd[4:6]}-{prev_ymd[6:]}"  # YYYY-MM-DD
+        import csv
+        with open(hist_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('date', '') == prev_date_str:
+                    try:
+                        final_total = float(row.get('final_total', 0))
+                    except (ValueError, TypeError):
+                        final_total = 0
+                    is_off = final_total >= SCORE_BUY_THRESHOLD
+                    logger.info(f"[PREV] 上一交易日({prev_date_str})评分={final_total}，{'进攻日' if is_off else '非进攻日'}")
+                    return is_off
+        logger.info(f"[PREV] 上一交易日({prev_date_str})无历史记录，视为非进攻日")
+        return False
+    except Exception as e:
+        logger.warning(f"[PREV] 判断上一日进攻状态失败: {e}")
+        return False
+
+
+def _get_prev_trade_picked_stocks() -> list:
+    """
+    读取上一交易日的 trade 文件，返回其选中的股票代码（剔除必选ETF 588080）
+
+    Returns:
+        list: 股票代码列表，文件不存在或解析失败返回 []
+    """
+    try:
+        prev_date = get_previous_trading_day()
+        trade_file = project_root / "data" / f"trade_{prev_date}.txt"
+        if not trade_file.exists():
+            logger.warning(f"[PREV] 上一交易日 trade 文件不存在: {trade_file.name}")
+            return []
+        with open(trade_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        codes = []
+        for line in lines[2:]:  # 跳过第1行数量和第2行表头
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(',')
+            if len(parts) >= 1:
+                code = parts[0].strip()
+                if code and code != '588080':  # 剔除必选ETF
+                    codes.append(code)
+        logger.info(f"[PREV] 上一交易日({prev_date})选中股票: {codes}")
+        return codes
+    except Exception as e:
+        logger.warning(f"[PREV] 读取上一交易日trade文件失败: {e}")
+        return []
+
+
+def _get_prev_day_change_pct(code: str, market: str) -> float:
+    """
+    计算个股在上一交易日（t-1日）的涨跌幅
+
+    涨跌幅 = (t-1日收盘 - t-2日收盘) / t-2日收盘 * 100
+    取腾讯K线中"日期 < 今天"的最后两根K线（t-1与t-2），
+    即使今天已开盘（K线含今日盘中数据）也不影响。
+
+    Returns:
+        float: t-1日涨跌幅(%)，获取失败返回 None
+    """
+    try:
+        resp = requests.get(
+            'http://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
+            params={'param': f'{market}{code},day,,,10,qfq'},
+            headers={'User-Agent': 'Mozilla/5.0'}, timeout=10
+        )
+        data = resp.json()
+        stock_data = data.get('data', {}).get(f'{market}{code}', {})
+        klines = stock_data.get('qfqday', []) or stock_data.get('day', [])
+        if not klines:
+            return None
+        # 过滤出 日期 < 今天 的K线（剔除今日盘中K线）
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        past_klines = [k for k in klines if isinstance(k, (list, tuple)) and len(k) >= 3 and k[0] < today_str]
+        if len(past_klines) < 2:
+            return None
+        close_t1 = float(past_klines[-1][2])  # t-1日收盘
+        close_t2 = float(past_klines[-2][2])  # t-2日收盘
+        if close_t2 <= 0:
+            return None
+        return (close_t1 - close_t2) / close_t2 * 100
+    except Exception:
+        return None
+
+
+def _filter_prev_big_risers(candidates: list) -> list:
+    """
+    过滤上一交易日涨幅>5%的个股（避免连续两日选股重复高位股）
+
+    仅当上一交易日也是进攻日（评分≥6）时执行：
+      - 读取上一交易日 trade 文件的选股结果（剔除588080）
+      - 计算这些个股在 t-1 日的涨跌幅，涨幅>5%的直接过滤
+      - 其余候选不受影响（未选中的股票不受此限制）
+
+    Args:
+        candidates: 当前候选股票代码列表
+
+    Returns:
+        list: 过滤后的候选列表
+    """
+    if not _is_prev_day_offensive():
+        return candidates
+
+    prev_picked = _get_prev_trade_picked_stocks()
+    if not prev_picked:
+        return candidates  # 上一日trade文件缺失，跳过本优化
+
+    def _market_of(c):
+        return 'sh' if c.startswith(('6', '9', '5')) else 'sz'
+
+    filtered_out = []
+    for code in prev_picked:
+        # 仅过滤当前候选池中的（上一日选中但今天不在候选池的无需处理）
+        if code not in candidates:
+            continue
+        chg = _get_prev_day_change_pct(code, _market_of(code))
+        if chg is not None and chg > 5.0:
+            filtered_out.append(f"{code}({chg:+.2f}%)")
+
+    if filtered_out:
+        logger.warning(f"[PREV] 上一交易日涨幅>5%，今日过滤: {filtered_out}")
+
+    result = [c for c in candidates if c not in [f.split('(')[0] for f in filtered_out]]
+    logger.info(f"[PREV] 过滤后候选: {len(result)}只（原{len(candidates)}只）")
+    return result
+
+
 def generate_offensive_trade_file() -> str:
     """
     评分≥阈值且开启进攻模式时，按 offensive_stks 生成买入委托 trade 文件
@@ -294,6 +443,18 @@ def generate_offensive_trade_file() -> str:
     all_stocks = list(cfg.offensive_stks)
     random_count = cfg.offensive_random_count
     always_etf = '588080'  # 必选ETF（硬编码）
+
+    # 0. 防重复优化：上一交易日若也是进攻日，过滤掉上一日涨幅>5%的个股
+    #    （避免连续两日选到同一批高位股）
+    all_stocks = _filter_prev_big_risers(all_stocks)
+    if not all_stocks:
+        logger.warning("[OFFENSIVE] 过滤后候选为空，跳过买入委托生成")
+        _send_alert_notification(
+            "⚠️ 买入委托计算失败",
+            "**上一交易日进攻日个股涨幅>5%全部被过滤，当前无候选可买，已跳过。**\n"
+            f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return "FAILED"
 
     def _market_of(code: str) -> str:
         return 'sh' if code.startswith(('6', '9', '5')) else 'sz'
@@ -337,6 +498,16 @@ def generate_offensive_trade_file() -> str:
     for code, rt, ma5, ma10 in tier3:
         ma5_str = f"{ma5:.3f}" if ma5 is not None else "N/A"
         logger.info(f"   ⬇️ {code}({rt['name']}) 开{_open([code, rt, ma5, ma10]):.3f} <= MA5 {ma5_str}")
+
+    # 2.5 行情全失败保护：buyable为空说明数据源故障（非市场弱势），按失败处理
+    if not buyable:
+        logger.warning("[OFFENSIVE] 所有候选股票行情获取失败（疑似数据源故障），按失败处理")
+        _send_alert_notification(
+            "⚠️ 买入委托计算失败",
+            "**评分≥阈值且开启进攻模式，但全部候选股票行情获取失败（数据源故障），已跳过买入。**\n"
+            f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return "FAILED"
 
     # 3. 弱势市场检测：MA5之上不超过2只 → 短期弱势，降级为防守ETF买入
     #    即使大盘评分≥阈值，个股普遍跌破5日线说明市场弱，应谨慎
@@ -753,27 +924,35 @@ def send_index_snapshot():
     s_hs = _score_hs(hs300_healthy)
     raw_total = s_lb + s_kc + s_ks + s_hs  # 满分10分
 
-    # 排除规则：前日科创50过热阶梯扣分（涨越多扣越多）
-    # 阈值：>4%扣1分，>5%扣2分，>6%扣3分
+    # 科创综指波动调整（均值回归，负数=加分）：
+    #   过热降级：>4%扣1，>6%扣2，>8%扣3
+    #   过冷加分：<-6%加1，<-8%加2
     if kc_change is not None:
-        if kc_change > 6.0:
+        if kc_change > 8.0:
             penalty = 3
-        elif kc_change > 5.0:
+        elif kc_change > 6.0:
             penalty = 2
         elif kc_change > 4.0:
             penalty = 1
+        elif kc_change < -8.0:
+            penalty = -2  # 过冷加分（负扣分）
+        elif kc_change < -6.0:
+            penalty = -1
         else:
             penalty = 0
     else:
         penalty = 0
 
-    # 情绪正加权：前日情绪好（≥7分）且无过热降级时加分，情绪极差（<3分）时减分
-    if emotion_score >= 7.0 and penalty == 0:
-        emotion_bonus = 1
-        logger.info(f"[SCORE] 情绪正加权: emotion_score={emotion_score} ≥7.0 → +1分")
-    elif emotion_score < 3.0:
+    # 情绪逆向加权（均值回归思维）：
+    #   ≥8分 → 市场过热，减1分（涨太多，防追高）
+    #   <3分 → 市场过冷，加1分（跌太多，超跌反弹机会）
+    #   3~8分 → 不加不减
+    if emotion_score >= 8.0:
         emotion_bonus = -1
-        logger.info(f"[SCORE] 情绪负加权: emotion_score={emotion_score} <3.0 → -1分")
+        logger.info(f"[SCORE] 情绪过热: emotion_score={emotion_score} ≥8.0 → -1分")
+    elif emotion_score < 3.0:
+        emotion_bonus = 1
+        logger.info(f"[SCORE] 情绪过冷: emotion_score={emotion_score} <3.0 → +1分")
     else:
         emotion_bonus = 0
 
@@ -810,10 +989,12 @@ def send_index_snapshot():
     parts_info.append(f"沪深300{'✅' if hs300_healthy else '❌'} ({s_hs}分)")
     parts_info.append(f"情绪{emotion_score:.1f}分")
     score_detail = " | ".join(parts_info)
-    if penalty:
-        score_detail += f" (过热降级-{penalty})"
+    if penalty > 0:
+        score_detail += f" (科创过热降级-{penalty})"
+    elif penalty < 0:
+        score_detail += f" (科创过冷加分{penalty:+.0f})"
     if emotion_bonus != 0:
-        score_detail += f" (情绪{'正' if emotion_bonus > 0 else '负'}加权{emotion_bonus:+.0f})"
+        score_detail += f" (情绪{'逆向加' if emotion_bonus > 0 else '逆向减'}{emotion_bonus:+.0f})"
 
     # ── 4e. 存入历史记录文件 ──
     try:
@@ -835,12 +1016,14 @@ def send_index_snapshot():
         advice_text = advice.replace('✅ ','').replace('🟡 ','').replace('🟠 ','').replace('🔴 ','')
         if '(' in advice_text:
             advice_text = advice_text.split('(')[0]
-        # 格式: date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return,nikkei_pct,nasdaq_pct
-        record = f"{date_str},{vol_str},{kc_str},{ks_str},{s_lb},{s_kc},{s_ks},{s_hs},{raw_total},{penalty},{emotion_bonus},{final_total},{advice_text},,{nikkei_pct_str},{nasdaq_pct_str}\n"
+        # 星期几：周一到周五简称 一、二、三、四、五（周末记录时用 六、日）
+        weekday = "一二三四五六日"[datetime.strptime(date_str, '%Y-%m-%d').weekday()]
+        # 格式: date,weekday,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return,nikkei_pct,nasdaq_pct
+        record = f"{date_str},{weekday},{vol_str},{kc_str},{ks_str},{s_lb},{s_kc},{s_ks},{s_hs},{raw_total},{penalty},{emotion_bonus},{final_total},{advice_text},,{nikkei_pct_str},{nasdaq_pct_str}\n"
         # 文件不存在时写入表头
         if not hist_file.exists():
             with open(hist_file, 'w', encoding='utf-8') as f:
-                f.write("date,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return,nikkei_pct,nasdaq_pct\n")
+                f.write("date,weekday,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return,nikkei_pct,nasdaq_pct\n")
         with open(hist_file, 'a', encoding='utf-8') as f:
             f.write(record)
         logger.info(f"[HISTORY] 已记录决策到 {hist_file.name}")
