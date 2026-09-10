@@ -1109,13 +1109,12 @@ class NewsMonitorScheduler:
                 shares = int(float(parts[2].strip()))
                 investment = float(parts[3].strip())
 
-                # 根据代码前缀确定市场
-                if code.startswith('6'):
+                # 根据代码前缀确定市场（与买入委托逻辑一致）：
+                # 6/9/5→sh（沪主板/沪B/沪市ETF），其余（0/1/2/3含16开头深市LOF）→sz
+                if code.startswith(('6', '9', '5')):
                     market = 'sh'
-                elif code.startswith(('0', '3')):
-                    market = 'sz'
                 else:
-                    market = 'sh'
+                    market = 'sz'
 
                 positions.append({
                     'code': code,
@@ -1160,6 +1159,48 @@ class NewsMonitorScheduler:
             pass
         return 0.0
 
+    def _backfill_actual_return(self, buy_date: str, total_return: float):
+        """
+        回填 buy_decision_history.txt 中买入日(buy_date)记录的 actual_return 列
+
+        Args:
+            buy_date: 买入日 YYYYMMDD
+            total_return: 实际收益率(%)（空仓日传 0.0）
+        """
+        try:
+            hist_file = Path(__file__).parent.parent.parent / "data" / "buy_decision_history.txt"
+            if not hist_file.exists():
+                return
+            lines = open(hist_file, 'r', encoding='utf-8').readlines()
+            if len(lines) < 2:
+                return
+            header = lines[0].strip()
+            header_cols = header.split(',')
+            try:
+                ret_idx = header_cols.index('actual_return')
+            except ValueError:
+                ret_idx = 13  # 旧表头兜底
+            trade_date_fmt = f"{buy_date[:4]}-{buy_date[4:6]}-{buy_date[6:8]}"
+            updated = False
+            for i in range(1, len(lines)):
+                cols = lines[i].strip().split(',')
+                if cols[0] == trade_date_fmt and (len(cols) <= ret_idx or cols[ret_idx].strip() == ''):
+                    while len(cols) <= ret_idx:
+                        cols.append('')
+                    cols[ret_idx] = f"{total_return:+.2f}"
+                    lines[i] = ','.join(cols) + '\n'
+                    updated = True
+                    logger.info(f"[HISTORY] 回填 {trade_date_fmt} 实际收益率: {total_return:+.2f}%")
+                    break
+            if updated:
+                with open(hist_file, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                logger.info(f"[HISTORY] buy_decision_history.txt 已更新")
+            else:
+                logger.debug(f"[HISTORY] {trade_date_fmt} 无需更新（记录不存在或已填）")
+        except Exception as e:
+            logger.warning(f"[HISTORY] 回填收益率失败: {e}")
+
     def _send_trade_return_notification(self):
         """
         发送持仓收益率飞书通知
@@ -1181,7 +1222,8 @@ class NewsMonitorScheduler:
             # 读取持仓（trade文件按买入日命名）
             positions = self._read_trade_file(buy_date)
             if not positions:
-                logger.info("ℹ️ 无可用的持仓数据，跳过收益率推送")
+                logger.info("ℹ️ 无持仓（空仓日），回填当日实际收益率为 0")
+                self._backfill_actual_return(buy_date, 0.0)
                 return
 
             # 计算每只股票收益
@@ -1204,9 +1246,9 @@ class NewsMonitorScheduler:
                     current_value = shares * close_price
                     profit = current_value - investment
                 else:
-                    return_pct = 0.0
-                    current_value = 0.0
-                    profit = 0.0
+                    # 行情获取失败：剔除该持仓，避免市值算0导致总收益率虚低
+                    logger.warning(f"⚠️ [{code}] 收盘价获取失败({close_price})，从总收益计算中剔除")
+                    continue
 
                 total_investment += investment
                 total_current_value += current_value
@@ -1225,6 +1267,11 @@ class NewsMonitorScheduler:
                 logger.info(f"   [{i}/{len(positions)}] {code}: 买入{buy_price:.2f}→收盘{close_price:.2f} ({return_pct:+.2f}%)")
                 import time as _t
                 _t.sleep(0.5)
+
+            # 全部持仓行情都失败：无可计算收益，跳过推送
+            if not total_results:
+                logger.warning("⚠️ 全部持仓收盘价获取失败，跳过收益率推送")
+                return
 
             # 总仓收益率
             total_return_pct = round((total_current_value - total_investment) / total_investment * 100, 2) if total_investment > 0 else 0.0
@@ -1256,7 +1303,7 @@ class NewsMonitorScheduler:
 
             sorted_results = sorted(total_results, key=lambda r: r['return_pct'], reverse=True)
             hold_detail = '/'.join([f"{r['code']}({_color_ret(r['return_pct'])})" for r in sorted_results])
-            content += f"**持仓数量**: {len(positions)} 只，{hold_detail}\n\n"
+            content += f"**持仓数量**: {len(total_results)} 只，{hold_detail}\n\n"
 
             # 收益率数字标颜色：负收益绿色、正收益红色、持平黑色
             if total_return_pct < 0:
@@ -1316,35 +1363,8 @@ class NewsMonitorScheduler:
             logger.info("✅ 持仓收益率通知完成\n")
 
             # ── 回填决策历史记录的实际收益率 ──
-            try:
-                hist_file = Path(__file__).parent.parent.parent / "data" / "buy_decision_history.txt"
-                if hist_file.exists():
-                    lines = open(hist_file, 'r', encoding='utf-8').readlines()
-                    if len(lines) >= 2:
-                        header = lines[0].strip()
-                        trade_date_compact = buy_date  # YYYYMMDD格式（买入日，用于匹配决策记录）
-                        # 转换为YYYY-MM-DD格式
-                        trade_date_fmt = f"{trade_date_compact[:4]}-{trade_date_compact[4:6]}-{trade_date_compact[6:8]}"
-                        updated = False
-                        for i in range(1, len(lines)):
-                            cols = lines[i].strip().split(',')
-                            if cols[0] == trade_date_fmt and (len(cols) < 14 or cols[13].strip() == ''):
-                                total_return = (total_current_value - total_investment) / total_investment * 100
-                                while len(cols) < 14:
-                                    cols.append('')
-                                cols[13] = f"{total_return:+.2f}"
-                                lines[i] = ','.join(cols) + '\n'
-                                updated = True
-                                logger.info(f"[HISTORY] 回填 {trade_date_fmt} 实际收益率: {total_return:+.2f}%")
-                                break
-                        if updated:
-                            with open(hist_file, 'w', encoding='utf-8') as f:
-                                f.writelines(lines)
-                            logger.info(f"[HISTORY] buy_decision_history.txt 已更新")
-                        else:
-                            logger.debug(f"[HISTORY] {trade_date_fmt} 无需更新（记录不存在或已填）")
-            except Exception as e2:
-                logger.warning(f"[HISTORY] 回填收益率失败: {e2}")
+            total_return = (total_current_value - total_investment) / total_investment * 100 if total_investment > 0 else 0.0
+            self._backfill_actual_return(buy_date, total_return)
 
         except Exception as e:
             logger.error(f"❌ 持仓收益率通知异常: {e}")

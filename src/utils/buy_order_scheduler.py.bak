@@ -582,41 +582,6 @@ def generate_offensive_trade_file() -> str:
         return "FAILED"
 
 
-def _set_today_decision(advice_text: str) -> bool:
-    """
-    更新 buy_decision_history.txt 中今天记录的 advice 列（三态：买股票/买ETF/空仓）
-    用于在 execute_buy_calculation 实际分流后修正记录（如买股票日无票 → 空仓）
-
-    Returns:
-        bool: 是否更新成功
-    """
-    try:
-        hist_file = project_root / "data" / "buy_decision_history.txt"
-        if not hist_file.exists():
-            return False
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        lines = open(hist_file, 'r', encoding='utf-8').readlines()
-        updated = False
-        for i, line in enumerate(lines[1:], 1):
-            parts = line.strip().split(',')
-            if len(parts) >= 14 and parts[0] == today_str:
-                # advice 列在 index 13（date,weekday,...,final_total,advice,...）
-                parts[13] = advice_text
-                lines[i] = ','.join(parts) + '\n'
-                updated = True
-                logger.info(f"[HISTORY] 今日({today_str})决策更新为: {advice_text}")
-                break
-        if updated:
-            with open(hist_file, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            return True
-        logger.warning(f"[HISTORY] 今日({today_str})无历史记录可更新")
-        return False
-    except Exception as e:
-        logger.warning(f"[HISTORY] 更新今日决策失败: {e}")
-        return False
-
-
 def execute_buy_calculation():
     """
     执行买入委托计算并发送飞书通知
@@ -650,33 +615,34 @@ def execute_buy_calculation():
         logger.warning(f"[CALENDAR] 获取交易日历失败({e})，降级为仅过滤周末")
 
     # 1. 先计算大盘综合评分（同时推送国际市场早盘概览）
-    #    send_index_snapshot 现返回 (final_total, vol_ratio)
     final_total = None
-    vol_ratio = None
     logger.info("\n[STEP 1] 计算大盘综合评分 + 国际市场早盘概览...")
     try:
-        _res = send_index_snapshot()
-        if isinstance(_res, tuple):
-            final_total, vol_ratio = _res
-        else:
-            final_total = _res  # 兼容旧返回
+        final_total = send_index_snapshot()
     except Exception as e:
         logger.error(f"[STEP 1] 大盘评分计算异常: {e}")
-
-    # 2. 定稿方案门控（2026-09验证，46天复利+32.52%）：
-    #    评分 ∈ {3,4,6} 且 量比≤1.15 → 买13分动态股（前日score_stockpool_13输出池）
-    #    其他评分 / 量比>1.15（过热）→ 买防守ETF
-    #    无票日（评分3/4/6但无票）→ 空仓不买（收益0）
-    #    （注意：评分7-9为过热陷阱、评分5为13分亏损日、评分2为弱市，均回避）
-    #    评分3纳入：4个有票日13分+4.04% vs ETF-0.40%（样本少，观察中）
-    defensive_mode = False  # 是否降级为防守ETF（非3/4/6窗口或过热）
-    can_buy_13 = (final_total is not None and final_total in (3, 4, 6)
-                  and (vol_ratio is None or vol_ratio <= 1.15))
-    if can_buy_13:
-        logger.info(f"\n[STEP 2] 评分{final_total}∈{{3,4,6}}且量比{vol_ratio}≤1.15 → 走13分股票池")
-        # 选股来源：统一读 score_stockpool_13.py 输出的 stockpool_{昨日}.txt（动态13分池）
-        # 注：offensive_stks 写死选股逻辑已废弃（generate_offensive_trade_file 不再调用），
-        #     use_offensive_stocks 开关保留判断框架：=1 时也走同一股票池（仅记日志）
+    
+    # 2. 根据评分决定买入委托生成方式
+    #   ≥SCORE_BUY_THRESHOLD：从股票池生成；<阈值：从防守ETF生成
+    defensive_mode = False  # 是否降级为防守ETF（弱势市场）
+    if final_total is not None and final_total < SCORE_BUY_THRESHOLD:
+        logger.info(f"\n[STEP 2] 大盘评分{final_total}<{SCORE_BUY_THRESHOLD}，使用防守ETF生成买入委托...")
+        defensive_mode = True
+        try:
+            if not generate_etf_trade_file():
+                # 生成失败已推送告警，跳过推送（避免读取残留的旧trade文件）
+                return
+            logger.success("[OK] 防守ETF买入委托计算完成")
+        except Exception as e:
+            logger.error(f"[ERROR] 执行ETF买入计算失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            _send_alert_notification("⚠️ 买入委托计算失败",
+                                     f"**大盘评分{final_total}<{SCORE_BUY_THRESHOLD}，改用防守ETF时执行异常**: {e}")
+            return
+    else:
+        # 评分≥阈值：按开关选择选股方式
+        # use_offensive_stocks=1 → 按offensive_stks生成；0 → 读股票池文件
         use_offensive = 0
         try:
             from src.utils.config import get_config
@@ -685,49 +651,42 @@ def execute_buy_calculation():
             pass
 
         if use_offensive == 1:
-            logger.info("[STEP 2] 检测到 use_offensive_stocks=1，但 offensive_stks 已废弃，统一走 score_stockpool_13 股票池")
-
-        logger.info("\n[STEP 2] 检查选股结果文件...")
-        if not check_stockpool_file():
-            logger.warning("[SKIP] 前日选股个股为0，今日空仓")
-            # 买股票日无票 → 空仓，并把历史记录从"买股票"修正为"空仓"
-            _set_today_decision("空仓")
-            # 推送空仓提示卡片（推送①早盘概览不变，仅此处买入委托卡片提示空仓）
+            logger.info("\n[STEP 2] 开启进攻模式，按 offensive_stks 生成买入委托...")
             try:
-                send_trade_notification(final_total_from_index=final_total, empty_position=True)
+                result = generate_offensive_trade_file()
+                if result == "FAILED":
+                    # 生成失败已推送告警，跳过推送
+                    return
+                if result == "DEFENSIVE":
+                    # 市场短期弱势（MA5之上≤2只），已降级为防守ETF买入
+                    defensive_mode = True
+                    logger.warning("[STEP 2] ⚠️ 市场短期弱势，降级为防守ETF买入")
+                else:
+                    logger.success("[OK] 进攻模式买入委托计算完成")
             except Exception as e:
-                logger.error(f"[STEP 3] 空仓提示推送异常: {e}")
-            return
-
-        logger.info("执行买入委托计算（股票池）...")
-        try:
-            buy_module.calculate_buy_orders()
-            logger.success("[OK] 买入委托计算完成")
-        except Exception as exc:
-            logger.error(f"[ERROR] 执行买入计算失败: {exc}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return
-    else:
-        # 转防守ETF（含评分None异常兜底）
-        reason = f"评分{final_total}" if final_total is not None else "评分获取失败"
-        if vol_ratio is not None and vol_ratio > 1.15:
-            reason += f"且量比{vol_ratio}>1.15过热"
-        logger.info(f"\n[STEP 2] {reason} → 使用防守ETF生成买入委托...")
-        defensive_mode = True
-        try:
-            if not generate_etf_trade_file():
-                # 生成失败已推送告警，跳过推送（避免读取残留的旧trade文件）
+                logger.error(f"[ERROR] 执行进攻模式买入计算失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                _send_alert_notification("⚠️ 买入委托计算失败",
+                                         f"**评分≥{SCORE_BUY_THRESHOLD}，进攻模式执行异常**: {e}")
                 return
-            logger.success("[OK] 防守ETF买入委托计算完成")
-        except Exception as exc:
-            logger.error(f"[ERROR] 执行ETF买入计算失败: {exc}")
-            import traceback
-            logger.error(traceback.format_exc())
-            _send_alert_notification("⚠️ 买入委托计算失败",
-                                     f"**{reason}，改用防守ETF时执行异常**: {exc}")
-            return
-
+        else:
+            logger.info("\n[STEP 2] 检查选股结果文件...")
+            if not check_stockpool_file():
+                logger.warning("[SKIP] 未找到前一日的选股结果文件，跳过本次执行")
+                logger.info("[TIP] 提示：请确保已运行 select_stocks_volume.py 生成选股结果")
+                return
+            
+            logger.info("执行买入委托计算（股票池）...")
+            try:
+                buy_module.calculate_buy_orders()
+                logger.success("[OK] 买入委托计算完成")
+            except Exception as e:
+                logger.error(f"[ERROR] 执行买入计算失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                return
+    
     # 3. 读取交易报告文件并发送飞书通知
     logger.info("\n[STEP 3] 发送买入委托通知...")
     try:
@@ -999,19 +958,19 @@ def send_index_snapshot():
 
     final_total = raw_total - penalty + emotion_bonus
 
-    # 转为建议（10分制）—— 定稿方案门控口径（2026-09验证）：
-    #   评分=3/4/6 → 可买13分动态股；评分=5 → 13分亏损日回避
-    #   评分7-9 → 过热陷阱回避；评分2 → 弱市回避 → 均转防守ETF
-    #   另：量比>1.15 → 过热熔断，即使3/4/6也转ETF
-    if final_total in (3, 4, 6) and (vol_ratio is None or vol_ratio <= 1.15):
-        advice = "🟢 买股票(优选13分)"
+    # 转为建议（10分制）
+    if final_total >= 8:
+        advice = "✅ 推荐买入"
         advice_color = "green"
-    elif final_total in (3, 4, 6) and vol_ratio is not None and vol_ratio > 1.15:
-        advice = "🔴 量比过热→买ETF"
-        advice_color = "red"
-    else:
-        advice = "🟡 买防守ETF"
+    elif final_total >= SCORE_BUY_THRESHOLD:
+        advice = "🟡 可买(控制仓位)"
+        advice_color = "yellow"
+    elif final_total >= 4:
+        advice = "🟠 谨慎(不建议买入)"
         advice_color = "orange"
+    else:
+        advice = "🔴 不买(观望)"
+        advice_color = "red"
 
     # 评分明细（仅显示有数据的项）
     parts_info = []
@@ -1053,12 +1012,10 @@ def send_index_snapshot():
         if nasdaq_data:
             try: nasdaq_pct_str = f"{float(nasdaq_data['change_pct'].replace('%','')):+.2f}"
             except: pass
-        # 历史记录：只存二分类决策（买股票 / 买ETF），与门控条件一致
-        if final_total is not None and final_total in (3, 4, 6) \
-                and (vol_ratio is None or vol_ratio <= 1.15):
-            advice_text = "买股票"
-        else:
-            advice_text = "买ETF"
+        # 建议转纯文字（去掉表情符号和括号内容，只保留主词）
+        advice_text = advice.replace('✅ ','').replace('🟡 ','').replace('🟠 ','').replace('🔴 ','')
+        if '(' in advice_text:
+            advice_text = advice_text.split('(')[0]
         # 星期几：周一到周五简称 一、二、三、四、五（周末记录时用 六、日）
         weekday = "一二三四五六日"[datetime.strptime(date_str, '%Y-%m-%d').weekday()]
         # 格式: date,weekday,vol_ratio,kc_change,kospi_pct,score_lb,score_kc,score_ks,score_hs,raw_total,penalty,emotion_bonus,final_total,advice,actual_return,nikkei_pct,nasdaq_pct
@@ -1077,12 +1034,12 @@ def send_index_snapshot():
     index_list = [d for d in [nasdaq_data, nikkei_data, kospi_data] if d is not None]
     if not index_list:
         logger.warning("[INDEX] 所有指数数据获取失败，跳过推送")
-        return final_total, vol_ratio  # 评分已算出，仍返回供Step2使用
+        return final_total  # 评分已算出，仍返回供Step2使用
 
     notifier = get_feishu_notifier()
     if not notifier.enabled:
         logger.warning("[INDEX] 飞书通知未启用，跳过推送")
-        return final_total, vol_ratio  # 评分已算出，仍返回供Step2使用
+        return final_total  # 评分已算出，仍返回供Step2使用
 
     today = datetime.now().strftime('%m/%d')
     content = f"**📡 国际市场早盘概览 — {today}**\n\n"
@@ -1141,65 +1098,18 @@ def send_index_snapshot():
     except Exception as e:
         logger.error(f"[INDEX] 推送失败: {e}")
 
-    return final_total, vol_ratio
+    return final_total
 
 
-def send_trade_notification(final_total_from_index=None, defensive_mode: bool = False,
-                            empty_position: bool = False):
+def send_trade_notification(final_total_from_index=None, defensive_mode: bool = False):
     """
     读取交易报告文件并通过飞书发送通知
 
     Args:
         final_total_from_index: 大盘综合评分（10分制）
         defensive_mode: 是否防守ETF模式（评分<阈值 或 弱势市场降级）
-        empty_position: 空仓日（买股票窗口但前日选股0只）→ 仅提示空仓
     """
     try:
-        # ── 空仓日（前日选股个股为0）：不读交易文件，直接推空仓提示卡片 ──
-        if empty_position:
-            notifier = get_feishu_notifier()
-            if not notifier.enabled:
-                logger.warning("[WARN] 飞书通知未启用，跳过发送")
-                return
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            content = f"**前日选股数为0，今日空仓。**\n"
-            content += f"**时间**: {current_time}\n"
-            logger.info("[TRADE] 空仓日（前日选股0只），推送空仓提示")
-            message = {
-                "msg_type": "interactive",
-                "card": {
-                    "config": {"wide_screen_mode": True},
-                    "header": {
-                        "title": {
-                            "tag": "plain_text",
-                            "content": "今日买入委托"
-                        },
-                        "template": "grey"
-                    },
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": content}},
-                        {"tag": "hr"},
-                        {"tag": "note", "elements": [
-                            {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
-                        ]}
-                    ]
-                }
-            }
-            import requests
-            import json
-            headers = {'Content-Type': 'application/json'}
-            response = requests.post(notifier.webhook_url, headers=headers,
-                                     data=json.dumps(message, ensure_ascii=False).encode('utf-8'), timeout=10)
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('StatusCode') == 0 or result.get('code') == 0:
-                    logger.success("[OK] 空仓提示推送成功")
-                else:
-                    logger.error(f"[ERROR] 飞书API返回错误: {result.get('msg', '未知')}")
-            else:
-                logger.error(f"[ERROR] 空仓提示推送失败，HTTP状态码: {response.status_code}")
-            return
-
         # 读取今天的交易报告文件
         date_str = datetime.now().strftime('%Y%m%d')
         filename = f"trade_{date_str}.txt"
@@ -1229,7 +1139,7 @@ def send_trade_notification(final_total_from_index=None, defensive_mode: bool = 
         # 防守ETF模式（评分<阈值 或 弱势市场降级）：仅提示一句话，不展示明细
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        if defensive_mode:
+        if defensive_mode or (final_total_from_index is not None and final_total_from_index < SCORE_BUY_THRESHOLD):
             content = f"**今日买入防守型ETF，如银行/红利/食饮/医药等ETF，尽量选择低位。**\n"
             content += f"**时间**: {current_time}\n"
             logger.info(f"[TRADE] 防守ETF模式（评分{final_total_from_index}，降级={defensive_mode}），仅提示")
@@ -1286,15 +1196,21 @@ def send_trade_notification(final_total_from_index=None, defensive_mode: bool = 
             logger.warning("[WARN] 飞书通知未启用，跳过发送")
             return
         
-        # 卡片颜色：defensive_mode 由 execute_buy_calculation 按定稿门控算出（权威）
+        # 卡片颜色：防守模式（评分<阈值 或 弱势降级）→ 橙/红提示谨慎；正常买入 → 绿
         if defensive_mode:
-            # 防守ETF：橙色提示（评分极低<4时红色）
+            # 弱势/低分降级为防守ETF：橙色提示谨慎（评分极低<4时红色）
             if final_total_from_index is not None and final_total_from_index < 4:
                 card_template = "red"
             else:
                 card_template = "orange"
+        elif final_total_from_index is not None:
+            if final_total_from_index < 4:
+                card_template = "red"
+            elif final_total_from_index < SCORE_BUY_THRESHOLD:
+                card_template = "orange"
+            else:
+                card_template = "green"
         else:
-            # 正常买13分：绿色
             card_template = "green"
 
         # 构建飞书消息体
