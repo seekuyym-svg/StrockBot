@@ -21,6 +21,16 @@ from src.utils.config import get_config
 from src.utils.news_crawler import get_eastmoney_crawler
 from src.utils.notification import send_news_notification, get_feishu_notifier
 
+# 累计净值（净值化）配置：以 NAV_BASE_DATE 为锚点，该日净值 = 1.0000
+# 净值序列持久化到 data/NAV_STATE_FILE，重启后可继续读取并累乘
+NAV_BASE_DATE = "2026-09-11"
+NAV_BASE_VALUE = 1.0
+# 模拟账户起始本金：锚点日 = 100，与累计净值同步复利累乘（当前市值 = 净值 × 100）
+NAV_BASE_CAPITAL = 100.0
+NAV_STATE_FILE = "cumulative_nav.json"
+# 胜率统计起始日：此日之前尚未净值化，不纳入统计
+WIN_RATE_START_DATE = "2026-09-14"
+
 
 class NewsMonitorScheduler:
     """股票资讯监控调度器"""
@@ -1201,6 +1211,159 @@ class NewsMonitorScheduler:
         except Exception as e:
             logger.warning(f"[HISTORY] 回填收益率失败: {e}")
 
+    def _update_and_get_cumulative_nav(self, current_return_pct: float, sell_date: str) -> float:
+        """
+        更新并返回累计净值（净值化），并持久化到 data/cumulative_nav.json。
+
+        以 NAV_BASE_DATE 为锚点（该日净值 = 1.0000），此后每期收益复利累乘：
+            NAV = 1.0000 × ∏ (1 + rᵢ/100)
+
+        记录日期 = 卖出日（当日）。每个交易日写入一笔，即使空仓收益为 0。
+        - 与回写 buy_decision_history.txt 属同一期、相邻落盘，不从历史回溯补齐；
+        - 每次运行：写入当期收益（幂等，同日重跑按最新收益重算）；
+        - 序列持久化，重启后可直接读取，不依赖内存状态。
+
+        Args:
+            current_return_pct: 当期收益率(%)（1.53 表示 +1.53%）
+            sell_date: 卖出日（当日）YYYYMMDD
+
+        Returns:
+            float: 当前累计净值（保留 4 位小数）
+        """
+        base_date = NAV_BASE_DATE
+        cur_fmt = f"{sell_date[:4]}-{sell_date[4:6]}-{sell_date[6:8]}"
+        state_path = project_root / "data" / NAV_STATE_FILE
+
+        # 1. 载入持久化净值序列（date -> 该期收益率%）
+        period_returns = {}
+        if state_path.exists():
+            try:
+                data = json.loads(state_path.read_text(encoding='utf-8'))
+                for e in data.get('entries', []):
+                    period_returns[e['date']] = float(e['period_return'])
+            except Exception as e:
+                logger.warning(f"[NAV] 读取净值状态失败，将重建: {e}")
+
+        # 2. 写入当期收益（卖出日 = 今日），与回写 buy_decision_history.txt 同属一期
+        if cur_fmt > base_date:
+            period_returns[cur_fmt] = float(current_return_pct)
+
+        # 3. 按日期顺序复利累乘
+        nav = NAV_BASE_VALUE
+        rows = []
+        for d in sorted(period_returns.keys()):
+            nav *= (1 + period_returns[d] / 100.0)
+            rows.append((d, period_returns[d], nav))
+
+        # 4. 持久化
+        #    注意：JSON 数字无法保留尾随零（json.dumps(1.0) → "1.0"），
+        #    故手写序列化，令 period_return 固定 2 位小数、nav 固定 4 位小数。
+        try:
+            lines = [
+                '{',
+                f'  "base_date": "{base_date}",',
+                f'  "base_value": {NAV_BASE_VALUE:.4f},',
+                '  "entries": [',
+            ]
+            for i, (d, r, v) in enumerate(rows):
+                tail = ',' if i < len(rows) - 1 else ''
+                lines.append('    {')
+                lines.append(f'      "date": "{d}",')
+                lines.append(f'      "period_return": {r:.2f},')
+                lines.append(f'      "nav": {v:.4f}')
+                lines.append('    }' + tail)
+            lines.append('  ]')
+            lines.append('}')
+            state_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            logger.info(f"[NAV] 累计净值已更新: {nav:.4f}（共 {len(rows)} 期）")
+        except Exception as e:
+            logger.warning(f"[NAV] 持久化净值失败: {e}")
+
+        return round(nav, 4)
+
+    def _calc_win_rate(self, start_date: str = WIN_RATE_START_DATE) -> tuple:
+        """
+        统计净值化以来的胜率。
+
+        数据源 = data/cumulative_nav.json 中 date >= start_date 的周期记录
+        （每个交易日一笔，含空仓日 0.00）。
+
+        胜率口径：零收益视为"不亏"，与正收益一同计入分子
+            胜率 = (正收益次数 + 零收益次数) / 总次数 × 100
+
+        Args:
+            start_date: 统计起始日 YYYY-MM-DD
+
+        Returns:
+            tuple: (胜率%, 正收益次数, 负收益次数, 零收益次数)
+                   无任何周期数据时胜率为 None
+        """
+        pos = neg = zero = 0
+        try:
+            state_path = project_root / "data" / NAV_STATE_FILE
+            if state_path.exists():
+                data = json.loads(state_path.read_text(encoding='utf-8'))
+                for e in data.get('entries', []):
+                    if str(e.get('date', '')) < start_date:
+                        continue
+                    r = float(e.get('period_return', 0) or 0)
+                    if r > 0:
+                        pos += 1
+                    elif r < 0:
+                        neg += 1
+                    else:
+                        zero += 1
+        except Exception as e:
+            logger.warning(f"[WINRATE] 读取净值序列失败: {e}")
+            return None, 0, 0, 0
+
+        total = pos + neg + zero
+        win_rate = (pos + zero) / total * 100 if total > 0 else None
+        return win_rate, pos, neg, zero
+
+    def _calc_month_return(self) -> tuple:
+        """
+        计算本月收益。
+
+        "本月第1天的累计净值"（基准口径）：
+            - 9 月（净值化起始月）特殊：基准 = 1.0000；
+            - 其他月份：基准 = 上月末最后 1 天的累计净值，
+              实现上取"本月第 1 天之前最后一条净值记录"的 nav。
+
+        本月收益 = (最新累计净值 - 基准净值) / 基准净值 × 100%
+        颜色：净值之比 ≥ 1.0000 → 红、< 1.0000 → 绿（等价于本月收益 ≥ 0 → 红）
+
+        Returns:
+            tuple: (本月收益%, 'red'|'green')；无数据时 (None, None)
+        """
+        state_path = project_root / "data" / NAV_STATE_FILE
+        try:
+            if not state_path.exists():
+                return None, None
+            data = json.loads(state_path.read_text(encoding='utf-8'))
+            entries = [e for e in data.get('entries', []) if e.get('date')]
+            if not entries:
+                return None, None
+            entries.sort(key=lambda e: str(e['date']))
+            nav_now = float(entries[-1]['nav'])                 # 最新累计净值
+            month_start = f"{str(entries[-1]['date'])[:7]}-01"  # 本月第1天
+            base_nav = None
+            for e in entries:                                   # 本月第1天之前最后一条
+                if str(e['date']) < month_start:
+                    base_nav = float(e['nav'])
+                else:
+                    break
+            if base_nav is None:                                # 9月无上月记录 → 锚点 1.0000
+                base_nav = NAV_BASE_VALUE
+            if base_nav <= 0:
+                return None, None
+            month_return_pct = (nav_now - base_nav) / base_nav * 100
+            color = 'red' if nav_now >= base_nav else 'green'
+            return month_return_pct, color
+        except Exception as e:
+            logger.warning(f"[MONTHRET] 计算本月收益失败: {e}")
+            return None, None
+
     def _send_trade_return_notification(self):
         """
         发送持仓收益率飞书通知
@@ -1221,15 +1384,14 @@ class NewsMonitorScheduler:
 
             # 读取持仓（trade文件按买入日命名）
             positions = self._read_trade_file(buy_date)
-            if not positions:
-                logger.info("ℹ️ 无持仓（空仓日），回填当日实际收益率为 0")
-                self._backfill_actual_return(buy_date, 0.0)
-                return
+            is_empty_day = not positions
 
-            # 计算每只股票收益
+            # 计算每只股票收益（空仓日跳过逐只计算，回测收益率记 0）
             total_results = []
             total_investment = 0.0
             total_current_value = 0.0
+            if is_empty_day:
+                logger.info("ℹ️ 无持仓（空仓日），回测收益率记 0.00%，累计净值照常计算")
 
             for i, pos in enumerate(positions, 1):
                 code = pos['code']
@@ -1268,16 +1430,22 @@ class NewsMonitorScheduler:
                 import time as _t
                 _t.sleep(0.5)
 
-            # 全部持仓行情都失败：无可计算收益，跳过推送
-            if not total_results:
+            # 全部持仓行情都失败：无可计算收益，跳过推送（空仓日除外，空仓日照常推送）
+            if not total_results and not is_empty_day:
                 logger.warning("⚠️ 全部持仓收盘价获取失败，跳过收益率推送")
                 return
 
             # 总仓收益率
             total_return_pct = round((total_current_value - total_investment) / total_investment * 100, 2) if total_investment > 0 else 0.0
-            total_profit = round(total_current_value - total_investment, 2)
 
             logger.info(f"\n   总仓: 投入{total_investment:,.0f}元 → 当前{total_current_value:,.0f}元 ({total_return_pct:+.2f}%)")
+
+            # 卖出日 = 今天（当前已收盘的交易日）
+            sell_date = datetime.now().strftime('%Y%m%d')
+
+            # 回写决策历史 + 写入净值序列：同一期收益，两处同时落盘
+            self._backfill_actual_return(buy_date, total_return_pct)
+            nav = self._update_and_get_cumulative_nav(total_return_pct, sell_date)
 
             # 构建飞书消息
             notifier = get_feishu_notifier()
@@ -1288,8 +1456,6 @@ class NewsMonitorScheduler:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             profit_icon = "📈" if total_return_pct >= 0 else "📉"
 
-            # 卖出日 = 今天（当前已收盘的交易日）
-            sell_date = datetime.now().strftime('%Y%m%d')
             content = f"**选股日期**: {stock_date[:4]}-{stock_date[4:6]}-{stock_date[6:]}\n"
             content += f"**买入日期**: {buy_date[:4]}-{buy_date[4:6]}-{buy_date[6:]}\n"
             content += f"**卖出日期**: {sell_date[:4]}-{sell_date[4:6]}-{sell_date[6:]}\n"
@@ -1303,7 +1469,10 @@ class NewsMonitorScheduler:
 
             sorted_results = sorted(total_results, key=lambda r: r['return_pct'], reverse=True)
             hold_detail = '/'.join([f"{r['code']}({_color_ret(r['return_pct'])})" for r in sorted_results])
-            content += f"**持仓数量**: {len(total_results)} 只，{hold_detail}\n\n"
+            if total_results:
+                content += f"**持仓数量**: {len(total_results)} 只，{hold_detail}\n\n"
+            else:
+                content += f"**持仓数量**: 0 只（空仓日）\n\n"
 
             # 收益率数字标颜色：负收益绿色、正收益红色、持平黑色
             if total_return_pct < 0:
@@ -1313,10 +1482,24 @@ class NewsMonitorScheduler:
             else:
                 ret_color = "black"
             content += f"**━━━━━━━━━━━━━━━**\n"
-            content += f"**{profit_icon} 总收益率**: <font color='{ret_color}'>{total_return_pct:+.2f}%</font>\n"
-            content += f"**总盈亏**: {total_profit:+,.0f}元\n"
-            content += f"**总投入**: {total_investment:,.0f}元\n"
-            content += f"**当前市值**: {total_current_value:,.0f}元\n"
+            content += f"**{profit_icon} 回测收益率**: <font color='{ret_color}'>{total_return_pct:+.2f}%</font>\n"
+            nav_color = 'red' if nav >= NAV_BASE_VALUE else 'green'
+            # 累计收益率 = (最新累计净值 - 1) × 100%（nav 已为 4 位小数，故与净值显示严格一致）
+            cum_return_pct = (nav - NAV_BASE_VALUE) * 100
+            content += f"**💰 累计净值**: <font color='{nav_color}'>{nav:.4f}({cum_return_pct:+.2f}%)</font>\n"
+            content += f"**📊 当前市值**: <font color='{nav_color}'>{nav * NAV_BASE_CAPITAL:.2f}</font>\n"
+            # 胜率：净值化以来的正/负/零收益次数与胜率（零收益按不亏计入分子）
+            win_rate, win_pos, win_neg, win_zero = self._calc_win_rate()
+            if win_rate is None:
+                content += f"**🎯 胜率**: —(0次正/0次负/0次零)\n"
+            else:
+                content += f"**🎯 胜率**: {win_rate:.2f}%({win_pos}次正/{win_neg}次负/{win_zero}次零)\n"
+            # 本月收益（末行）：基准 = 9月为 1.0000，其他月份为上月末最后一天净值
+            month_return_pct, month_color = self._calc_month_return()
+            if month_return_pct is None:
+                content += f"**📅 本月收益**: —\n"
+            else:
+                content += f"**📅 本月收益**: <font color='{month_color}'>{month_return_pct:+.2f}%</font>\n"
 
             # 根据收益率确定卡片颜色
             if total_return_pct < 0:
@@ -1361,10 +1544,6 @@ class NewsMonitorScheduler:
                 logger.error(f"❌ 飞书通知发送失败，HTTP状态码: {response.status_code}")
 
             logger.info("✅ 持仓收益率通知完成\n")
-
-            # ── 回填决策历史记录的实际收益率 ──
-            total_return = (total_current_value - total_investment) / total_investment * 100 if total_investment > 0 else 0.0
-            self._backfill_actual_return(buy_date, total_return)
 
         except Exception as e:
             logger.error(f"❌ 持仓收益率通知异常: {e}")

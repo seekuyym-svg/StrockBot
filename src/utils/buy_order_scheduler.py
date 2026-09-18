@@ -89,18 +89,27 @@ def check_stockpool_file() -> bool:
 
 # 大盘评分<6时使用的防守ETF列表（沪市）
 # 从 config.yaml 的 buy_order_scheduler.defensive_etfs 读取，可配置
-_DEFAULT_DEFENSIVE_ETFS = ['513850', '513050', '513120', '516310', '515170']
+# 与 config.yaml 的 buy_order_scheduler.defensive_etfs 保持一致；
+# 仅在配置读取失败时兜底，且必须显式告警（曾因静默回退到旧列表导致落盘少标的）
+_DEFAULT_DEFENSIVE_ETFS = ['513050', '513120', '516130', '516310', '518880', '162411']
 
 
 def _load_defensive_etfs() -> list:
-    """从config读取防守ETF列表，失败时用默认值"""
+    """从config读取防守ETF列表；读取失败时告警并回退到内置默认列表"""
     try:
         from src.utils.config import get_config
         etfs = get_config().buy_order_scheduler.defensive_etfs
         if etfs:
-            return list(etfs)
+            etfs = [str(c).strip() for c in etfs]
+            logger.info(f"[ETF] 防守ETF列表（{len(etfs)}只）: {etfs}")
+            return etfs
     except Exception as e:
-        logger.warning(f"[ETF] 读取防守ETF配置失败({e})，使用默认列表")
+        logger.error(f"[ETF] 读取防守ETF配置失败({e})，回退到内置默认列表")
+    logger.error(
+        f"[ETF] ⚠️ 未能读到 buy_order_scheduler.defensive_etfs → 使用内置默认列表"
+        f"（{len(_DEFAULT_DEFENSIVE_ETFS)}只）: {_DEFAULT_DEFENSIVE_ETFS}"
+        f"  ← 请确认 config.yaml 已正确配置该段！"
+    )
     return _DEFAULT_DEFENSIVE_ETFS
 
 
@@ -169,18 +178,50 @@ def generate_etf_trade_file() -> bool:
         watchlist.append({'code': code, 'market': _market_of(code), 'name': name, 'score': 0.0})
 
     results = []
+    dropped = []  # 数据异常被剔除的标的（用于数量校验告警）
     total_investment = 0
     investment_per_stock = buy_module.INITIAL_CAPITAL / len(watchlist)
     logger.info(f"[ETF] 每只ETF分配资金: {investment_per_stock:,.2f} 元")
 
+    import time as _time
     for stock in watchlist:
         code = stock['code']
-        realtime = buy_module.get_stock_realtime_data(code, stock['market'])
+
+        # 行情获取：腾讯接口偶发超时/空包，单次失败不应直接丢标的 → 最多重试3次
+        realtime = None
+        for attempt in range(1, 4):
+            try:
+                realtime = buy_module.get_stock_realtime_data(code, stock['market'])
+            except Exception as _e:
+                realtime = None
+                logger.warning(f"[ETF] {code} 行情请求异常(第{attempt}/3次): {_e}")
+            if realtime is not None:
+                break
+            logger.warning(f"[ETF] {code} 第{attempt}/3次未取到行情")
+            if attempt < 3:
+                _time.sleep(1.2)
         if realtime is None:
-            logger.warning(f"[ETF] {code} 无法获取实时数据，跳过")
+            dropped.append(f"{code}(行情获取失败)")
+            logger.error(f"[ETF] ❌ {code} 重试3次仍取不到行情，本次不买该ETF")
             continue
+
         open_price = realtime['open_price']
+        if open_price <= 0:
+            # 9:26 刚开市，流动性差的ETF可能还没有今开价 → 退回当前价（否则 shares=0 会被静默剔除）
+            if realtime.get('current_price', 0) > 0:
+                logger.warning(f"[ETF] ⚠️ {code} 今开价缺失(0)，改用当前价 {realtime['current_price']} 计算")
+                open_price = realtime['current_price']
+            else:
+                dropped.append(f"{code}(今开与当前价均无效)")
+                logger.error(f"[ETF] ❌ {code} 今开价与当前价均无效，本次不买该ETF")
+                continue
+
         shares = buy_module.calculate_buy_shares(open_price, investment_per_stock, code)
+        if shares <= 0:
+            dropped.append(f"{code}(可买股数为0)")
+            logger.error(f"[ETF] ❌ {code} 可买股数为0（价格{open_price}，单只资金{investment_per_stock:,.2f}），本次不买该ETF")
+            continue
+
         actual_investment = shares * open_price
         results.append({
             'code': code,
@@ -195,16 +236,28 @@ def generate_etf_trade_file() -> bool:
         total_investment += actual_investment
         logger.info(f"[ETF] {code}({stock['name']}) 开盘{open_price:.3f} 买入{shares}股 金额{actual_investment:,.2f}元")
 
+    expected = len(watchlist)
     if results:
         # ETF价格保留3位小数
         buy_module.save_trade_report(results, total_investment, price_decimals=3)
-        logger.info(f"[ETF] trade 文件已生成（{len(results)}只ETF，总投入{total_investment:,.2f}元）")
+        logger.info(f"[ETF] trade 文件已生成（{len(results)}/{expected}只ETF，总投入{total_investment:,.2f}元）")
+        # 数量校验：少一只意味着那份资金闲置，过去是静默发生的 → 必须显式告警
+        if len(results) != expected:
+            logger.error(f"[ETF] ⚠️ 期望{expected}只、实际仅{len(results)}只，缺失: {dropped}")
+            _send_alert_notification(
+                "⚠️ 防守ETF未买齐",
+                f"**本应买入 {expected} 只防守ETF，实际只生成 {len(results)} 只。**\n"
+                f"**缺失**: {', '.join(dropped) if dropped else '未知'}\n"
+                f"**常见原因**: 腾讯行情接口失败；或该ETF无今开价（流动性差/停牌）\n"
+                f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**ETF列表**: {', '.join(DEFENSIVE_ETFS)}"
+            )
         return True
     else:
         logger.warning("[ETF] 所有ETF均获取失败，未生成 trade 文件")
         _send_alert_notification(
             "⚠️ 买入委托计算失败",
-            "**大盘评分 < 6，本应使用防守ETF生成买入委托，但5只ETF行情全部获取失败。**\n"
+            f"**大盘评分 < 6，本应使用防守ETF生成买入委托，但全部{expected}只ETF行情均获取失败。**\n"
             f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**ETF列表**: {', '.join(DEFENSIVE_ETFS)}"
         )
