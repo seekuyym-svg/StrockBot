@@ -1,0 +1,32 @@
+# StockBot 依赖包 - 精确版本锁定
+# 生成方式: pip freeze > requirements_locked.txt
+# 用于确保开发和生产环境完全一致
+
+# Web框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# 数据库
+sqlalchemy==2.0.25
+
+# 数据处理
+pandas==2.2.0
+numpy==1.26.3
+
+# 配置和校验
+pyyaml==6.0.1
+pydantic==2.5.3
+
+# 日志
+loguru==0.7.2
+
+# 定时任务
+apscheduler==3.10.4
+
+# HTTP客户端
+aiohttp==3.9.1
+requests==2.31.0
+
+# 数据源
+baostock==0.8.8
+akshare==1.12.0

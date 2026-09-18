@@ -8,3 +8,7 @@ backtest/score_stockpool.py
 docs/
 # DSH 插件依赖链接（junction 指向全局 dsh 的 node_modules，避免卷入仓库）
 node_modules/
+# 本地 Python 环境（uv 创建的虚拟环境、缓存与托管解释器，不入仓库）
+.venv/
+.uv-cache/
+.uv-python/

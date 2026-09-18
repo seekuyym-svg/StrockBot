@@ -30,6 +30,14 @@ NAV_BASE_CAPITAL = 100.0
 NAV_STATE_FILE = "cumulative_nav.json"
 # 胜率统计起始日：此日之前尚未净值化，不纳入统计
 WIN_RATE_START_DATE = "2026-09-14"
+# 月内位置标记（tag）的人工锁定值：这些日期的 tag 恒为指定值，不参与自动计算。
+# 2026-09-11 是净值序列的起始日（锚点）：按交易日历它不是 9 月首个交易日，
+# 但作为净值序列的第一天，语义上标为 first —— 手工设定值，禁止被覆盖。
+TAG_FIXED = {NAV_BASE_DATE: 'first'}
+# 是否用交易日历重算"文件中已有条目"的 tag：
+# False（默认）= 保留文件里已有的 tag，人工修正优先，只有新增日期才自动计算；
+# True = 全量按交易日历重算（TAG_FIXED 仍优先，不受影响）。
+TAG_RECOMPUTE_EXISTING = False
 
 
 class NewsMonitorScheduler:
@@ -1211,7 +1219,8 @@ class NewsMonitorScheduler:
         except Exception as e:
             logger.warning(f"[HISTORY] 回填收益率失败: {e}")
 
-    def _update_and_get_cumulative_nav(self, current_return_pct: float, sell_date: str) -> float:
+    def _update_and_get_cumulative_nav(self, current_return_pct: float = None,
+                                       sell_date: str = None, recompute: bool = False) -> float:
         """
         更新并返回累计净值（净值化），并持久化到 data/cumulative_nav.json。
 
@@ -1220,44 +1229,93 @@ class NewsMonitorScheduler:
 
         记录日期 = 卖出日（当日）。每个交易日写入一笔，即使空仓收益为 0。
         - 与回写 buy_decision_history.txt 属同一期、相邻落盘，不从历史回溯补齐；
-        - 每次运行：写入当期收益（幂等，同日重跑按最新收益重算）；
-        - 序列持久化，重启后可直接读取，不依赖内存状态。
+        - **默认增量更新**：只更新/追加"当期"这一条，历史条目原样保留（含人工 tag 与自定义字段），
+          净值 = 上一条净值的复利递推，不重算历史；
+        - **全量重算**（维护）：recompute=True（命令行 `--recompute-nav`）时忽略当期收益，
+          按文件里已有的 period_return 从锚点重新累乘，刷新全部 nav；
+        - tag 优先级：TAG_FIXED 人工锁定 > 文件里已有的 tag > 按交易日历自动计算；
+        - 落盘采用「写临时文件 + 原子替换」，避免写到一半终止而损坏整条序列。
 
         Args:
-            current_return_pct: 当期收益率(%)（1.53 表示 +1.53%）
-            sell_date: 卖出日（当日）YYYYMMDD
+            current_return_pct: 当期收益率(%)（1.53 表示 +1.53%）；recompute=True 时忽略
+            sell_date: 卖出日（当日）YYYYMMDD；recompute=True 时忽略
+            recompute: True = 全量重算 nav（维护模式）
 
         Returns:
             float: 当前累计净值（保留 4 位小数）
         """
         base_date = NAV_BASE_DATE
-        cur_fmt = f"{sell_date[:4]}-{sell_date[4:6]}-{sell_date[6:8]}"
         state_path = project_root / "data" / NAV_STATE_FILE
 
-        # 1. 载入持久化净值序列（date -> 该期收益率%）
-        period_returns = {}
+        # 1. 读取原始序列：保留每条 entry 的完整字段（含人工 tag 与自定义字段）
+        entries = []
         if state_path.exists():
             try:
                 data = json.loads(state_path.read_text(encoding='utf-8'))
-                for e in data.get('entries', []):
-                    period_returns[e['date']] = float(e['period_return'])
+                entries = [e for e in data.get('entries', [])
+                           if isinstance(e, dict) and e.get('date')]
             except Exception as e:
-                logger.warning(f"[NAV] 读取净值状态失败，将重建: {e}")
+                logger.warning(f"[NAV] 读取净值状态失败，将按新增处理: {e}")
+        entries.sort(key=lambda e: str(e['date']))
 
-        # 2. 写入当期收益（卖出日 = 今日），与回写 buy_decision_history.txt 同属一期
-        if cur_fmt > base_date:
-            period_returns[cur_fmt] = float(current_return_pct)
+        # 2. 全量重算模式（维护用）：忽略当期收益，只按文件里已有的 period_return 重算 nav
+        if recompute:
+            nav = NAV_BASE_VALUE
+            for e in entries:
+                nav *= (1 + float(e.get('period_return', 0) or 0) / 100.0)
+                e['nav'] = round(nav, 4)
+                e['tag'] = self._resolve_tag(str(e['date']), e.get('tag'))
+            self._persist_nav_series(state_path, base_date, entries)
+            logger.info(f"[NAV] 全量重算完成：{len(entries)} 期，最新净值 {nav:.4f}")
+            return round(nav, 4)
 
-        # 3. 按日期顺序复利累乘
-        nav = NAV_BASE_VALUE
-        rows = []
-        for d in sorted(period_returns.keys()):
-            nav *= (1 + period_returns[d] / 100.0)
-            rows.append((d, period_returns[d], nav))
+        # 3. 增量模式：只动"当期"这一条，历史条目不动
+        if sell_date is None:
+            sell_date = datetime.now().strftime('%Y%m%d')
+        cur_fmt = f"{sell_date[:4]}-{sell_date[4:6]}-{sell_date[6:8]}"
+        if cur_fmt <= base_date:
+            logger.info(f"[NAV] {cur_fmt} 未晚于锚点 {base_date}，不写入序列")
+            return round(float(entries[-1].get('nav', NAV_BASE_VALUE)) if entries else NAV_BASE_VALUE, 4)
 
-        # 4. 持久化
-        #    注意：JSON 数字无法保留尾随零（json.dumps(1.0) → "1.0"），
-        #    故手写序列化，令 period_return 固定 2 位小数、nav 固定 4 位小数。
+        r = float(current_return_pct)
+        idx = next((i for i, e in enumerate(entries) if str(e['date']) == cur_fmt), -1)
+        if idx >= 0:                                    # 同日重跑：更新当条
+            row = entries[idx]
+            action = "更新"
+        else:                                           # 新日期：末尾追加
+            row = {'date': cur_fmt}
+            entries.append(row)
+            idx = len(entries) - 1
+            action = "追加"
+
+        prev_nav = float(entries[idx - 1].get('nav', NAV_BASE_VALUE)) if idx > 0 else NAV_BASE_VALUE
+        row['period_return'] = r
+        row['nav'] = round(prev_nav * (1 + r / 100.0), 4)
+        row['tag'] = self._resolve_tag(cur_fmt, row.get('tag'))
+        nav = row['nav']
+
+        self._persist_nav_series(state_path, base_date, entries)
+        logger.info(f"[NAV] {action} {cur_fmt}：收益 {r:+.2f}% → 净值 {nav:.4f}（共 {len(entries)} 期）")
+        return round(nav, 4)
+
+    def _resolve_tag(self, date_fmt: str, existing=None) -> str:
+        """tag 优先级：TAG_FIXED 人工锁定 > 文件里已有（人工修正优先） > 按交易日历计算"""
+        if date_fmt in TAG_FIXED:
+            return TAG_FIXED[date_fmt]
+        if not TAG_RECOMPUTE_EXISTING:
+            t = str(existing or '').strip()
+            if t in ('first', 'last', 'normal'):
+                return t
+        return self._month_position_tag(date_fmt)
+
+    def _persist_nav_series(self, state_path, base_date: str, entries: list):
+        """
+        把手写序列化结果**原子地**写回文件（先写 .tmp，再替换）。
+
+        已知字段固定小数位（period_return 2 位、nav 4 位，保留尾随零）；
+        条目里其它自定义字段按原样透传，不会丢。
+        """
+        known = ('date', 'period_return', 'nav', 'tag')
         try:
             lines = [
                 '{',
@@ -1265,21 +1323,74 @@ class NewsMonitorScheduler:
                 f'  "base_value": {NAV_BASE_VALUE:.4f},',
                 '  "entries": [',
             ]
-            for i, (d, r, v) in enumerate(rows):
-                tail = ',' if i < len(rows) - 1 else ''
+            for i, e in enumerate(entries):
+                extras = [k for k in e if k not in known]
                 lines.append('    {')
-                lines.append(f'      "date": "{d}",')
-                lines.append(f'      "period_return": {r:.2f},')
-                lines.append(f'      "nav": {v:.4f}')
-                lines.append('    }' + tail)
+                lines.append(f'      "date": "{e["date"]}",')
+                lines.append(f'      "period_return": {float(e.get("period_return", 0) or 0):.2f},')
+                lines.append(f'      "nav": {float(e.get("nav", NAV_BASE_VALUE)):.4f},')
+                lines.append(f'      "tag": "{e.get("tag", "normal")}"' + (',' if extras else ''))
+                for j, k in enumerate(extras):
+                    tail = ',' if j < len(extras) - 1 else ''
+                    lines.append(f'      "{k}": {json.dumps(e[k], ensure_ascii=False)}' + tail)
+                lines.append('    }' + (',' if i < len(entries) - 1 else ''))
             lines.append('  ]')
             lines.append('}')
-            state_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-            logger.info(f"[NAV] 累计净值已更新: {nav:.4f}（共 {len(rows)} 期）")
+            tmp_path = state_path.with_name(state_path.name + '.tmp')
+            tmp_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            tmp_path.replace(state_path)          # 原子替换
         except Exception as e:
             logger.warning(f"[NAV] 持久化净值失败: {e}")
 
-        return round(nav, 4)
+    def _month_position_tag(self, date_fmt: str) -> str:
+        """
+        标注某个交易日在所属月份中的位置（用于快速定位「本月收益率」的基准）。
+
+        基于交易日历相邻日是否跨月判断：
+            first  = 该月第 1 个交易日（上一个交易日属于上个月）
+            last   = 该月最后 1 个交易日（下一个交易日属于下个月）
+            normal = 其余中间交易日
+
+        注：若某月只有 1 个交易日（first 与 last 重合），优先标 first；
+            此时 _calc_month_return 会退化为"本月第 1 天之前最后一条记录"。
+
+        Args:
+            date_fmt: 日期 YYYY-MM-DD（或 YYYYMMDD）
+
+        Returns:
+            str: 'first' | 'last' | 'normal'
+        """
+        try:
+            d = pd.to_datetime(date_fmt)
+        except Exception:
+            return 'normal'
+
+        cache = self.trading_days_cache
+        if not cache:
+            # 降级（无日历）：用"工作日"近似交易日
+            first_wd = d.replace(day=1)
+            while first_wd.weekday() >= 5:
+                first_wd += timedelta(days=1)
+            last_day = (d.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+            last_wd = last_day
+            while last_wd.weekday() >= 5:
+                last_wd -= timedelta(days=1)
+            if d.normalize() == first_wd.normalize():
+                return 'first'
+            if d.normalize() == last_wd.normalize():
+                return 'last'
+            return 'normal'
+
+        prev_days = [x for x in cache if x < d]
+        next_days = [x for x in cache if x > d]
+        prev_d = max(prev_days) if prev_days else None
+        next_d = min(next_days) if next_days else None
+
+        if prev_d is None or (prev_d.year, prev_d.month) != (d.year, d.month):
+            return 'first'
+        if next_d is None or (next_d.year, next_d.month) != (d.year, d.month):
+            return 'last'
+        return 'normal'
 
     def _calc_win_rate(self, start_date: str = WIN_RATE_START_DATE) -> tuple:
         """
@@ -1323,18 +1434,18 @@ class NewsMonitorScheduler:
 
     def _calc_month_return(self) -> tuple:
         """
-        计算本月收益。
+        计算本月收益率。
 
         "本月第1天的累计净值"（基准口径）：
             - 9 月（净值化起始月）特殊：基准 = 1.0000；
-            - 其他月份：基准 = 上月末最后 1 天的累计净值，
-              实现上取"本月第 1 天之前最后一条净值记录"的 nav。
+            - 其他月份：基准 = 上月末最后 1 天的累计净值，即上月 tag=last 那条记录的 nav
+              （缺失该 tag 时退化为"本月第 1 天之前最后一条净值记录"）。
 
-        本月收益 = (最新累计净值 - 基准净值) / 基准净值 × 100%
-        颜色：净值之比 ≥ 1.0000 → 红、< 1.0000 → 绿（等价于本月收益 ≥ 0 → 红）
+        本月收益率 = (最新累计净值 - 基准净值) / 基准净值 × 100%
+        颜色：净值之比 ≥ 1.0000 → 红、< 1.0000 → 绿（等价于本月收益率 ≥ 0 → 红）
 
         Returns:
-            tuple: (本月收益%, 'red'|'green')；无数据时 (None, None)
+            tuple: (本月收益率%, 'red'|'green')；无数据时 (None, None)
         """
         state_path = project_root / "data" / NAV_STATE_FILE
         try:
@@ -1347,12 +1458,16 @@ class NewsMonitorScheduler:
             entries.sort(key=lambda e: str(e['date']))
             nav_now = float(entries[-1]['nav'])                 # 最新累计净值
             month_start = f"{str(entries[-1]['date'])[:7]}-01"  # 本月第1天
+            prev = [e for e in entries if str(e['date']) < month_start]
+            # 上月末 = 本月1日往前一天所在月份
+            prev_month = (pd.to_datetime(month_start) - timedelta(days=1)).strftime('%Y-%m')
             base_nav = None
-            for e in entries:                                   # 本月第1天之前最后一条
-                if str(e['date']) < month_start:
+            for e in reversed(prev):                            # 优先用「上月末」tag=last 快速定位
+                if str(e['date'])[:7] == prev_month and str(e.get('tag', '')) == 'last':
                     base_nav = float(e['nav'])
-                else:
                     break
+            if base_nav is None and prev:                       # 兜底：本月初之前最后一条
+                base_nav = float(prev[-1]['nav'])
             if base_nav is None:                                # 9月无上月记录 → 锚点 1.0000
                 base_nav = NAV_BASE_VALUE
             if base_nav <= 0:
@@ -1361,7 +1476,7 @@ class NewsMonitorScheduler:
             color = 'red' if nav_now >= base_nav else 'green'
             return month_return_pct, color
         except Exception as e:
-            logger.warning(f"[MONTHRET] 计算本月收益失败: {e}")
+            logger.warning(f"[MONTHRET] 计算本月收益率失败: {e}")
             return None, None
 
     def _send_trade_return_notification(self):
@@ -1483,23 +1598,24 @@ class NewsMonitorScheduler:
                 ret_color = "black"
             content += f"**━━━━━━━━━━━━━━━**\n"
             content += f"**{profit_icon} 回测收益率**: <font color='{ret_color}'>{total_return_pct:+.2f}%</font>\n"
+            # 本月收益率：基准 = 9月为 1.0000，其他月份为上月末最后一天净值（tag=last）
+            month_return_pct, month_color = self._calc_month_return()
+            if month_return_pct is None:
+                content += f"**📅 本月收益率**: —\n"
+            else:
+                content += f"**📅 本月收益率**: <font color='{month_color}'>{month_return_pct:+.2f}%</font>\n"
             nav_color = 'red' if nav >= NAV_BASE_VALUE else 'green'
             # 累计收益率 = (最新累计净值 - 1) × 100%（nav 已为 4 位小数，故与净值显示严格一致）
             cum_return_pct = (nav - NAV_BASE_VALUE) * 100
             content += f"**💰 累计净值**: <font color='{nav_color}'>{nav:.4f}({cum_return_pct:+.2f}%)</font>\n"
-            content += f"**📊 当前市值**: <font color='{nav_color}'>{nav * NAV_BASE_CAPITAL:.2f}</font>\n"
-            # 胜率：净值化以来的正/负/零收益次数与胜率（零收益按不亏计入分子）
+            # 当前市值：单位「万」（净值 × 100，基准 100 万），固定系统色、不随涨跌变色
+            content += f"**📊 当前市值**: {nav * NAV_BASE_CAPITAL:.2f} W\n"
+            # 胜率（末行）：净值化以来的正/负/零收益次数与胜率（零收益按不亏计入分子）
             win_rate, win_pos, win_neg, win_zero = self._calc_win_rate()
             if win_rate is None:
                 content += f"**🎯 胜率**: —(0次正/0次负/0次零)\n"
             else:
                 content += f"**🎯 胜率**: {win_rate:.2f}%({win_pos}次正/{win_neg}次负/{win_zero}次零)\n"
-            # 本月收益（末行）：基准 = 9月为 1.0000，其他月份为上月末最后一天净值
-            month_return_pct, month_color = self._calc_month_return()
-            if month_return_pct is None:
-                content += f"**📅 本月收益**: —\n"
-            else:
-                content += f"**📅 本月收益**: <font color='{month_color}'>{month_return_pct:+.2f}%</font>\n"
 
             # 根据收益率确定卡片颜色
             if total_return_pct < 0:
@@ -1625,3 +1741,29 @@ def test_news_monitor(target_date: str = None):
     """
     scheduler = get_news_monitor_scheduler()
     scheduler.run_once(target_date)
+
+
+def main():
+    """
+    净值序列维护入口。
+
+    日常 21:00 的更新是**增量**的，不需要任何参数；
+    只有需要修复/重建历史（改了净值计算逻辑、修正历史收益等）时才用 --recompute-nav 全量重算。
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description="StockBot 净值序列维护工具")
+    parser.add_argument(
+        "--recompute-nav", action="store_true",
+        help="全量重算 data/cumulative_nav.json 的所有 nav（维护用）")
+    args = parser.parse_args()
+
+    if args.recompute_nav:
+        scheduler = NewsMonitorScheduler()
+        nav = scheduler._update_and_get_cumulative_nav(recompute=True)
+        logger.info(f"[NAV] 全量重算结束，当前净值 = {nav}")
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

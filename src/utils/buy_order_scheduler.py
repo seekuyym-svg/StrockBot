@@ -91,7 +91,7 @@ def check_stockpool_file() -> bool:
 # 运行时从 config.yaml 的 buy_order_scheduler.defensive_etfs 读取；
 # 下面的内置列表仅在该配置读取失败时兜底，且必须显式告警
 # （曾因静默回退到旧列表导致落盘少标的）。务必与 config.yaml 保持一致。
-_DEFAULT_DEFENSIVE_ETFS = ['513050', '513120', '513850', '516130', '516310', '518880', '162411']
+_DEFAULT_DEFENSIVE_ETFS = ['513050', '513120', '516130', '516310', '518880', '588080', '162411']
 
 
 def _load_defensive_etfs() -> list:
