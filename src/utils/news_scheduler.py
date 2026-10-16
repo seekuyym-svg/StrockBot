@@ -39,6 +39,19 @@ TAG_FIXED = {NAV_BASE_DATE: 'first'}
 # True = 全量按交易日历重算（TAG_FIXED 仍优先，不受影响）。
 TAG_RECOMPUTE_EXISTING = False
 
+# ── 融资余额（前日）分层 ──
+# 数据来源：data/market_emotion.txt 的 margin_balance 列（单位：亿元）。
+# 该值由 backtest/fetch_market_emotion.py 抓取后回填到"数值所属交易日"的行，
+# 官方口径滞后一个交易日公布，故当日 21:00 推送时最新已公布值即为"上一交易日"的数值。
+MARGIN_BALANCE_FILE = "market_emotion.txt"
+# (下限阈值亿, 档位标签, 飞书 lark_md 字体颜色)；颜色为 None 表示用默认色（"正常颜色"）
+MARGIN_BALANCE_LEVELS = (
+    (30000, "超高", "red"),
+    (25000, "过高", "orange"),
+    (20000, "偏高", "yellow"),
+    (0,     "合理", None),
+)
+
 
 class NewsMonitorScheduler:
     """股票资讯监控调度器"""
@@ -699,6 +712,81 @@ class NewsMonitorScheduler:
             logger.warning(f"⚠️ 读取 signal_history.json 失败: {e}")
             return {}
 
+    def _read_prev_margin_balance(self) -> tuple:
+        """
+        读取上一交易日的全市场融资余额（亿元）
+
+        数据来源：data/market_emotion.txt 的 margin_balance 列。
+        该数值回填在"数值所属交易日"的行上，官方口径滞后一个交易日公布，
+        因此当日 21:00 运行时文件中最新已公布值即为「上一交易日」的数值。
+        为稳妥起见，取**严格早于今天**的最新一条；若不存在则退化为最新一条。
+
+        Returns:
+            tuple: (date_str, value)，取不到时返回 (None, None)
+        """
+        filepath = project_root / "data" / MARGIN_BALANCE_FILE
+        if not filepath.exists():
+            logger.warning(f"⚠️ {MARGIN_BALANCE_FILE} 不存在，融资余额无法展示")
+            return None, None
+
+        try:
+            lines = filepath.read_text(encoding='utf-8').splitlines()
+        except Exception as e:
+            logger.warning(f"⚠️ 读取 {MARGIN_BALANCE_FILE} 失败: {e}")
+            return None, None
+
+        if len(lines) < 2:
+            return None, None
+
+        header = [h.strip() for h in lines[0].split(',')]
+        if 'margin_balance' not in header:
+            logger.warning(f"⚠️ {MARGIN_BALANCE_FILE} 缺少 margin_balance 列，融资余额无法展示")
+            return None, None
+        col = header.index('margin_balance')
+
+        candidates = []  # [(date, value)]，按文件顺序（时间升序）
+        for line in lines[1:]:
+            parts = line.split(',')
+            if len(parts) <= col:
+                continue
+            raw = parts[col].strip()
+            if not raw:
+                continue
+            try:
+                candidates.append((parts[0].strip(), float(raw)))
+            except ValueError:
+                continue
+
+        if not candidates:
+            logger.warning(f"⚠️ {MARGIN_BALANCE_FILE} 中暂无已公布的融资余额")
+            return None, None
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        prev = [c for c in candidates if c[0] < today]
+        return prev[-1] if prev else candidates[-1]
+
+    def _format_margin_balance_line(self) -> str:
+        """
+        构建大盘环境信号中的「融资余额(前日)」展示行
+
+        Returns:
+            str: 形如 `**融资余额(前日)**: 25081.23亿 | <font color='orange'>过高</font>\\n\\n`
+        """
+        date_str, value = self._read_prev_margin_balance()
+        if value is None:
+            logger.warning("⚠️ 未取到融资余额（前日），本次推送展示「暂无数据」")
+            return "**融资余额(前日)**: 暂无数据\n\n"
+
+        level, color = MARGIN_BALANCE_LEVELS[-1][1], MARGIN_BALANCE_LEVELS[-1][2]
+        for threshold, name, c in MARGIN_BALANCE_LEVELS:
+            if value >= threshold:
+                level, color = name, c
+                break
+
+        level_md = f"<font color='{color}'>{level}</font>" if color else level
+        logger.info(f"💰 融资余额(前日 {date_str}): {value:.2f}亿 → {level}")
+        return f"**融资余额(前日)**: {value:.2f}亿 | {level_md}\n\n"
+
     def _send_market_signal_notification(self):
         """
         发送大盘环境信号飞书通知
@@ -739,7 +827,10 @@ class NewsMonitorScheduler:
                 level_str = f"活跃度{vol_level}" if vol_level else ""
                 detail_str = f" ({vol_detail})" if vol_detail else ""
                 level_part = f" | {level_str}" if level_str else ""
-                content += f"**沪深市场成交额**: {market_volume:.0f}亿{level_part}{detail_str}\n\n"
+                content += f"**沪深市场成交额**: {market_volume:.0f}亿{level_part}{detail_str}\n"
+
+            # 融资余额(前日)：官方口径滞后一个交易日公布，取上一交易日已公布的数值
+            content += self._format_margin_balance_line()
 
             # 不通过原因
             if reasons:
@@ -1265,6 +1356,12 @@ class NewsMonitorScheduler:
                 nav *= (1 + float(e.get('period_return', 0) or 0) / 100.0)
                 e['nav'] = round(nav, 4)
                 e['tag'] = self._resolve_tag(str(e['date']), e.get('tag'))
+            # 顺带刷新月末条目的 month_return（修正历史收益后自动自愈）
+            for e in entries:
+                if str(e.get('tag', '')) == 'last':
+                    mr, _ = self._calc_month_return(entries=entries, upto=str(e['date']))
+                    if mr is not None:
+                        e['month_return'] = round(mr, 2)
             self._persist_nav_series(state_path, base_date, entries)
             logger.info(f"[NAV] 全量重算完成：{len(entries)} 期，最新净值 {nav:.4f}")
             return round(nav, 4)
@@ -1294,6 +1391,12 @@ class NewsMonitorScheduler:
         row['tag'] = self._resolve_tag(cur_fmt, row.get('tag'))
         nav = row['nav']
 
+        # 月末（tag=last）额外把当月收益率一并落盘，便于回溯；非月末不写该字段
+        if row['tag'] == 'last':
+            mr, _ = self._calc_month_return(entries=entries, upto=cur_fmt)
+            if mr is not None:
+                row['month_return'] = round(mr, 2)
+
         self._persist_nav_series(state_path, base_date, entries)
         logger.info(f"[NAV] {action} {cur_fmt}：收益 {r:+.2f}% → 净值 {nav:.4f}（共 {len(entries)} 期）")
         return round(nav, 4)
@@ -1315,7 +1418,7 @@ class NewsMonitorScheduler:
         已知字段固定小数位（period_return 2 位、nav 4 位，保留尾随零）；
         条目里其它自定义字段按原样透传，不会丢。
         """
-        known = ('date', 'period_return', 'nav', 'tag')
+        known = ('date', 'period_return', 'nav', 'tag', 'month_return')
         try:
             lines = [
                 '{',
@@ -1324,15 +1427,21 @@ class NewsMonitorScheduler:
                 '  "entries": [',
             ]
             for i, e in enumerate(entries):
-                extras = [k for k in e if k not in known]
+                body = [
+                    f'      "date": "{e["date"]}"',
+                    f'      "period_return": {float(e.get("period_return", 0) or 0):.2f}',
+                    f'      "nav": {float(e.get("nav", NAV_BASE_VALUE)):.4f}',
+                    f'      "tag": "{e.get("tag", "normal")}"',
+                ]
+                # 月末条目附带本月收益率（固定 2 位小数）
+                if e.get('month_return') is not None:
+                    body.append(f'      "month_return": {float(e["month_return"]):.2f}')
+                # 其余自定义字段原样透传，不丢
+                for k in [k for k in e if k not in known]:
+                    body.append(f'      "{k}": {json.dumps(e[k], ensure_ascii=False)}')
                 lines.append('    {')
-                lines.append(f'      "date": "{e["date"]}",')
-                lines.append(f'      "period_return": {float(e.get("period_return", 0) or 0):.2f},')
-                lines.append(f'      "nav": {float(e.get("nav", NAV_BASE_VALUE)):.4f},')
-                lines.append(f'      "tag": "{e.get("tag", "normal")}"' + (',' if extras else ''))
-                for j, k in enumerate(extras):
-                    tail = ',' if j < len(extras) - 1 else ''
-                    lines.append(f'      "{k}": {json.dumps(e[k], ensure_ascii=False)}' + tail)
+                lines.extend(x + ',' for x in body[:-1])
+                lines.append(body[-1])
                 lines.append('    }' + (',' if i < len(entries) - 1 else ''))
             lines.append('  ]')
             lines.append('}')
@@ -1432,7 +1541,7 @@ class NewsMonitorScheduler:
         win_rate = (pos + zero) / total * 100 if total > 0 else None
         return win_rate, pos, neg, zero
 
-    def _calc_month_return(self) -> tuple:
+    def _calc_month_return(self, entries: list = None, upto: str = None) -> tuple:
         """
         计算本月收益率。
 
@@ -1441,34 +1550,45 @@ class NewsMonitorScheduler:
             - 其他月份：基准 = 上月末最后 1 天的累计净值，即上月 tag=last 那条记录的 nav
               （缺失该 tag 时退化为"本月第 1 天之前最后一条净值记录"）。
 
-        本月收益率 = (最新累计净值 - 基准净值) / 基准净值 × 100%
+        本月收益率 = (当刻累计净值 - 基准净值) / 基准净值 × 100%
         颜色：净值之比 ≥ 1.0000 → 红、< 1.0000 → 绿（等价于本月收益率 ≥ 0 → 红）
+
+        Args:
+            entries: 内存中的净值序列（写入过程中可直接传入，避免读盘）；None 时从文件读取
+            upto:    以哪一天的净值作为"当刻"（回溯重算历史月份时用）；None 时取序列最后一条
 
         Returns:
             tuple: (本月收益率%, 'red'|'green')；无数据时 (None, None)
         """
-        state_path = project_root / "data" / NAV_STATE_FILE
         try:
-            if not state_path.exists():
-                return None, None
-            data = json.loads(state_path.read_text(encoding='utf-8'))
-            entries = [e for e in data.get('entries', []) if e.get('date')]
+            if entries is None:
+                state_path = project_root / "data" / NAV_STATE_FILE
+                if not state_path.exists():
+                    return None, None
+                data = json.loads(state_path.read_text(encoding='utf-8'))
+                entries = [e for e in data.get('entries', []) if e.get('date')]
+            entries = sorted([e for e in entries if e.get('date')], key=lambda e: str(e['date']))
             if not entries:
                 return None, None
-            entries.sort(key=lambda e: str(e['date']))
-            nav_now = float(entries[-1]['nav'])                 # 最新累计净值
-            month_start = f"{str(entries[-1]['date'])[:7]}-01"  # 本月第1天
+            if upto is not None:
+                cur = next((e for e in entries if str(e['date']) == str(upto)), None)
+                if cur is None:
+                    return None, None
+            else:
+                cur = entries[-1]
+            nav_now = float(cur['nav'])                          # 当刻累计净值
+            month_start = f"{str(cur['date'])[:7]}-01"           # 本月第1天
             prev = [e for e in entries if str(e['date']) < month_start]
             # 上月末 = 本月1日往前一天所在月份
             prev_month = (pd.to_datetime(month_start) - timedelta(days=1)).strftime('%Y-%m')
             base_nav = None
-            for e in reversed(prev):                            # 优先用「上月末」tag=last 快速定位
+            for e in reversed(prev):                             # 优先用「上月末」tag=last 快速定位
                 if str(e['date'])[:7] == prev_month and str(e.get('tag', '')) == 'last':
                     base_nav = float(e['nav'])
                     break
-            if base_nav is None and prev:                       # 兜底：本月初之前最后一条
+            if base_nav is None and prev:                        # 兜底：本月初之前最后一条
                 base_nav = float(prev[-1]['nav'])
-            if base_nav is None:                                # 9月无上月记录 → 锚点 1.0000
+            if base_nav is None:                                 # 9月无上月记录 → 锚点 1.0000
                 base_nav = NAV_BASE_VALUE
             if base_nav <= 0:
                 return None, None
