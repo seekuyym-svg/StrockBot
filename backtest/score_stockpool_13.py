@@ -9,8 +9,23 @@
    - 缩量/正常（volume_ratio < 1.05）→ 选 13分 ∩ 综合分≤66（错杀价值）
    - 温和放量（1.05 ≤ volume_ratio ≤ 1.15）→ 选 13分 ∩ 综合分67~69（强者恒强，剔除70过热）
    - 过热（volume_ratio > 1.15）→ 空仓（与 buy_decision 评分过热扣分口径一致，不追高）
+
+   ⚠️ 输入口径（2026-10-19 起变更）：
+   本脚本读的 `_all` 文件已由 config 的 `backtest.min_score / max_score` 截断。
+   自 2026-10-19 起该区间由 [65-70] 放宽为 **[60-70]**，因此：
+     · 「缩量档 score ≤ 66」实际覆盖 **60-66**，新增的 **60-64 段会自动纳入**；
+     · 「放量档 67-69」与「剔除70过热」语义不变（70 仍在输入区间内）；
+     · **本脚本代码无需修改**，若日后再次调整 min_score 也会自动跟随。
+   实证依据（109天/35,032条历史重建）：门控日为真实下单日，60-64 是唯一日均收益非负的区间
+   （+0.048%/日），故放宽下界、保持上界 70 是数据支持的方向。
 4. 有多少选多少，不补足（宁可少选/空着，不买凑数的票）
 5. 输出 stockpool_YYYYMMDD.txt（直接作为选股池）
+6. **无论选出几只都生成池文件**（0 只时只写注释头，即"空池文件"）：
+   目的是让每天的池文件都存在，从而区分两种状态——
+     · 空池文件 = 当天跑了、但当日空仓 → 回测记 +0.00#dyn
+     · 文件缺失 = 当天忘记跑
+   消费端 buy_order_scheduler.check_stockpool_file() 以「数据行数≥1」判定有票，
+   故空池文件会被正确识别为【空仓】。
 
 依据（全样本回测，见 backtest/FINAL_PLAN_v2026.md）：
 - 动态分档(缩量选≤66 / 温和放量选67-69剔70 / 量比>1.15空仓)优于静态单档
@@ -113,7 +128,9 @@ def process_date(date_str: str, override_vol: float = None):
         mode_desc = f'放量(vol_ratio={vol_ratio:.2f},1.05~1.15评分尚可) → 选高分13分(综合分67-69)'
         filtered = [r for r in records if int(r['pref']) == 13 and 67 <= r['score'] <= 69]
     else:
-        # 缩量/正常(评分2-3分健康)：错杀价值 → 低分13分（≤66）
+        # 缩量/正常(评分2-3分健康)：错杀价值 → 低分13分
+        # 注：输入 _all 已按 config 截断（2026-10-19 起为 [60-70]），故 ≤66 实际等于 60-66，
+        #     其中 60-64 为放宽下界后新增纳入的段
         mode = 'low'
         vr = vol_ratio if vol_ratio is not None else 'N/A'
         mode_desc = f'缩量/正常(vol_ratio={vr}) → 选低分13分(综合分≤66)'
@@ -124,29 +141,38 @@ def process_date(date_str: str, override_vol: float = None):
     print(f"\n  📅 {date_str}  —  原始{len(records)}只 → 13精选{len(filtered)}只")
     print(f"     🔀 {mode_desc}")
     
-    if not filtered:
-        print(f"     今日无符合条件的股票，空仓")
-        print(f"     💡 注意：不生成 stockpool_{dc}.txt，若明日评分=4/6将按【空仓】处理（buy_decision_history记空仓）")
-        return None
-    
-    # 统计各分数段
+    # ── 无论是否选出股票，都落盘池文件（用户要求，2026-10-16）──
+    #   有票 → 写入明细；0 只 → 只写头部注释（空池文件）
+    # 目的：让每天的 stockpool_YYYYMMDD.txt 都存在，以便区分两种状态：
+    #   · 空池文件（本次跑了、当日空仓）→ 回测记 +0.00#dyn
+    #   · 文件缺失（当天忘记跑）
+    # 消费端 buy_order_scheduler.check_stockpool_file() 以「数据行数≥1」判定有票，
+    # 因此空池文件会被正确识别为【空仓】，不会被误当成有票。
     pref_dist = defaultdict(int)
     for r in filtered:
         pref_dist[int(r['pref'])] += 1
-    dist_str = ', '.join(f'{k}分×{v}' for k, v in sorted(pref_dist.items()))
-    print(f"     优选分分布: {dist_str}")
-    print(f"     综合评分范围: {min(r['score'] for r in filtered)}~{max(r['score'] for r in filtered)}分")
-    
-    # 写入文件
+    if filtered:
+        dist_str = ', '.join(f'{k}分×{v}' for k, v in sorted(pref_dist.items()))
+        print(f"     优选分分布: {dist_str}")
+        print(f"     综合评分范围: {min(r['score'] for r in filtered)}~{max(r['score'] for r in filtered)}分")
+
+    # 写入文件（0 只时也写，只保留注释头）
     out_path = DATA_DIR / f"stockpool_{dc}.txt"
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(f"# 优选分过滤结果 (生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')})\n")
         f.write(f"# 筛选规则: 仅13分; 动态分档({mode}); 不补足; 按综合评分降序\n")
         f.write(f"# 格式: 股票代码,综合评分,优选分\n")
+        if not filtered:
+            f.write("# ⚠️ 今日13精选 0 只 → 空仓。本文件是「已运行」凭证：回测记 +0.00#dyn；文件缺失才代表忘记跑。\n")
         f.write("# === 精选数据 ===\n")
         for r in filtered:
             f.write(f"{r['code']},{r['score']},{r['pref']:.0f}\n")
-    
+
+    if not filtered:
+        print(f"     今日无符合条件的股票，空仓")
+        print(f"     ✅ 已生成空池文件（仅注释头）: {out_path.name}  → 回测记 +0.00#dyn")
+        return None
+
     print(f"     ✅ 已保存: {out_path.name}")
     return filtered
 

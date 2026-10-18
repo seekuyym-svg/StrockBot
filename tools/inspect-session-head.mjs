@@ -1,14 +1,18 @@
 /**
- * 只读诊断：为什么某个 DSH 会话文件在 v3→v4 迁移时被拒绝。
+ * 只读诊断：为什么某个 DSH 会话文件加载失败 / 迁移被拒绝。
  *
  * 不写盘、不改文件，只做三件事：
  *   1. 解压会话的 zstd 分帧，按行还原事件；
- *   2. 走 DSH 真实加载路径（catalog.createRestore + persistence.validateStoredEvents）复现报错；
+ *   2. 按 DSH 的两条真实校验路径各跑一遍并复现报错：
+ *        validation="current"     —— 读「已存储日志」用的路径（**v4 文件走这条**）
+ *        validation="transformed" —— 迁移产物校验用的路径（v3 文件走这条）
  *   3. 单步重放「受保护系统头」状态机，指出是哪一个 seq 触发了拒绝。
  *
+ * ★ 关键教训：v4 文件必须用 current 校验才等价于 DSH 的真实加载路径。
+ *   只用 transformed 会把损坏的 v4 文件误判为「通过」（v4→v4 无迁移，transformed 直接放行）。
+ *
  * 用法：
- *   node tools/inspect-session-head.mjs "<session.v3.jsonl.zstd>"
- *   node tools/inspect-session-head.mjs "<某个会话目录或 sessions 根目录>"   # 批量只看结论
+ *   node tools/inspect-session-head.mjs "<session.v3.jsonl.zstd | session.v4.jsonl.zstd | 目录>"
  * 依赖 DSH 模块位置可用 DSH_MODULES 覆盖。
  */
 import fs from 'node:fs'
@@ -25,7 +29,7 @@ const SURFACE_TYPES = new Set(['system/message', 'user/message', 'assistant/mess
 
 const target = process.argv[2]
 if (target === undefined) {
-  console.error('用法: node tools/inspect-session-head.mjs <session.v3.jsonl.zstd | 目录>')
+  console.error('用法: node tools/inspect-session-head.mjs <session.*.jsonl.zstd | 目录>')
   process.exit(2)
 }
 
@@ -61,12 +65,12 @@ function readLines(file) {
   return { lines, frames, undecodable }
 }
 
-/** DSH 真实加载路径：v3→v4 迁移（含表面折叠与关系校验）+ 存储形状校验。 */
-function verify(lines, id) {
+/** 走 DSH 真实加载路径；validation 取 "current" 或 "transformed"。 */
+function verify(lines, id, validation) {
   try {
     const header = JSON.parse(lines[0])
     const restore = catalog.createSessionFormatCatalogWithChildren([])
-      .createRestore(header, { recovery: 'recoverable', validation: 'transformed' })
+      .createRestore(header, { recovery: 'recoverable', validation })
     for (let i = 1; i < lines.length; i += 1) restore.decodeRow(JSON.parse(lines[i]))
     const artifact = restore.finish()
     persistence.validateStoredEvents(
@@ -74,26 +78,25 @@ function verify(lines, id) {
       (artifact.events ?? []).slice(),
       id,
     )
-    return { ok: true, header, version: artifact.header.version }
+    return { ok: true, version: artifact.header.version }
   } catch (error) {
     return { ok: false, error: String(error.message) }
   }
 }
 
 /**
- * 单步重放 worker.cjs:10403-10425 的受保护系统头状态机。
- * @returns 触发拒绝的 seq（没有则为 null）
+ * 单步重放受保护系统头状态机（worker.cjs:10403-10425 与 :11313 同源）。
+ * @returns 触发拒绝的 seq 列表
  */
-function firstHeadViolation(events) {
+function headViolationSeqs(events) {
+  const violations = []
   let hasSurface = false
   let head
   for (const event of events) {
     if (event.type === 'system/message') {
       const operation = event.surfaceOp
-      if (hasSurface && head === undefined) {
-        return { seq: event.seq, head, hasSurface, surfaceBefore: true }
-      }
-      if (operation === 'append') {
+      if (hasSurface && head === undefined) violations.push(event.seq)
+      else if (operation === 'append') {
         if (!hasSurface) head = event.seq
       } else if (operation !== undefined && operation !== null && typeof operation === 'object') {
         if (operation.startSeq === head || operation.endSeq === head) head = event.seq
@@ -101,7 +104,7 @@ function firstHeadViolation(events) {
     }
     if (SURFACE_TYPES.has(event.type)) hasSurface = true
   }
-  return null
+  return violations
 }
 
 function describe(event) {
@@ -134,49 +137,78 @@ function walk(target) {
 }
 
 const files = walk(target)
-const detail = files.length === 1
+const forceDetail = process.argv.includes('--dump')
+const detail = files.length === 1 || forceDetail
 console.log(`扫描 ${String(files.length)} 个会话文件（DSH_MODULES=${DSH_MODULES}）`)
 for (const file of files) {
   const id = path.basename(path.dirname(file))
   const { lines, frames, undecodable } = readLines(file)
-  const result = verify(lines, id)
+  let version
+  try {
+    version = JSON.parse(lines[0]).version
+  } catch {
+    version = '?'
+  }
+  const asCurrent = verify(lines, id, 'current')
+  const asTransformed = verify(lines, id, 'transformed')
   const sizeMb = (fs.statSync(file).size / 1048576).toFixed(2)
   console.log(`\n=== ${id} ===`)
   console.log(`  文件 ${file}`)
-  console.log(`  ${sizeMb} MB · ${String(frames)} 帧 · ${String(lines.length)} 行 · 解压失败 ${String(undecodable)} 帧`)
-  if (result.ok) {
-    console.log(`  迁移校验：通过（v${String(result.version)}）`)
-    continue
-  }
-  console.log(`  迁移校验：拒绝`)
-  console.log(`  报错：${result.error}`)
+  console.log(`  ${sizeMb} MB · v${String(version)} · ${String(frames)} 帧 · ${String(lines.length)} 行 · 解压失败 ${String(undecodable)} 帧 · 判定 ${asCurrent.ok ? '正常' : '损坏'}`)
+  console.log(`  current 校验（已存储日志的真实路径）：${asCurrent.ok ? '通过' : `拒绝 —— ${asCurrent.error}`}`)
+  console.log(`  transformed 校验（迁移产物路径）：${asTransformed.ok ? '通过' : `拒绝 —— ${asTransformed.error}`}`)
 
-  if (!detail) continue
+  if (asCurrent.ok && asTransformed.ok && !forceDetail) continue
 
-  // 详细模式：把事件解析出来做单步重放
   const events = []
   for (let i = 1; i < lines.length; i += 1) {
     try {
       events.push(JSON.parse(lines[i]))
     } catch { /* 跳过坏行 */ }
   }
-  console.log(`  事件 ${String(events.length)} 个（header: ${lines[0].slice(0, 200)}）`)
+
+  if (!detail) {
+    const violations = headViolationSeqs(events)
+    if (violations.length > 0) console.log(`  受保护头违规 seq：${violations.slice(0, 10).join(', ')}`)
+    continue
+  }
+
+  const rawWanted = (process.argv.find((arg) => arg.startsWith('--raw=')) ?? '').slice('--raw='.length)
+  if (rawWanted !== '') {
+    const wanted = Number(rawWanted)
+    for (const event of events) if (event.seq === wanted) {
+      const raw = JSON.stringify(event)
+      console.log(`  RAW seq=${rawWanted} (${String(raw.length)} 字符): ${raw.slice(0, 700)}`)
+      const message = event.data !== null && typeof event.data === 'object' ? event.data.message : undefined
+      if (message !== null && typeof message === 'object') {
+        console.log(`  RAW-META keys=${Object.keys(message).join(',')} id=${String(message.id)} source=${JSON.stringify(message.source)}`)
+      }
+    }
+  }
+
+  const histogram = new Map()
+  for (const event of events) histogram.set(event.type, (histogram.get(event.type) ?? 0) + 1)
+  const watched = [...histogram.entries()]
+    .filter(([type]) => type.includes('orphan') || type === 'system/message')
+    .map(([type, count]) => `${type}×${String(count)}`)
+  console.log(`  事件 ${String(events.length)} 个 · 关注类型：${watched.length > 0 ? watched.join(' · ') : '（无 system/message、无 orphan）'}`)
   console.log('  --- 前 12 个事件 ---')
   for (const event of events.slice(0, 12)) console.log(`    ${describe(event)}`)
 
-  const violations = events.filter((e) => e.type === 'system/message')
-  console.log(`  --- system/message 共 ${String(violations.length)} 个 ---`)
-  for (const event of violations.slice(0, 12)) console.log(`    ${describe(event)}`)
+  const systems = events.filter((event) => event.type === 'system/message')
+  console.log(`  --- system/message 共 ${String(systems.length)} 个 ---`)
+  for (const event of systems.slice(0, 20)) console.log(`    ${describe(event)}`)
 
-  const violation = firstHeadViolation(events)
+  const violations = headViolationSeqs(events)
   console.log('  --- 受保护系统头状态机 ---')
-  if (violation === null) {
+  if (violations.length === 0) {
     console.log('    未发现系统头违规（报错来自其它校验环节）')
   } else {
-    console.log(`    首个违规：seq=${String(violation.seq)} —— 表面已开始但受保护头仍未建立，该 system/message 被拒`)
-    const index = events.findIndex((e) => e.seq === violation.seq)
-    const around = events.slice(Math.max(0, index - 3), index + 2)
-    console.log('    现场事件：')
-    for (const event of around) console.log(`      ${describe(event)}`)
+    console.log(`    违规 seq：${violations.join(', ')} —— 表面已开始但受保护头仍未建立`)
+    for (const seq of violations.slice(0, 3)) {
+      const index = events.findIndex((event) => event.seq === seq)
+      console.log(`    seq=${String(seq)} 现场：`)
+      for (const event of events.slice(Math.max(0, index - 2), index + 2)) console.log(`      ${describe(event)}`)
+    }
   }
 }

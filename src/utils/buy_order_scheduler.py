@@ -63,28 +63,92 @@ def get_previous_trading_day() -> str:
     return yesterday.strftime('%Y%m%d')
 
 
-def check_stockpool_file() -> bool:
+def _count_stockpool_rows(filepath) -> int:
     """
-    检查是否存在前一日的选股结果文件（最近交易日）
-    
+    统计选股结果文件中的股票数据行数（跳过注释、空行与分隔线）
+
     Returns:
-        bool: 文件是否存在
+        int: 数据行数（读取失败返回 0）
+    """
+    try:
+        n = 0
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#') or s.startswith('-'):
+                    continue
+                n += 1
+        return n
+    except Exception as e:
+        logger.warning(f"[WARN] 统计选股结果文件行数失败({filepath}): {e}")
+        return 0
+
+
+# ── 选股池文件状态（check_stockpool_file 的返回值）──
+POOL_OK = 'ok'            # 文件存在且有股票 → 正常买股票
+POOL_EMPTY = 'empty'      # 文件存在但 0 只（空池文件）→ 空仓；当天确实跑过选股
+POOL_MISSING = 'missing'  # 文件不存在 → 空仓；通常意味着当天**忘记跑选股**
+
+
+def check_stockpool_file() -> str:
+    """
+    检查前一交易日的选股结果文件状态
+
+    ⚠️ 仅判断「文件存在」是不够的：`score_stockpool_13.py` **无论选出几只都会生成
+    池文件**——0 只时只写注释头（即「空池文件」），这是「当天已运行、且当日空仓」的
+    凭证（回测时记 +0.00#dyn）；**文件缺失才代表忘记跑**。因此必须按「数据行数 ≥ 1」
+    判定有票；否则空池文件会被当成有票、继续走 calculate_buy_orders()，而该函数在
+    无票时静默 return —— 结果是既不推送空仓卡片、也不把 buy_decision_history 的
+    advice 改成空仓。
+
+    Returns:
+        str: POOL_OK(有票) / POOL_EMPTY(空池文件，已跑过且空仓) / POOL_MISSING(文件不存在)
     """
     try:
         date_str = get_previous_trading_day()
-        filename = f"stockpool_{date_str}.txt"
-        filepath = project_root / "data" / filename
-        
-        if filepath.exists():
-            logger.info(f"[OK] 找到选股结果文件: {filepath}")
-            return True
-        else:
-            logger.warning(f"[WARN] 选股结果文件不存在: {filepath}")
-            return False
-            
+        filepath = project_root / "data" / f"stockpool_{date_str}.txt"
+
+        if not filepath.exists():
+            logger.error(f"[WARN] 未找到选股结果文件（可能忘记跑选股）: {filepath}")
+            return POOL_MISSING
+
+        rows = _count_stockpool_rows(filepath)
+        if rows <= 0:
+            logger.warning(f"[WARN] 选股结果文件存在但 0 只（空池文件=已跑过且空仓）: {filepath}")
+            return POOL_EMPTY
+
+        logger.info(f"[OK] 找到选股结果文件: {filepath}（{rows} 只）")
+        return POOL_OK
+
     except Exception as e:
         logger.error(f"[ERROR] 检查选股结果文件失败: {e}")
-        return False
+        return POOL_MISSING
+
+
+def _count_today_orders() -> int:
+    """
+    统计今日买入委托文件（trade_YYYYMMDD.txt）中的有效委托笔数
+
+    委托文件首行为可买入只数。文件不存在/格式异常/首行非数字时返回 0。
+
+    Returns:
+        int: 可买入笔数
+    """
+    try:
+        filepath = project_root / "data" / f"trade_{datetime.now().strftime('%Y%m%d')}.txt"
+        if not filepath.exists():
+            return 0
+        lines = filepath.read_text(encoding='utf-8').splitlines()
+        if not lines:
+            return 0
+        try:
+            return max(0, int(float(lines[0].strip())))
+        except ValueError:
+            logger.warning(f"[WARN] 委托文件首行非数字: {lines[0].strip()!r}")
+            return 0
+    except Exception as e:
+        logger.warning(f"[WARN] 统计今日委托笔数失败: {e}")
+        return 0
 
 
 # 大盘评分<6时使用的防守ETF列表（沪市ETF + 深市LOF）
@@ -670,6 +734,48 @@ def _set_today_decision(advice_text: str) -> bool:
         return False
 
 
+def _handle_empty_position(final_total, pool_status: str = POOL_EMPTY) -> None:
+    """
+    空仓日统一处理：把 buy_decision_history 的 advice 修正为「空仓」 + 推送空仓卡片
+
+    触发情形（同属「买股票窗口但实际可买 0 只」）与对应文案：
+      1. 池文件存在但 0 只（「空池文件」，说明当天跑过选股）→「前日选股数为0」
+      2. 池文件不存在（通常意味着当天**忘记跑选股**）→「未找到前日池文件（可能忘记跑）」
+      3. 池文件有票但全部被评分过滤/行情获取失败，实际委托 0 只 →「今日无买入标的」
+
+    Args:
+        final_total: 今日大盘综合评分（仅用于日志）
+        pool_status: POOL_EMPTY / POOL_MISSING / 其它（如「实际委托 0 只」）
+    """
+    reason = {
+        POOL_EMPTY: "前日选股数为0",
+        POOL_MISSING: "未找到前日池文件（可能忘记跑）",
+    }.get(pool_status, "今日无买入标的")
+    if pool_status == POOL_MISSING:
+        # 文件缺失通常意味着当天忘记跑选股，用 error 级别让它在日志中醒目
+        logger.error(f"[SKIP] {reason}，今日空仓（评分{final_total}）")
+    else:
+        logger.warning(f"[SKIP] {reason}，今日空仓（评分{final_total}）")
+    # 历史记录从「买股票」修正为「空仓」
+    _set_today_decision("空仓")
+    # 落一份「0 只」委托文件：一是让 21:00 收盘任务明确识别为空仓日（收益记 0、
+    # 累计净值照记一笔），二是覆盖掉可能残留的同名委托文件，避免 21:00 误把
+    # 旧文件当成今日真实持仓、污染累计净值。
+    try:
+        trade_file = project_root / "data" / f"trade_{datetime.now().strftime('%Y%m%d')}.txt"
+        with open(trade_file, 'w', encoding='utf-8') as f:
+            f.write("0\n股票代码,开盘价,股数,金额\n")
+        logger.info(f"[TRADE] 已写入空仓委托文件: {trade_file.name}")
+    except Exception as e:
+        logger.warning(f"[TRADE] 写入空仓委托文件失败: {e}")
+    # 推送空仓提示卡片（推送①早盘概览不变，仅此处买入委托卡片提示空仓）
+    try:
+        send_trade_notification(final_total_from_index=final_total, empty_position=True,
+                                empty_reason=reason)
+    except Exception as e:
+        logger.error(f"[STEP 3] 空仓提示推送异常: {e}")
+
+
 def execute_buy_calculation():
     """
     执行买入委托计算并发送飞书通知
@@ -741,15 +847,9 @@ def execute_buy_calculation():
             logger.info("[STEP 2] 检测到 use_offensive_stocks=1，但 offensive_stks 已废弃，统一走 score_stockpool_13 股票池")
 
         logger.info("\n[STEP 2] 检查选股结果文件...")
-        if not check_stockpool_file():
-            logger.warning("[SKIP] 前日选股个股为0，今日空仓")
-            # 买股票日无票 → 空仓，并把历史记录从"买股票"修正为"空仓"
-            _set_today_decision("空仓")
-            # 推送空仓提示卡片（推送①早盘概览不变，仅此处买入委托卡片提示空仓）
-            try:
-                send_trade_notification(final_total_from_index=final_total, empty_position=True)
-            except Exception as e:
-                logger.error(f"[STEP 3] 空仓提示推送异常: {e}")
+        pool_status = check_stockpool_file()
+        if pool_status != POOL_OK:
+            _handle_empty_position(final_total, pool_status)
             return
 
         logger.info("执行买入委托计算（股票池）...")
@@ -760,6 +860,12 @@ def execute_buy_calculation():
             logger.error(f"[ERROR] 执行买入计算失败: {exc}")
             import traceback
             logger.error(traceback.format_exc())
+            return
+
+        # 复核：池文件有票也可能「全部被评分过滤 / 行情获取失败」→ 实际委托 0 只，
+        # 此时同样必须按空仓处理（否则既不推送空仓卡片、也不修正历史记录）
+        if _count_today_orders() <= 0:
+            _handle_empty_position(final_total, "no_orders")  # → 文案「今日无买入标的」
             return
     else:
         # 转防守ETF（含评分None异常兜底）
@@ -1197,60 +1303,79 @@ def send_index_snapshot():
     return final_total, vol_ratio
 
 
+def _push_empty_position_card(reason: str = "前日选股数为0") -> bool:
+    """
+    推送「今日空仓」灰色卡片（占用买入委托卡片位）
+
+    Args:
+        reason: 正文前缀，最终展示为「**{reason}，今日空仓。**」
+
+    Returns:
+        bool: 是否推送成功
+    """
+    try:
+        notifier = get_feishu_notifier()
+        if not notifier.enabled:
+            logger.warning("[WARN] 飞书通知未启用，跳过发送")
+            return False
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        content = f"**{reason}，今日空仓。**\n"
+        content += f"**时间**: {current_time}\n"
+        logger.info(f"[TRADE] 空仓提示推送（{reason}）")
+        message = {
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {
+                        "tag": "plain_text",
+                        "content": "今日买入委托"
+                    },
+                    "template": "grey"
+                },
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+                    {"tag": "hr"},
+                    {"tag": "note", "elements": [
+                        {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
+                    ]}
+                ]
+            }
+        }
+        import requests
+        import json
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(notifier.webhook_url, headers=headers,
+                                 data=json.dumps(message, ensure_ascii=False).encode('utf-8'), timeout=10)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('StatusCode') == 0 or result.get('code') == 0:
+                logger.success("[OK] 空仓提示推送成功")
+                return True
+            logger.error(f"[ERROR] 飞书API返回错误: {result.get('msg', '未知')}")
+        else:
+            logger.error(f"[ERROR] 空仓提示推送失败，HTTP状态码: {response.status_code}")
+    except Exception as e:
+        logger.error(f"[ERROR] 空仓提示推送异常: {e}")
+    return False
+
+
 def send_trade_notification(final_total_from_index=None, defensive_mode: bool = False,
-                            empty_position: bool = False):
+                            empty_position: bool = False,
+                            empty_reason: str = "前日选股数为0"):
     """
     读取交易报告文件并通过飞书发送通知
 
     Args:
         final_total_from_index: 大盘综合评分（10分制）
         defensive_mode: 是否防守ETF模式（评分<阈值 或 弱势市场降级）
-        empty_position: 空仓日（买股票窗口但前日选股0只）→ 仅提示空仓
+        empty_position: 空仓日（买股票窗口但实际可买 0 只）→ 仅提示空仓
+        empty_reason: 空仓卡片正文前缀，如「前日选股数为0」/「未找到前日池文件（可能忘记跑）」
     """
     try:
-        # ── 空仓日（前日选股个股为0）：不读交易文件，直接推空仓提示卡片 ──
+        # ── 空仓日：不读交易文件，直接推空仓提示卡片 ──
         if empty_position:
-            notifier = get_feishu_notifier()
-            if not notifier.enabled:
-                logger.warning("[WARN] 飞书通知未启用，跳过发送")
-                return
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            content = f"**前日选股数为0，今日空仓。**\n"
-            content += f"**时间**: {current_time}\n"
-            logger.info("[TRADE] 空仓日（前日选股0只），推送空仓提示")
-            message = {
-                "msg_type": "interactive",
-                "card": {
-                    "config": {"wide_screen_mode": True},
-                    "header": {
-                        "title": {
-                            "tag": "plain_text",
-                            "content": "今日买入委托"
-                        },
-                        "template": "grey"
-                    },
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": content}},
-                        {"tag": "hr"},
-                        {"tag": "note", "elements": [
-                            {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
-                        ]}
-                    ]
-                }
-            }
-            import requests
-            import json
-            headers = {'Content-Type': 'application/json'}
-            response = requests.post(notifier.webhook_url, headers=headers,
-                                     data=json.dumps(message, ensure_ascii=False).encode('utf-8'), timeout=10)
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('StatusCode') == 0 or result.get('code') == 0:
-                    logger.success("[OK] 空仓提示推送成功")
-                else:
-                    logger.error(f"[ERROR] 飞书API返回错误: {result.get('msg', '未知')}")
-            else:
-                logger.error(f"[ERROR] 空仓提示推送失败，HTTP状态码: {response.status_code}")
+            _push_empty_position_card(reason=empty_reason)
             return
 
         # 读取今天的交易报告文件
@@ -1276,7 +1401,9 @@ def send_trade_notification(final_total_from_index=None, defensive_mode: bool = 
         stock_count = int(lines[0].strip())
         
         if stock_count == 0:
-            logger.info("[INFO] 今日没有可买入的股票")
+            # 委托文件存在但为 0 只 → 同样属空仓日，必须推送空仓卡片（不能静默 return）
+            logger.info("[INFO] 今日没有可买入的股票（委托 0 只）→ 按空仓提示")
+            _push_empty_position_card(reason="今日无买入标的")
             return
         
         # 防守ETF模式（评分<阈值 或 弱势市场降级）：仅提示一句话，不展示明细
