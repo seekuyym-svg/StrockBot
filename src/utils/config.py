@@ -188,6 +188,10 @@ class FeishuNotificationConfig(BaseModel):
     """飞书通知配置"""
     enabled: bool = False  # 是否启用飞书通知
     webhook_url: str = ""  # 飞书机器人 Webhook URL
+    # 自建应用凭证（仅「发送图片」需要）：webhook 无法携带图片，图片须先经应用上传换取 img_key。
+    # 留空 = 跳过图片、只发文字卡片；也可用环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET 覆盖。
+    app_id: str = ""
+    app_secret: str = ""
     notify_signals: List[str] = ["BUY", "SELL", "ADD", "STOP"]  # 需要通知的信号类型
 
 

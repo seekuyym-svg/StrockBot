@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """飞书通知模块 - 通过飞书机器人发送交易信号通知"""
+import os
 import requests
 import json
 from typing import Dict, Any, Optional
@@ -19,6 +20,11 @@ class FeishuNotifier:
         self.enabled = self.feishu_config.enabled
         self.webhook_url = self.feishu_config.webhook_url
         self.notify_signals = self.feishu_config.notify_signals
+        # 自建应用凭证（仅「发送图片」需要）；环境变量优先，避免把密钥写进配置文件
+        self.app_id = os.getenv("FEISHU_APP_ID") or getattr(self.feishu_config, "app_id", "") or ""
+        self.app_secret = os.getenv("FEISHU_APP_SECRET") or getattr(self.feishu_config, "app_secret", "") or ""
+        self._tenant_token = None            # 缓存的 tenant_access_token
+        self._tenant_token_expire_at = 0.0   # 过期时间戳（提前 5 分钟刷新）
         
         # 频率控制：记录最后发送时间
         self.last_send_time = {}  # {symbol_signal_type: timestamp}
@@ -34,6 +40,71 @@ class FeishuNotifier:
         else:
             logger.info("ℹ️ 飞书通知未启用")
     
+    def _get_tenant_token(self) -> Optional[str]:
+        """
+        获取并缓存 tenant_access_token（有效期约 2 小时，提前 5 分钟刷新）。
+
+        未配置 app_id/app_secret 时返回 None。
+        """
+        import time as _t
+        if self._tenant_token and _t.time() < self._tenant_token_expire_at:
+            return self._tenant_token
+        if not (self.app_id and self.app_secret):
+            return None
+        try:
+            r = requests.post(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                json={"app_id": self.app_id, "app_secret": self.app_secret},
+                timeout=10)
+            d = r.json()
+            if d.get("code") != 0:
+                logger.error(f"[FEISHU] 获取 tenant_access_token 失败: {d.get('msg')} (code={d.get('code')})")
+                return None
+            self._tenant_token = d.get("tenant_access_token")
+            self._tenant_token_expire_at = _t.time() + max(60, int(d.get("expire", 7200)) - 300)
+            return self._tenant_token
+        except Exception as e:
+            logger.error(f"[FEISHU] 获取 tenant_access_token 异常: {e}")
+            return None
+
+    def upload_image(self, image_path) -> Optional[str]:
+        """
+        上传本地图片到飞书，返回可用于卡片的 img_key。
+
+        飞书自定义机器人的 webhook **不能**携带图片，图片必须先经自建应用上传换取
+        img_key。未配置 app_id/app_secret 时返回 None（调用方应跳过图片、只发文字）。
+
+        Args:
+            image_path: 本地图片路径（PNG/JPG）
+
+        Returns:
+            str | None: img_key；失败返回 None
+        """
+        token = self._get_tenant_token()
+        if not token:
+            logger.warning("[FEISHU] 未配置 app_id/app_secret，跳过图片上传（仅发文字卡片）")
+            return None
+        try:
+            with open(image_path, "rb") as f:
+                files = {"image": (os.path.basename(str(image_path)), f, "image/png")}
+                r = requests.post(
+                    "https://open.feishu.cn/open-apis/im/v1/images",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={"image_type": "message"},
+                    files=files,
+                    timeout=20)
+            d = r.json()
+            if d.get("code") != 0:
+                logger.error(f"[FEISHU] 上传图片失败: {d.get('msg')} (code={d.get('code')})")
+                return None
+            key = (d.get("data") or {}).get("image_key")
+            if key:
+                logger.success(f"[FEISHU] 图片上传成功: {key}")
+            return key
+        except Exception as e:
+            logger.error(f"[FEISHU] 上传图片异常: {e}")
+            return None
+
     def should_notify(self, signal_type: str, reason: str = "", alert_type: str = "") -> bool:
         """
         判断是否应该发送通知

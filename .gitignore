@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+config.yaml
 files/
 data/
 signal/
@@ -12,3 +13,6 @@ node_modules/
 .venv/
 .uv-cache/
 .uv-python/
+# 生成的图表与权限诊断报告（可再生成，不入仓库）
+charts/
+.acl-reports/

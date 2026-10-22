@@ -31,3 +31,6 @@ aiohttp>=3.9.0
 
 # 定时任务
 apscheduler>=3.10.0
+
+# 绘图（累计净值 vs 沪深300 曲线图，src/utils/nav_chart.py）
+matplotlib>=3.8.0

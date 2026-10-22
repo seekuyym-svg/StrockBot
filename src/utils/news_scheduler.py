@@ -1632,6 +1632,34 @@ class NewsMonitorScheduler:
             logger.warning(f"[MONTHRET] 计算本月收益率失败: {e}")
             return None, None
 
+    def _build_nav_chart_element(self):
+        """
+        生成「累计净值 vs 沪深300」曲线图并上传飞书，返回卡片的 img 元素。
+
+        展示位置：卡片中「胜率」那一行下方（content div 之后）。
+        任何一步失败（出图 / 上传 / 未配应用凭证）都只记日志并返回 None，
+        不影响文字卡片照常发送。
+        """
+        try:
+            from src.utils.nav_chart import build_chart
+            png = build_chart()                      # 默认落盘 data/nav_curve.png
+            logger.info(f"[CHART] 净值曲线已生成: {png}")
+        except Exception as e:
+            logger.error(f"[CHART] 生成净值曲线失败: {e}")
+            return None
+        try:
+            img_key = get_feishu_notifier().upload_image(png)
+        except Exception as e:
+            logger.error(f"[CHART] 上传净值曲线失败: {e}")
+            return None
+        if not img_key:
+            return None
+        return {
+            "tag": "img",
+            "img_key": img_key,
+            "alt": {"tag": "plain_text", "content": "累计净值 vs 沪深300"},
+        }
+
     def _send_trade_return_notification(self):
         """
         发送持仓收益率飞书通知
@@ -1777,6 +1805,16 @@ class NewsMonitorScheduler:
                 card_color = "red"
             else:
                 card_color = "grey"
+            # 累计净值曲线图（位于「胜率」下方）：生成→上传→插入 img；失败则跳过，不影响文字卡片
+            chart_element = self._build_nav_chart_element()
+            elements = [{"tag": "div", "text": {"tag": "lark_md", "content": content}}]
+            if chart_element:
+                elements.append(chart_element)
+            elements.append({"tag": "hr"})
+            elements.append({"tag": "note", "elements": [
+                {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
+            ]})
+
             message = {
                 "msg_type": "interactive",
                 "card": {
@@ -1785,13 +1823,7 @@ class NewsMonitorScheduler:
                         "title": {"tag": "plain_text", "content": f"{profit_icon} 周期收益率"},
                         "template": "red" if total_return_pct < 0 else "green"
                     },
-                    "elements": [
-                        {"tag": "div", "text": {"tag": "lark_md", "content": content}},
-                        {"tag": "hr"},
-                        {"tag": "note", "elements": [
-                            {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
-                        ]}
-                    ]
+                    "elements": elements
                 }
             }
 
