@@ -173,7 +173,8 @@ class BuyOrderSchedulerConfig(BaseModel):
     minute: int = 26  # 执行分钟
     min_score: float = 1.0  # 最低综合评分阈值
     # 大盘评分<阈值时买入的防守ETF列表（沪市ETF + 深市LOF）
-    defensive_etfs: List[str] = ["513050", "513120", "516130", "516310", "518880", "588080", "162411"]  # 须与 config.yaml 保持一致
+    # 2026-10-19 起为 6 只：移除 588080 科创50、513050 中概互联，新增 513850 美国50
+    defensive_etfs: List[str] = ["513120", "516130", "516310", "518880", "513850", "162411"]  # 须与 config.yaml 保持一致
     # 进攻股票列表（评分≥阈值时从中随机选 offensive_random_count 个）
     offensive_stks: List[str] = ["600206", "600397", "002056", "002156", "002636",
                                  "002674", "003043", "300649", "688141"]

@@ -712,36 +712,36 @@ class NewsMonitorScheduler:
             logger.warning(f"⚠️ 读取 signal_history.json 失败: {e}")
             return {}
 
-    def _read_prev_margin_balance(self) -> tuple:
+    def _read_margin_balance_series(self) -> list:
         """
-        读取上一交易日的全市场融资余额（亿元）
+        读取已公布的全市场融资余额序列（亿元），按日期升序
 
         数据来源：data/market_emotion.txt 的 margin_balance 列。
         该数值回填在"数值所属交易日"的行上，官方口径滞后一个交易日公布，
         因此当日 21:00 运行时文件中最新已公布值即为「上一交易日」的数值。
-        为稳妥起见，取**严格早于今天**的最新一条；若不存在则退化为最新一条。
+        为稳妥起见，只取**严格早于今天**的行；若一条都没有则退化为全部可用行。
 
         Returns:
-            tuple: (date_str, value)，取不到时返回 (None, None)
+            list: [(date_str, value)]，取不到时返回 []
         """
         filepath = project_root / "data" / MARGIN_BALANCE_FILE
         if not filepath.exists():
             logger.warning(f"⚠️ {MARGIN_BALANCE_FILE} 不存在，融资余额无法展示")
-            return None, None
+            return []
 
         try:
             lines = filepath.read_text(encoding='utf-8').splitlines()
         except Exception as e:
             logger.warning(f"⚠️ 读取 {MARGIN_BALANCE_FILE} 失败: {e}")
-            return None, None
+            return []
 
         if len(lines) < 2:
-            return None, None
+            return []
 
         header = [h.strip() for h in lines[0].split(',')]
         if 'margin_balance' not in header:
             logger.warning(f"⚠️ {MARGIN_BALANCE_FILE} 缺少 margin_balance 列，融资余额无法展示")
-            return None, None
+            return []
         col = header.index('margin_balance')
 
         candidates = []  # [(date, value)]，按文件顺序（时间升序）
@@ -759,23 +759,53 @@ class NewsMonitorScheduler:
 
         if not candidates:
             logger.warning(f"⚠️ {MARGIN_BALANCE_FILE} 中暂无已公布的融资余额")
-            return None, None
+            return []
 
         today = datetime.now().strftime('%Y-%m-%d')
         prev = [c for c in candidates if c[0] < today]
-        return prev[-1] if prev else candidates[-1]
+        return prev if prev else candidates
+
+    def _read_prev_margin_balance(self) -> tuple:
+        """
+        读取上一交易日的全市场融资余额（亿元）
+
+        Returns:
+            tuple: (date_str, value)，取不到时返回 (None, None)
+        """
+        series = self._read_margin_balance_series()
+        return series[-1] if series else (None, None)
 
     def _format_margin_balance_line(self) -> str:
         """
         构建大盘环境信号中的「融资余额(前日)」展示行
 
+        环比口径：前一日 − 前二日。正值显示 `+XX.XX`（融资增加），
+        负值显示 `-XX.XX`（融资减少），为 0 显示 `0.00`；不足两期数据时不显示括号。
+
         Returns:
-            str: 形如 `**融资余额(前日)**: 25081.23亿 | <font color='orange'>过高</font>\\n\\n`
+            str: 形如 `**融资余额(前日)**: 25081.23亿(-62.60) | <font color='orange'>过高</font>\\n\\n`
         """
-        date_str, value = self._read_prev_margin_balance()
-        if value is None:
+        series = self._read_margin_balance_series()
+        if not series:
             logger.warning("⚠️ 未取到融资余额（前日），本次推送展示「暂无数据」")
             return "**融资余额(前日)**: 暂无数据\n\n"
+
+        date_str, value = series[-1]
+
+        # 环比：（上一交易日 − 上上交易日）
+        if len(series) >= 2:
+            delta = round(value - series[-2][1], 2)
+            if delta > 0:
+                delta_str = f"+{delta:.2f}"
+            elif delta < 0:
+                delta_str = f"{delta:.2f}"   # 自带负号
+            else:
+                delta_str = "0.00"
+            delta_part = f"({delta_str})"
+        else:
+            delta = None
+            delta_str = ""
+            delta_part = ""
 
         level, color = MARGIN_BALANCE_LEVELS[-1][1], MARGIN_BALANCE_LEVELS[-1][2]
         for threshold, name, c in MARGIN_BALANCE_LEVELS:
@@ -784,8 +814,11 @@ class NewsMonitorScheduler:
                 break
 
         level_md = f"<font color='{color}'>{level}</font>" if color else level
-        logger.info(f"💰 融资余额(前日 {date_str}): {value:.2f}亿 → {level}")
-        return f"**融资余额(前日)**: {value:.2f}亿 | {level_md}\n\n"
+        if delta is None:
+            logger.info(f"💰 融资余额(前日 {date_str}): {value:.2f}亿（环比无数据）→ {level}")
+        else:
+            logger.info(f"💰 融资余额(前日 {date_str}): {value:.2f}亿 ({delta_str}) → {level}")
+        return f"**融资余额(前日)**: {value:.2f}亿{delta_part} | {level_md}\n\n"
 
     def _send_market_signal_notification(self):
         """
