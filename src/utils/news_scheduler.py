@@ -5,6 +5,7 @@ from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timedelta
 import sys
 from pathlib import Path
+from typing import Optional
 import pandas as pd
 from loguru import logger
 import requests
@@ -795,13 +796,8 @@ class NewsMonitorScheduler:
         # 环比：（上一交易日 − 上上交易日）
         if len(series) >= 2:
             delta = round(value - series[-2][1], 2)
-            if delta > 0:
-                delta_str = f"+{delta:.2f}"
-            elif delta < 0:
-                delta_str = f"{delta:.2f}"   # 自带负号
-            else:
-                delta_str = "0.00"
-            delta_part = f"({delta_str})"
+            delta_str = self._format_delta_value(delta)
+            delta_part = self._format_delta_part(delta)
         else:
             delta = None
             delta_str = ""
@@ -819,6 +815,78 @@ class NewsMonitorScheduler:
         else:
             logger.info(f"💰 融资余额(前日 {date_str}): {value:.2f}亿 ({delta_str}) → {level}")
         return f"**融资余额(前日)**: {value:.2f}亿{delta_part} | {level_md}\n\n"
+
+    @staticmethod
+    def _format_delta_value(delta: Optional[float], decimals: int = 2) -> str:
+        """
+        把环比差值格式化为带符号的字符串
+
+        Args:
+            delta: 环比差值；为 None 时返回空串
+            decimals: 保留小数位（默认 2；传 0 显示为整数，成交额用）
+
+        Returns:
+            str: 正值前置 `+`、负值自带 `-`、零显示对应位数的 0；delta 为 None 时返回 ""
+        """
+        if delta is None:
+            return ""
+        value = round(float(delta), decimals)
+        if value > 0:
+            return f"+{value:.{decimals}f}"
+        if value < 0:
+            return f"{value:.{decimals}f}"
+        return f"{0:.{decimals}f}"
+
+    @classmethod
+    def _format_delta_part(cls, delta: Optional[float], decimals: int = 2) -> str:
+        """把环比差值格式化为括号形式 `(+12.34)`；delta 为 None 时返回空串（不显示括号）"""
+        value = cls._format_delta_value(delta, decimals)
+        return f"({value})" if value else ""
+
+    def _read_prev_market_volume(self, signal_date: str) -> Optional[float]:
+        """
+        读取上一交易日的沪深市场成交额（亿元）
+
+        数据来源：data/signal_history.json。取**严格早于 signal_date** 的最近一条
+        含 market_volume 的记录，即上一个交易日的成交额。
+
+        Args:
+            signal_date: 当日信号日期 YYYY-MM-DD
+
+        Returns:
+            float | None: 上一交易日成交额；取不到时返回 None
+        """
+        signal_file = project_root / "data" / "signal_history.json"
+        if not signal_file.exists():
+            logger.warning("⚠️ signal_history.json 不存在，成交额环比无法展示")
+            return None
+
+        try:
+            history = json.loads(signal_file.read_text(encoding='utf-8'))
+        except Exception as e:
+            logger.warning(f"⚠️ 读取 signal_history.json 失败（成交额环比）: {e}")
+            return None
+
+        if not isinstance(history, list) or not history:
+            return None
+
+        rows = []
+        for entry in history:
+            date_str = str(entry.get('date') or '')
+            vol = entry.get('market_volume')
+            if not date_str or vol is None:
+                continue
+            try:
+                rows.append((date_str, float(vol)))
+            except (TypeError, ValueError):
+                continue
+
+        if not rows:
+            return None
+
+        rows.sort(key=lambda r: r[0])
+        prev = [r for r in rows if r[0] < str(signal_date)]
+        return prev[-1][1] if prev else None
 
     def _send_market_signal_notification(self):
         """
@@ -860,7 +928,15 @@ class NewsMonitorScheduler:
                 level_str = f"活跃度{vol_level}" if vol_level else ""
                 detail_str = f" ({vol_detail})" if vol_detail else ""
                 level_part = f" | {level_str}" if level_str else ""
-                content += f"**沪深市场成交额**: {market_volume:.0f}亿{level_part}{detail_str}\n"
+                # 环比：与上一交易日的成交额对比（取自 signal_history.json 上一条记录）
+                prev_volume = self._read_prev_market_volume(signal_date)
+                vol_delta = round(market_volume - prev_volume, 2) if prev_volume is not None else None
+                delta_part = self._format_delta_part(vol_delta, decimals=0)
+                if vol_delta is None:
+                    logger.info(f"📊 沪深市场成交额: {market_volume:.0f}亿（环比无数据）")
+                else:
+                    logger.info(f"📊 沪深市场成交额: {market_volume:.0f}亿 ({self._format_delta_value(vol_delta, 0)}) 上一交易日 {prev_volume:.0f}亿")
+                content += f"**沪深市场成交额**: {market_volume:.0f}亿{delta_part}{level_part}{detail_str}\n"
 
             # 融资余额(前日)：官方口径滞后一个交易日公布，取上一交易日已公布的数值
             content += self._format_margin_balance_line()
@@ -951,6 +1027,59 @@ class NewsMonitorScheduler:
             import traceback
             logger.error(traceback.format_exc())
 
+    def _push_stockpool_alert(self, reason: str, filepath, trading_date: str,
+                              hint: str, template: str = "red",
+                              title: str = "⚠️ 选股结果文件未生成") -> None:
+        """
+        选股文件状态异常时的**独立提醒卡片**。
+
+        用途：把「文件缺失（忘记生成）」与「空池文件（当天跑过、0 只）」区分开。
+        此前这两种情况都只打日志、不推送，导致"该提醒却没提醒"。
+        """
+        notifier = get_feishu_notifier()
+        if not notifier.enabled:
+            logger.warning("[STOCKPOOL] 飞书通知未启用，跳过提醒推送")
+            return
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        content = f"**原因**: {reason}\n"
+        content += f"**目标日期**: {trading_date}\n"
+        content += f"**文件**: `{filepath.name}`\n\n"
+        content += f"{hint}\n\n"
+        content += f"**━━━━━━━━━━━━━━━**\n"
+        content += f"**时间**: {current_time}\n"
+        message = {
+            "msg_type": "interactive",
+            "card": {
+                "config": {"wide_screen_mode": True},
+                "header": {"title": {"tag": "plain_text", "content": title},
+                           "template": template},
+                "elements": [
+                    {"tag": "div", "text": {"tag": "lark_md", "content": content}},
+                    {"tag": "hr"},
+                    {"tag": "note", "elements": [
+                        {"tag": "plain_text", "content": f"ETF马丁格尔量化交易系统 | {current_time}"}
+                    ]},
+                ],
+            },
+        }
+        try:
+            resp = requests.post(
+                notifier.webhook_url,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(message, ensure_ascii=False).encode("utf-8"),
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                body = resp.json()
+                if body.get("StatusCode") == 0 or body.get("code") == 0:
+                    logger.success("[STOCKPOOL] 选股文件状态提醒已推送")
+                else:
+                    logger.error(f"[STOCKPOOL] 提醒推送失败: {body.get('msg', '未知错误')}")
+            else:
+                logger.error(f"[STOCKPOOL] 提醒推送失败，HTTP {resp.status_code}")
+        except Exception as e:
+            logger.error(f"[STOCKPOOL] 提醒推送异常: {e}")
+
     def _send_stockpool_notification(self):
         """
         发送选股结果飞书通知
@@ -969,8 +1098,16 @@ class NewsMonitorScheduler:
             filepath = project_root / "data" / filename
             
             if not filepath.exists():
-                logger.warning(f"⚠️ 选股结果文件不存在: {filepath}")
-                logger.info("ℹ️ 跳过选股结果通知")
+                # 文件缺失 = 当天忘记跑选股（异常），必须与「空池文件（跑过、0 只）」区分开
+                logger.error(f"❌ 选股结果文件不存在（可能忘记生成选股结果）: {filepath}")
+                self._push_stockpool_alert(
+                    reason="文件不存在",
+                    filepath=filepath,
+                    trading_date=trading_date,
+                    hint=("通常是当天**忘记运行** `backtest/score_stockpool_13.py`，"
+                          "或生成的池文件**未上传到服务器**。\n"
+                          "⚠️ 注意：这与「空池文件」不同——空池文件表示脚本已跑过、当日无符合条件股票。"),
+                )
                 return
             
             logger.info(f"✅ 找到选股结果文件: {filepath}")
@@ -1012,7 +1149,9 @@ class NewsMonitorScheduler:
                             })
             
             if not stocks:
-                logger.info("ℹ️ 选股结果为空，跳过通知")
+                # 文件存在但 0 只 =「空池文件」：选股脚本当天确实跑过、当日无符合条件股票 → 正常空仓
+                logger.info(f"ℹ️ 选股结果文件存在但为 0 只（空池文件=当天已跑过选股、当日空仓）: {filepath.name}")
+                logger.info("ℹ️ 跳过选股明细通知（空池属正常情况，与「文件缺失」不同，不推送告警）")
                 return
             
             logger.info(f"📈 读取到 {len(stocks)} 只股票")
