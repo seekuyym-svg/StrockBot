@@ -23,6 +23,7 @@ import argparse
 import bisect
 import csv
 import json
+import logging
 import sys
 from datetime import date as _date
 from pathlib import Path
@@ -117,6 +118,66 @@ def downsample(rows: list[tuple[str, float]], granularity: str) -> list[tuple[st
 
 
 # ---------------------------------------------------------------- 画图
+# 图中额外展示「剔除最大 N 个持有期收益后」的净值（判断收益是否靠少数爆发日）
+TOP_N_TO_STRIP = 3
+
+
+def strip_top_returns(
+    rows: list[tuple[str, float]], n: int = TOP_N_TO_STRIP
+) -> list[tuple[str, float]]:
+    """把收益最大的 n 个持有期收益置 0，返回同长度的净值序列。
+
+    用途：净值曲线若呈「阶梯型」，说明收益集中在少数大赚日。用这条序列可以
+    直观看出剔除这些爆发后策略的真实水平（与「月度评估须报剔除 top3」同一口径）。
+
+    Args:
+        rows: [(日期, 净值)]，按日期升序
+        n: 剔除的最大收益个数
+
+    Returns:
+        [(日期, 净值)]，与输入等长、同日期；首点净值保持原值
+    """
+    if len(rows) < 2 or n <= 0:
+        return list(rows)
+
+    rets: list[float] = []
+    for i in range(1, len(rows)):
+        prev = rows[i - 1][1]
+        rets.append((rows[i][1] / prev - 1.0) if prev > 0 else 0.0)
+
+    top = set(sorted(range(len(rets)), key=lambda i: rets[i], reverse=True)[:n])
+
+    out: list[tuple[str, float]] = [(rows[0][0], rows[0][1])]
+    cur = rows[0][1]
+    for i, r in enumerate(rets):
+        cur *= 1.0 + (0.0 if i in top else r)
+        out.append((rows[i + 1][0], cur))
+    return out
+
+
+class _FontWeightNoiseFilter(logging.Filter):
+    """
+    只丢弃 matplotlib 的「字体字重回退」这一条无害告警。
+
+    背景：WenQuanYi Zen Hei 只注册了 weight=500 的字面，而 matplotlib 的 Text / 刻度默认
+    按 'normal'(400) 请求字形，于是每新建一个文本对象就会回退到 500 并打一条
+        findfont: Failed to find font weight normal for WenQuanYi Zen Hei, now using 500.
+    实测改 rcParams['font.weight'] 无效（底层 Text 仍按 normal 请求）；渲染完全正常，
+    只差一个字重档位。故只精确过滤这一条，不屏蔽其它字体告警（真缺字体时我们有自己的探测）。
+    """
+    _NOISE = "Failed to find font weight normal"
+
+    def filter(self, record):
+        return self._NOISE not in record.getMessage()
+
+
+def _silence_font_weight_noise():
+    """给 matplotlib.font_manager 挂一次去重过滤器（幂等，可重复调用）。"""
+    lg = logging.getLogger("matplotlib.font_manager")
+    if not any(isinstance(f, _FontWeightNoiseFilter) for f in lg.filters):
+        lg.addFilter(_FontWeightNoiseFilter())
+
+
 def _setup_cjk_font():
     """探测中文字体；返回字体名，找不到返回 None（调用方退回英文标签）。"""
     from matplotlib import font_manager
@@ -125,6 +186,7 @@ def _setup_cjk_font():
             continue
         try:
             font_manager.fontManager.addfont(p)
+            _silence_font_weight_noise()
             return font_manager.FontProperties(fname=p).get_name()
         except Exception:
             continue
@@ -157,6 +219,8 @@ def build_chart(out_path: str | None = None, granularity: str = "auto") -> str:
 
     gran = auto_granularity(len(nav_rows)) if granularity == "auto" else granularity
     nav_pts = downsample(nav_rows, gran)
+    strip_pts = downsample(strip_top_returns(nav_rows, TOP_N_TO_STRIP), gran)
+    strip_map = {d: v for d, v in strip_pts}
 
     # 归一化基准 = 策略首个净值日
     base_day, base_nav = nav_pts[0]
@@ -164,7 +228,7 @@ def build_chart(out_path: str | None = None, granularity: str = "auto") -> str:
     if not hs_base or base_nav <= 0:
         raise RuntimeError(f"基准日 {base_day} 数据缺失，无法归一化")
 
-    xs, strat, hs = [], [], []
+    xs, strat, hs, strip = [], [], [], []
     for d, v in nav_pts:
         hv = _value_on_or_before(hs_rows, d)
         if hv is None:
@@ -172,6 +236,8 @@ def build_chart(out_path: str | None = None, granularity: str = "auto") -> str:
         xs.append(d)
         strat.append(v / base_nav)      # 归一化净值（起点 = 1.0）
         hs.append(hv / hs_base)
+        sv = strip_map.get(d)
+        strip.append((sv / base_nav) if sv is not None else None)
 
     if len(xs) < 1:
         raise RuntimeError("对齐后无有效数据点")
@@ -186,6 +252,11 @@ def build_chart(out_path: str | None = None, granularity: str = "auto") -> str:
     idx = list(range(len(xs)))
     ax.plot(idx, strat, color="#D62728", linewidth=2.0,
             label=("策略" if zh else "Strategy"), zorder=3)
+    strip_y = [y for y in strip if y is not None]
+    if len(strip_y) == len(idx):
+        ax.plot(idx, strip_y, color="#FF7F0E", linewidth=1.5, linestyle="--",
+                label=("策略(剔TOP3)" if zh
+                       else f"Strategy(ex-top{TOP_N_TO_STRIP})"), zorder=2)
     ax.plot(idx, hs, color="#8C8C8C", linewidth=1.6, linestyle="-",
             label=("沪深300" if zh else "HS300"), zorder=2)
     ax.axhline(1.0, color="#BBBBBB", linewidth=0.9, zorder=1)
@@ -194,8 +265,14 @@ def build_chart(out_path: str | None = None, granularity: str = "auto") -> str:
     ax.scatter([idx[-1]], [strat[-1]], color="#D62728", s=22, zorder=4)
     ax.annotate(f"{strat[-1]:.4f}", (idx[-1], strat[-1]), textcoords="offset points",
                 xytext=(-6, 8), ha="right", fontsize=9, color="#D62728")
-    ax.annotate(f"{hs[-1]:.4f}", (idx[-1], hs[-1]), textcoords="offset points",
-                xytext=(-6, -14), ha="right", fontsize=9, color="#8C8C8C")
+    if len(strip_y) == len(idx):
+        ax.annotate(f"{strip_y[-1]:.4f}", (idx[-1], strip_y[-1]), textcoords="offset points",
+                    xytext=(-6, -8), ha="right", fontsize=9, color="#FF7F0E")
+        ax.annotate(f"{hs[-1]:.4f}", (idx[-1], hs[-1]), textcoords="offset points",
+                    xytext=(-6, -22), ha="right", fontsize=9, color="#8C8C8C")
+    else:
+        ax.annotate(f"{hs[-1]:.4f}", (idx[-1], hs[-1]), textcoords="offset points",
+                    xytext=(-6, -14), ha="right", fontsize=9, color="#8C8C8C")
 
     ax.set_title(
         (f"累计净值 vs 沪深300（{xs[0]} ~ {xs[-1]}，基准 {base_day}=1.0000）" if zh
@@ -216,8 +293,15 @@ def build_chart(out_path: str | None = None, granularity: str = "auto") -> str:
     ax.set_xticklabels([xs[i][5:] for i in ticks], fontsize=8, rotation=0)
 
     excess = (strat[-1] - hs[-1]) * 100.0   # 净值之比差 → 收益率差（pp）
-    ax.text(0.01, 0.02,
-            (f"超额 {excess:+.2f}pp" if zh else f"Excess {excess:+.2f}pp"),
+    info_lines = [(f"超额 {excess:+.2f}pp" if zh else f"Excess {excess:+.2f}pp")]
+    if len(strip_y) == len(idx):
+        strip_excess = (strip_y[-1] - hs[-1]) * 100.0
+        info_lines.append(
+            (f"策略(剔TOP3) 终值 {strip_y[-1]:.4f}（超额 {strip_excess:+.2f}pp）"
+             if zh else
+             f"ex-top{TOP_N_TO_STRIP} {strip_y[-1]:.4f} (excess {strip_excess:+.2f}pp)")
+        )
+    ax.text(0.01, 0.02, "\n".join(info_lines),
             transform=ax.transAxes, ha="left", va="bottom", fontsize=9,
             color="#1F77B4")
 
