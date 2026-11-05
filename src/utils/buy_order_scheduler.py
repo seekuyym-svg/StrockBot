@@ -155,7 +155,7 @@ def _count_today_orders() -> int:
 # 运行时从 config.yaml 的 buy_order_scheduler.defensive_etfs 读取；
 # 下面的内置列表仅在该配置读取失败时兜底，且必须显式告警
 # （曾因静默回退到旧列表导致落盘少标的）。务必与 config.yaml 保持一致。
-_DEFAULT_DEFENSIVE_ETFS = ['513120', '516130', '516310', '518880', '513850', '162411']
+_DEFAULT_DEFENSIVE_ETFS = ['513120', '515650', '516310', '518880', '513850', '561360', '513050', '588080']
 
 
 def _load_defensive_etfs() -> list:
@@ -178,6 +178,117 @@ def _load_defensive_etfs() -> list:
 
 
 DEFENSIVE_ETFS = _load_defensive_etfs()
+
+# 本交易日实际选中的 ETF（供通知文案显示；在 generate_etf_trade_file 时刷新）
+_SELECTED_ETFS: list = []
+# 每只的选基判据（code → 简述），供飞书卡片展示"为什么选它"
+_SELECTION_REASONS: dict = {}
+
+
+def _load_etf_selection_config() -> dict:
+    """读取 etf_selection 配置（从 8 只候选池选 6 只的规则）
+
+    读取失败时退化为 enabled=False（等价旧行为：直接买候选池前 count 只），
+    保证不会因为配置缺失导致不买或买错只数。
+    """
+    default = dict(enabled=False, count=6, lookback=3, window=250, thresholds={}, prices={})
+    try:
+        from src.utils.config import get_config
+        c = get_config().buy_order_scheduler.etf_selection
+        cfg = dict(
+            enabled=bool(c.enabled),
+            count=int(c.count),
+            lookback=int(c.momentum_lookback_days),
+            window=int(c.drawdown_window_days),
+            thresholds={str(k): float(v) for k, v in (c.deep_drop_thresholds or {}).items()},
+            prices={str(k): float(v) for k, v in (c.deep_drop_prices or {}).items()},
+        )
+        logger.info(
+            f"[ETF-SEL] 配置: enabled={cfg['enabled']} count={cfg['count']} "
+            f"动量回看={cfg['lookback']}日 回撤窗口={cfg['window']}日 "
+            f"回撤跌透={cfg['thresholds']} 价格跌透={cfg['prices']}"
+        )
+        return cfg
+    except Exception as e:
+        logger.error(f"[ETF-SEL] 读取 etf_selection 失败({e}) → 退化为「直接取候选池前 "
+                     f"{default['count']} 只」")
+        return default
+
+
+def _etf_momentum_and_drawdown(code: str, lookback: int, window: int):
+    """返回 (近 lookback 日涨幅%, 距 window 日高点回撤%, 最新收盘价)；取不到返回 (None, None, None)
+
+    只用最近一个收盘日及之前的数据，无未来函数。
+    """
+    try:
+        from local.utils import _get_historical_klines
+        market = 'sh' if code.startswith(('6', '9', '5')) else 'sz'
+        need = max(window, lookback) + 5
+        df = _get_historical_klines(market, code, days=need, end_date=None,
+                                    min_data_length=lookback + 2)
+        if df is None or len(df) < lookback + 2:
+            n = 0 if df is None else len(df)
+            logger.warning(f"[ETF-SEL] {code} 历史数据不足（{n} 条）→ 视为无信息")
+            return None, None, None
+        closes = [float(x) for x in df['close'].values]
+        last = closes[-1]
+        mom = (last / closes[-1 - lookback] - 1) * 100
+        hi = max(closes[-window:]) if len(closes) >= window else max(closes)
+        dd = (last / hi - 1) * 100 if hi > 0 else 0.0
+        return mom, dd, last
+    except Exception as e:
+        logger.warning(f"[ETF-SEL] {code} 取历史数据失败: {e} → 视为无信息")
+        return None, None, None
+
+
+def _select_defensive_etfs(candidates: list) -> list:
+    """从候选池按规则选 N 只（2026-11-05 新增）
+
+    排序规则：
+      ①「跌透」优先 —— 距 window 日高点回撤 ≤ 该只 deep_drop_thresholds 阈值
+      ② 其余按近 lookback 日涨幅降序
+    取不到历史数据的标的排在最后（不排除，只降权）。
+    任何异常都保证返回非空且不超过 count 只。
+    """
+    cfg = _load_etf_selection_config()
+    count = max(1, min(cfg['count'], len(candidates)))
+    _SELECTION_REASONS.clear()
+    if not cfg['enabled'] or len(candidates) <= count:
+        logger.info(f"[ETF-SEL] 未启用或候选数≤{count}，直接取前 {count} 只")
+        return list(candidates[:count])
+
+    rows = []
+    for code in candidates:
+        mom, dd, last = _etf_momentum_and_drawdown(code, cfg['lookback'], cfg['window'])
+        thr = cfg['thresholds'].get(code)
+        pthr = cfg['prices'].get(code)
+        deep_dd = (thr is not None and dd is not None and dd <= thr)
+        deep_px = (pthr is not None and last is not None and last <= pthr)
+        rows.append(dict(code=code, mom=mom, dd=dd, last=last, thr=thr,
+                         pthr=pthr, deep=deep_dd or deep_px,
+                         deep_dd=deep_dd, deep_px=deep_px))
+
+    # 排序：跌透在前；组内按涨幅降序；无数据（mom=None）排最后
+    rows.sort(key=lambda r: (0 if r['deep'] else 1,
+                             -(r['mom'] if r['mom'] is not None else -1e9)))
+    selected = [r['code'] for r in rows[:count]]
+
+    for r in rows:
+        parts = []
+        if r['deep_dd']:
+            parts.append(f"★跌透(回撤{r['dd']:.1f}%)")
+        elif r['deep_px']:
+            parts.append(f"★跌透(价{r['last']:.3f}≤{r['pthr']:.3f})")
+        if r['pthr'] is not None and r['last'] is not None and not r['deep_px']:
+            parts.append(f"价{r['last']:.3f}(阈值{r['pthr']:.3f})")
+        if r['mom'] is not None:
+            parts.append(f"近{cfg['lookback']}日{r['mom']:+.2f}%")
+        reason = ' / '.join(parts) or '无数据'
+        _SELECTION_REASONS[r['code']] = reason
+        logger.info(f"[ETF-SEL] {r['code']} {reason}"
+                    f" → {'买入' if r['code'] in selected else '跳过'}")
+    logger.info(f"[ETF-SEL] 最终选中 {len(selected)} 只: {selected}")
+    return selected
 
 # 大盘综合评分买入阈值（10分制）：≥此分从股票池选股，<此分用防守ETF
 SCORE_BUY_THRESHOLD = 6
@@ -233,10 +344,14 @@ def generate_etf_trade_file() -> bool:
     def _market_of(code: str) -> str:
         return 'sh' if code.startswith(('6', '9', '5')) else 'sz'
 
-    logger.info(f"[ETF] 使用防守ETF生成买入委托: {DEFENSIVE_ETFS}")
+    # 2026-11-05 起：从候选池按规则选 N 只（跌透优先 → 近3日涨幅降序）
+    selected = _select_defensive_etfs(DEFENSIVE_ETFS)
+    global _SELECTED_ETFS
+    _SELECTED_ETFS = list(selected)
+    logger.info(f"[ETF] 候选池 {len(DEFENSIVE_ETFS)} 只 → 本次买入 {len(selected)} 只: {selected}")
 
     watchlist = []
-    for code in DEFENSIVE_ETFS:
+    for code in selected:
         # 用本模块 get_stock_name（带缓存，支持5开头沪市ETF/16开头深市LOF）
         name = get_stock_name(code)
         watchlist.append({'code': code, 'market': _market_of(code), 'name': name, 'score': 0.0})
@@ -314,7 +429,7 @@ def generate_etf_trade_file() -> bool:
                 f"**缺失**: {', '.join(dropped) if dropped else '未知'}\n"
                 f"**常见原因**: 腾讯行情接口失败；或该ETF无今开价（流动性差/停牌）\n"
                 f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"**ETF列表**: {', '.join(DEFENSIVE_ETFS)}"
+                f"**ETF列表**: {', '.join(_SELECTED_ETFS or DEFENSIVE_ETFS)}"
             )
         return True
     else:
@@ -323,7 +438,7 @@ def generate_etf_trade_file() -> bool:
             "⚠️ 买入委托计算失败",
             f"**大盘评分 < 6，本应使用防守ETF生成买入委托，但全部{expected}只ETF行情均获取失败。**\n"
             f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"**ETF列表**: {', '.join(DEFENSIVE_ETFS)}"
+            f"**ETF列表**: {', '.join(_SELECTED_ETFS or DEFENSIVE_ETFS)}"
         )
         return False
 
@@ -1410,16 +1525,28 @@ def send_trade_notification(final_total_from_index=None, defensive_mode: bool = 
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         if defensive_mode:
-            content = f"**今日买入防守型ETF，如银行/红利/食饮/医药等ETF，尽量选择低位。**\n"
+            # 2026-11-05 起：防守ETF 也展示明细（原来只有一句固定话）
+            content = f"**今日买入 ETF：{stock_count} 只**"
+            if final_total_from_index is not None:
+                content += f"（大盘评分 {final_total_from_index}）"
+            content += "\n"
             content += f"**时间**: {current_time}\n"
-            logger.info(f"[TRADE] 防守ETF模式（评分{final_total_from_index}，降级={defensive_mode}），仅提示")
+            _skipped = [c for c in DEFENSIVE_ETFS if c not in (_SELECTED_ETFS or DEFENSIVE_ETFS)]
+            content += f"**候选池**: {len(DEFENSIVE_ETFS)} 只 → 选 {stock_count} 只"
+            if _skipped:
+                content += f"，跳过 {', '.join(_skipped)}"
+            content += "\n\n"
+            content += f"**━━━━━━━━━━━━━━━**\n\n"
+            logger.info(f"[TRADE] 防守ETF模式（评分{final_total_from_index}），展示 {stock_count} 只明细")
         else:
             # 股票池委托：展示明细
             content = f"**今日买入委托明细**\n"
             content += f"**时间**: {current_time}\n"
             content += f"**数量**: {stock_count} 只股票\n\n"
             content += f"**━━━━━━━━━━━━━━━**\n\n"
-        
+
+        # ── 以下明细解析【股票模式与 ETF 模式共用】（ETF 模式额外显示"选基判据"）──
+        if True:
             # 解析委托明细（逐行容错：单行格式异常只跳过该行，不影响整条消息）
             detail_codes = []
             detail_lines = []
@@ -1451,8 +1578,16 @@ def send_trade_notification(final_total_from_index=None, defensive_mode: bool = 
                 price_decimals = 3 if code.startswith('5') else 2
                 price_fmt = f".{price_decimals}f"
                 
+                # ETF 模式额外显示选基判据（2026-11-05 新增）
+                reason_line = ""
+                if defensive_mode:
+                    _r = _SELECTION_REASONS.get(code, "")
+                    if _r:
+                        reason_line = f"   判据: {_r}\n"
+                
                 # 格式化输出
                 content += f"**{i}. {stock_name} ({code})**\n"
+                content += reason_line
                 content += f"   开盘价: ¥{open_price:{price_fmt}}\n"
                 content += f"   股数: {shares:,} 股\n"
                 content += f"   金额: ¥{amount:,.2f}\n\n"

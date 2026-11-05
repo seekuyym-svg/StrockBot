@@ -38,6 +38,43 @@ logger.add(
     level="INFO"  # 修改为 INFO 级别，显示正常运行日志，隐藏调试日志
 )
 
+# ── 文件日志：按日切分（2026-11-05 新增）──────────────────────────────
+# 为什么要加：买 ETF 的选基过程（[ETF-SEL] 那些行）只在 stdout，
+#   而启动命令常写成 `nohup python main.py > /dev/null 2>&1 &`，
+#   → 日志全部丢弃，选基出问题时完全无法事后排查。
+# 规则：logs/sb_YYYY-MM-DD.log，每天 00:00 自动切分，只保留最近 30 天。
+# 想关闭：把 _FILE_LOG_ENABLED 改成 False。
+_FILE_LOG_ENABLED = True
+_LOG_DIR_NAME = "logs"
+_LOG_RETENTION_DAYS = 30
+_LOG_LEVEL = "INFO"
+
+if _FILE_LOG_ENABLED:
+    try:
+        _log_dir = project_root / _LOG_DIR_NAME
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _sink_path = str(_log_dir / "sb_{time:YYYY-MM-DD}.log")
+        _sink_kw = dict(
+            rotation="00:00",                     # 每天零点切分，文件名自带日期
+            retention=f"{_LOG_RETENTION_DAYS} days",  # 自动清理 30 天前的
+            level=_LOG_LEVEL,
+            encoding="utf-8",
+            backtrace=True,
+            diagnose=False,                       # 不放变量值，避免把凭证写进日志
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | "
+                   "{module}:{function}:{line} | {message}",
+        )
+        try:
+            # enqueue=True：多线程/定时任务下写入更安全（生产环境首选）
+            logger.add(_sink_path, enqueue=True, **_sink_kw)
+        except Exception as _qerr:
+            # 某些受限环境不允许建 multiprocessing 队列（命名管道被禁）→ 降级为同步写
+            print(f"[LOG][INFO] enqueue 不可用（{type(_qerr).__name__}），改用同步写入")
+            logger.add(_sink_path, enqueue=False, **_sink_kw)
+        print(f"[LOG] 文件日志已启用: {_log_dir}/sb_YYYY-MM-DD.log（每日切分，保留 {_LOG_RETENTION_DAYS} 天）")
+    except Exception as _log_err:
+        print(f"[LOG][WARN] 文件日志初始化失败（不影响程序运行）: {_log_err}")
+
 # 解决Windows GBK编码问题：重新包装stdout为UTF-8
 import io
 if sys.platform == 'win32':

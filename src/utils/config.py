@@ -166,15 +166,47 @@ class StockNewsMonitorConfig(BaseModel):
     schedule: ScheduleConfig = ScheduleConfig()  # 定时任务配置
 
 
+class EtfSelectionConfig(BaseModel):
+    """从候选 ETF 池中选 N 只的规则（2026-11-05 新增）
+
+    排序：① 距 drawdown_window_days 日高点回撤 ≤ 该只 deep_drop_thresholds 值（跌透）者排最前
+         ② 其余按近 momentum_lookback_days 日涨幅降序
+    仓位：仍均分，不按信号加权
+    """
+    enabled: bool = True  # 关闭则直接买候选池前 count 只（等同旧的固定列表行为）
+    count: int = 6  # 每次买入几只
+    momentum_lookback_days: int = 3  # 动量回看窗口（近 N 日涨幅）
+    drawdown_window_days: int = 250  # 回撤基准窗口（距 N 日高点）
+    # 每只各自的"跌透"阈值（距 N 日高点回撤，单位 %，负值）
+    # 未列出的标的不参与回撤型跌透判定（只按涨幅排序）
+    deep_drop_thresholds: Dict[str, float] = {
+        "515650": -20.0,   # 消费50
+        "516310": -15.0,   # 银行
+        "518880": -30.0,   # 黄金
+        "513850": -15.0,   # 美国50
+        "561360": -25.0,   # 石油ETF国泰
+    }
+    # 每只的"价格跌透"阈值（绝对收盘价，跌破即优先买）
+    # 与 deep_drop_thresholds 是**并列关系**：任一条件满足即视为跌透
+    deep_drop_prices: Dict[str, float] = {
+        "588080": 1.200,   # 科创50
+        "513050": 0.950,   # 中概互联
+        "513120": 1.000,   # 港股创新药
+    }
+
+
 class BuyOrderSchedulerConfig(BaseModel):
     """买入委托定时任务配置"""
     enabled: bool = True  # 是否启用买入委托定时任务
     hour: int = 9  # 执行小时（24小时制）
     minute: int = 26  # 执行分钟
     min_score: float = 1.0  # 最低综合评分阈值
-    # 大盘评分<阈值时买入的防守ETF列表（沪市ETF + 深市LOF）
-    # 2026-10-19 起为 6 只：移除 588080 科创50、513050 中概互联，新增 513850 美国50
-    defensive_etfs: List[str] = ["513120", "516130", "516310", "518880", "513850", "162411"]  # 须与 config.yaml 保持一致
+    # 大盘评分<阈值时买入的 ETF **候选池**（2026-11-05 起为 8 只，每次按 etf_selection 规则选 6 只）
+    # 2026-11-02 起：516130 消费龙头因受限买不了 → 515650 消费50ETF富国
+    # 2026-11-05 起：162411 华宝油气波动过大 → 561360 石油ETF国泰；并把 588080/513050 加回候选池
+    defensive_etfs: List[str] = ["513120", "515650", "516310", "518880", "513850", "561360", "513050", "588080"]  # 须与 config.yaml 保持一致
+    # 从候选池选 N 只的规则（2026-11-05 新增）
+    etf_selection: EtfSelectionConfig = EtfSelectionConfig()
     # 进攻股票列表（评分≥阈值时从中随机选 offensive_random_count 个）
     offensive_stks: List[str] = ["600206", "600397", "002056", "002156", "002636",
                                  "002674", "003043", "300649", "688141"]
