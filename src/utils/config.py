@@ -2,7 +2,7 @@
 """配置加载模块"""
 import os
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import yaml
 from pydantic import BaseModel
 from loguru import logger
@@ -167,10 +167,12 @@ class StockNewsMonitorConfig(BaseModel):
 
 
 class EtfSelectionConfig(BaseModel):
-    """从候选 ETF 池中选 N 只的规则（2026-11-05 新增）
+    """从候选 ETF 池中选 N 只的规则（2026-11-05 新增；2026-11-06 加过热降权）
 
-    排序：① 距 drawdown_window_days 日高点回撤 ≤ 该只 deep_drop_thresholds 值（跌透）者排最前
-         ② 其余按近 momentum_lookback_days 日涨幅降序
+    排序（三层）：① 距 drawdown_window_days 日高点回撤 ≤ 该只 deep_drop_thresholds 值、
+                     或收盘价 ≤ 该只 deep_drop_prices 值（跌透）者排最前
+                  ② 近 5 日涨幅 ≥ overheat_mom5_threshold 的「过热」标的排到跌透组之后
+                  ③ 其余按近 momentum_lookback_days 日涨幅降序
     仓位：仍均分，不按信号加权
     """
     enabled: bool = True  # 关闭则直接买候选池前 count 只（等同旧的固定列表行为）
@@ -193,6 +195,19 @@ class EtfSelectionConfig(BaseModel):
         "513050": 0.950,   # 中概互联
         "513120": 1.000,   # 港股创新药
     }
+    # 过热降权阈值（%）：近 5 日涨幅 ≥ 此值时，买入优先级降到最后（不排除，仅排序靠后）
+    # None 或 ≤0 = 关闭该规则
+    #
+    # 数据依据（2026-11-06，8 只 ETF / 2024-01~2026-11 / 5376 行 / 84 个交易日模拟）：
+    #   · 近5日涨幅≥8% 时未来2日收益：全期 -0.415pp、前半 -0.511pp、后半 -0.285pp（三段同向）
+    #   · 留一检验：去掉任一标的后差值仍为负（-0.169 ~ -0.769pp）⇒ 稳健
+    #   · 选基模拟：现行 +0.168%/t=1.23 → 加降权 +0.231%/t=1.74，
+    #              剔top3 +0.056%→+0.121%，胜率 57%→61%
+    #   ⚠️ 配对 t=+1.65 未达 2.0 采纳线 ⇒ 标为「待观察规则」，需月度复核
+    #   ⚠️ 为何不用 6%：6% 表面配对 t=+2.47 更高，但个股层面不成立
+    #      （前半反向 -0.015pp、留一检验去掉 3 只后转负）⇒ 属过拟合
+    #   ⚠️ 为何不用逐只阈值/豁免名单：配对 t 分别仅 +0.86 / +1.32，均劣于统一 8%
+    overheat_mom5_threshold: Optional[float] = 8.0
 
 
 class BuyOrderSchedulerConfig(BaseModel):

@@ -191,10 +191,12 @@ def _load_etf_selection_config() -> dict:
     读取失败时退化为 enabled=False（等价旧行为：直接买候选池前 count 只），
     保证不会因为配置缺失导致不买或买错只数。
     """
-    default = dict(enabled=False, count=6, lookback=3, window=250, thresholds={}, prices={})
+    default = dict(enabled=False, count=6, lookback=3, window=250, thresholds={},
+                   prices={}, overheat=None)
     try:
         from src.utils.config import get_config
         c = get_config().buy_order_scheduler.etf_selection
+        _oh = getattr(c, 'overheat_mom5_threshold', None)
         cfg = dict(
             enabled=bool(c.enabled),
             count=int(c.count),
@@ -202,11 +204,14 @@ def _load_etf_selection_config() -> dict:
             window=int(c.drawdown_window_days),
             thresholds={str(k): float(v) for k, v in (c.deep_drop_thresholds or {}).items()},
             prices={str(k): float(v) for k, v in (c.deep_drop_prices or {}).items()},
+            # 过热降权阈值（%）：近 5 日涨幅 ≥ 此值时排到最后。None / ≤0 = 关闭
+            overheat=(float(_oh) if _oh is not None and float(_oh) > 0 else None),
         )
         logger.info(
             f"[ETF-SEL] 配置: enabled={cfg['enabled']} count={cfg['count']} "
             f"动量回看={cfg['lookback']}日 回撤窗口={cfg['window']}日 "
-            f"回撤跌透={cfg['thresholds']} 价格跌透={cfg['prices']}"
+            f"回撤跌透={cfg['thresholds']} 价格跌透={cfg['prices']} "
+            f"过热降权={'近5日≥'+str(cfg['overheat'])+'%' if cfg['overheat'] else '关闭'}"
         )
         return cfg
     except Exception as e:
@@ -216,39 +221,54 @@ def _load_etf_selection_config() -> dict:
 
 
 def _etf_momentum_and_drawdown(code: str, lookback: int, window: int):
-    """返回 (近 lookback 日涨幅%, 距 window 日高点回撤%, 最新收盘价)；取不到返回 (None, None, None)
+    """返回 (近 lookback 日涨幅%, 距 window 日高点回撤%, 最新收盘价, 近5日涨幅%)
 
-    只用最近一个收盘日及之前的数据，无未来函数。
+    取不到返回 (None, None, None, None)。只用最近一个收盘日及之前的数据，无未来函数。
+    近5日涨幅用于「过热降权」（2026-11-06 新增，独立于 lookback）。
     """
     try:
         from local.utils import _get_historical_klines
         market = 'sh' if code.startswith(('6', '9', '5')) else 'sz'
-        need = max(window, lookback) + 5
+        need = max(window, lookback, 6) + 5
         df = _get_historical_klines(market, code, days=need, end_date=None,
                                     min_data_length=lookback + 2)
         if df is None or len(df) < lookback + 2:
             n = 0 if df is None else len(df)
             logger.warning(f"[ETF-SEL] {code} 历史数据不足（{n} 条）→ 视为无信息")
-            return None, None, None
+            return None, None, None, None
         closes = [float(x) for x in df['close'].values]
         last = closes[-1]
         mom = (last / closes[-1 - lookback] - 1) * 100
+        # 近5日涨幅：需要 6 个收盘价（T-5..T）
+        mom5 = (last / closes[-6] - 1) * 100 if len(closes) >= 6 and closes[-6] > 0 else None
         hi = max(closes[-window:]) if len(closes) >= window else max(closes)
         dd = (last / hi - 1) * 100 if hi > 0 else 0.0
-        return mom, dd, last
+        return mom, dd, last, mom5
     except Exception as e:
         logger.warning(f"[ETF-SEL] {code} 取历史数据失败: {e} → 视为无信息")
-        return None, None, None
+        return None, None, None, None
 
 
 def _select_defensive_etfs(candidates: list) -> list:
-    """从候选池按规则选 N 只（2026-11-05 新增）
+    """从候选池按规则选 N 只（2026-11-05 新增；2026-11-06 加「过热降权」）
 
-    排序规则：
-      ①「跌透」优先 —— 距 window 日高点回撤 ≤ 该只 deep_drop_thresholds 阈值
-      ② 其余按近 lookback 日涨幅降序
+    排序规则（三层）：
+      ①「跌透」优先 —— 距 window 日高点回撤 ≤ 该只 deep_drop_thresholds 阈值，
+                      或最新收盘价 ≤ 该只 deep_drop_prices 阈值
+      ②「过热」降权 —— 近 5 日涨幅 ≥ overheat_mom5_threshold 的排到跌透组之后、
+                      正常组之前（不影响跌透组内部顺序）
+      ③ 其余按近 lookback 日涨幅降序
     取不到历史数据的标的排在最后（不排除，只降权）。
     任何异常都保证返回非空且不超过 count 只。
+
+    「过热降权」的数据依据（2026-11-06，8 只 ETF / 2024-01~2026-11 / 5376 行 / 84 个交易日模拟）：
+      · 近5日涨幅≥8% 时未来2日收益：全期 -0.415pp、前半 -0.511pp、后半 -0.285pp（三段同向）
+      · 留一检验：去掉任一标的后差值仍为负（-0.169 ~ -0.769pp）⇒ 稳健
+      · 选基模拟：现行 +0.168%/t=1.23 → 加降权后 +0.231%/t=1.74，剔top3 +0.056%→+0.121%，胜率 57%→61%
+      · 配对 t=+1.65（未达 2.0 采纳线，故标为「待观察规则」，需月度复核）
+      · 阈值取 8% 而非 6%：6% 表面 t=+2.47 更高，但个股层面不成立（前半反向 -0.015pp、
+        留一检验去掉 3 只后转负）⇒ 属过拟合；8% 才是真信号
+      · 不采用「逐只阈值/豁免名单」：配对 t 分别仅 +0.86 / +1.32，均劣于统一 8%
     """
     cfg = _load_etf_selection_config()
     count = max(1, min(cfg['count'], len(candidates)))
@@ -257,19 +277,22 @@ def _select_defensive_etfs(candidates: list) -> list:
         logger.info(f"[ETF-SEL] 未启用或候选数≤{count}，直接取前 {count} 只")
         return list(candidates[:count])
 
+    oh_thr = cfg.get('overheat')
     rows = []
     for code in candidates:
-        mom, dd, last = _etf_momentum_and_drawdown(code, cfg['lookback'], cfg['window'])
+        mom, dd, last, mom5 = _etf_momentum_and_drawdown(code, cfg['lookback'], cfg['window'])
         thr = cfg['thresholds'].get(code)
         pthr = cfg['prices'].get(code)
         deep_dd = (thr is not None and dd is not None and dd <= thr)
         deep_px = (pthr is not None and last is not None and last <= pthr)
-        rows.append(dict(code=code, mom=mom, dd=dd, last=last, thr=thr,
-                         pthr=pthr, deep=deep_dd or deep_px,
+        overheat = (oh_thr is not None and mom5 is not None and mom5 >= oh_thr)
+        rows.append(dict(code=code, mom=mom, dd=dd, last=last, mom5=mom5, thr=thr,
+                         pthr=pthr, deep=deep_dd or deep_px, overheat=overheat,
                          deep_dd=deep_dd, deep_px=deep_px))
 
-    # 排序：跌透在前；组内按涨幅降序；无数据（mom=None）排最后
+    # 排序：① 跌透在前 ② 过热降权（仅作用于非跌透组）③ 涨幅降序；无数据排最后
     rows.sort(key=lambda r: (0 if r['deep'] else 1,
+                             (1 if r['overheat'] else 0) if not r['deep'] else 0,
                              -(r['mom'] if r['mom'] is not None else -1e9)))
     selected = [r['code'] for r in rows[:count]]
 
@@ -279,6 +302,8 @@ def _select_defensive_etfs(candidates: list) -> list:
             parts.append(f"★跌透(回撤{r['dd']:.1f}%)")
         elif r['deep_px']:
             parts.append(f"★跌透(价{r['last']:.3f}≤{r['pthr']:.3f})")
+        if r['overheat']:
+            parts.append(f"⚠过热(近5日{r['mom5']:+.2f}%≥{oh_thr:.0f}%)")
         if r['pthr'] is not None and r['last'] is not None and not r['deep_px']:
             parts.append(f"价{r['last']:.3f}(阈值{r['pthr']:.3f})")
         if r['mom'] is not None:
